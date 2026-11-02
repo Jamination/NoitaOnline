@@ -526,7 +526,19 @@ pub unsafe fn unload_far_chunks(foci: &[[i32; 4]], margin: i32, max: u32) -> u32
     if table.is_null() {
         return 0;
     }
-    let unload: extern "fastcall" fn(u32, *const i32, i32) = std::mem::transmute(UNLOAD_CHUNK_FN as usize);
+    // FUN_00740e70 takes (ecx, edx, one stack arg) but returns with a plain `ret`: the caller
+    // pops the stack argument (vanilla call sites `add esp,4`), which no Rust ABI expresses.
+    let unload = |map: u32, coords: *const i32| {
+        std::arch::asm!(
+            "push 1",
+            "call {f}",
+            "add esp, 4",
+            f = in(reg) UNLOAD_CHUNK_FN,
+            inout("ecx") map => _,
+            inout("edx") coords => _,
+            clobber_abi("C"),
+        );
+    };
     let mut n = 0;
     for idx in 0..512 * 512u32 {
         if n >= max {
@@ -543,7 +555,7 @@ pub unsafe fn unload_far_chunks(foci: &[[i32; 4]], margin: i32, max: u32) -> u32
         });
         if !keep {
             let coords = [cx, cy, idx as i32];
-            unload(chunk_map, coords.as_ptr(), 1);
+            unload(chunk_map, coords.as_ptr());
             n += 1;
         }
     }
