@@ -72,8 +72,10 @@ function M.input(pi, f, px, py)
     else s.buttons[dir > 0 and "Left" or "Right"] = true end
     if t % 120 < 20 then s.buttons.Up = true; s.buttons.Fly = true end
   else
-    -- idle with occasional interaction (lets liquids and fire settle)
+    -- idle with occasional interaction (lets liquids and fire settle); edit the first wand
+    -- (swap its first two spells) through the lockstep inventory commands
     if t % 100 < 3 then s.buttons.Interact = true end
+    if t == 50 then s.cmds = { { sc = 1, ss = 0, dc = 1, ds = 1 } } end
   end
   return s
 end

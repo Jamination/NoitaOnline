@@ -30,6 +30,7 @@ local Input = dofile_once(ROOT .. "input.lua")
 local Players = dofile_once(ROOT .. "players.lua")
 local State = dofile_once(ROOT .. "state.lua")
 local Bot = dofile_once(ROOT .. "bot.lua")
+local Inventory = dofile_once(ROOT .. "inventory.lua")
 
 local session = nil   -- { seed, input_delay, player, players, scenario }
 local solo = cfg.solo
@@ -247,7 +248,11 @@ function OnWorldPostUpdate()
     end
     NO.lib.no_sim_leave()
     in_sim_window = false
-    if ready then set_render_camera() end
+    if ready then
+      set_render_camera()
+      local slot = Players.local_slot()
+      Inventory.draw(slot and slot.entity)
+    end
   end
   if f % 600 == 0 then drain_events() end
   if cfg.debug and ready and f % 60 == 0 then
