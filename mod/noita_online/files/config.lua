@@ -33,6 +33,8 @@ function M.load()
   -- "full": hash every loaded chunk at once on each 60-frame checkpoint (instead of the
   -- default staggered hashing, one slice of chunks per frame).
   c.full_hash = env("NOITA_ONLINE_HASH") == "full"
+  -- Frame-rate cap (stands in for vsync on displays without it); nil = uncapped.
+  c.fps_cap = tonumber(env("NOITA_ONLINE_FPS_CAP") or "")
   -- Diagnostics: report state every frame (all entity positions) in [from, to].
   local dense = env("NOITA_ONLINE_DENSE")
   if dense then

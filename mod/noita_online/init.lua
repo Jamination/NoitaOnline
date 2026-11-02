@@ -26,6 +26,7 @@ if not cfg.enabled then
 end
 
 local NO = dofile_once(ROOT .. "native.lua")
+if cfg.fps_cap then NO.lib.no_set_frame_cap(cfg.fps_cap) end
 local Input = dofile_once(ROOT .. "input.lua")
 local Players = dofile_once(ROOT .. "players.lua")
 local State = dofile_once(ROOT .. "state.lua")

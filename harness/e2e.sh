@@ -31,6 +31,7 @@ while [[ $# -gt 0 ]]; do
     --seed) SEED="$2"; shift 2 ;;
     --pin) PIN=1; shift ;;
     --human) HUMAN=1; shift ;;
+    --fps-cap) FPS_CAP="$2"; shift 2 ;;
     *) echo "unknown arg $1" >&2; exit 2 ;;
   esac
 done
@@ -61,6 +62,8 @@ else
   export NOITA_ONLINE_EXIT=1
 fi
 export NOITA_ONLINE_OUT="$OUT"
+# Same frame cap (vsync stand-in) for baseline and multiplayer runs; 0 = uncapped.
+[[ "${FPS_CAP:-60}" != 0 ]] && export NOITA_ONLINE_FPS_CAP="${FPS_CAP:-60}"
 [[ -n "$SEED" ]] && export NOITA_ONLINE_SOLO_SEED="$SEED"
 
 if [[ "$SOLO" == 1 ]]; then

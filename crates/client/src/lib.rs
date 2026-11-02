@@ -248,6 +248,15 @@ pub unsafe extern "C" fn no_report_state(
     elapsed
 }
 
+/// Cap the frame rate at `fps` (0 = uncapped), measured between frame marks; stands in
+/// for vsync where the display cannot provide it.
+#[no_mangle]
+pub extern "C" fn no_set_frame_cap(fps: u32) {
+    with_rt((), |rt| {
+        rt.timer.min_interval = (fps > 0).then(|| Duration::from_secs_f64(1.0 / fps as f64));
+    })
+}
+
 /// Mark the start of a game frame. Every 60 frames a performance report is sent (when
 /// connected). Returns the previous frame's duration in µs (0 for the first).
 #[no_mangle]

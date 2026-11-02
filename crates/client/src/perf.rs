@@ -1,6 +1,8 @@
-//! Frame-time recording: intervals between consecutive frame marks from the game thread.
+//! Frame-time recording (intervals between consecutive frame marks from the game thread)
+//! and an optional frame-rate cap standing in for vsync, which a virtual X display
+//! cannot provide.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Default)]
 pub struct FrameTimer {
@@ -10,6 +12,8 @@ pub struct FrameTimer {
     window: Vec<u32>,
     /// Time spent blocked waiting for lockstep ticks during the current window (µs).
     pub window_wait_us: u64,
+    /// Minimum frame interval (frame-rate cap); None = uncapped.
+    pub min_interval: Option<Duration>,
 }
 
 pub struct WindowStats {
@@ -21,7 +25,24 @@ pub struct WindowStats {
 }
 
 impl FrameTimer {
+    /// Mark the start of a frame: first hold the frame until the cap's interval since the
+    /// previous frame start has elapsed, then record the interval.
     pub fn mark(&mut self) -> Option<u32> {
+        if let (Some(min), Some(last)) = (self.min_interval, self.last) {
+            let target = last + min;
+            loop {
+                let now = Instant::now();
+                if now >= target {
+                    break;
+                }
+                let left = target - now;
+                if left > Duration::from_micros(1500) {
+                    std::thread::sleep(left - Duration::from_micros(1000));
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+        }
         let now = Instant::now();
         let dt = self.last.map(|l| now.duration_since(l).as_micros().min(u32::MAX as u128) as u32);
         self.last = Some(now);
