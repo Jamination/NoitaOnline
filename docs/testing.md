@@ -60,7 +60,6 @@ vanilla single-player baseline, same scenario, seed and pinning; average and 1 %
 same session guarantees under the network conditions. Every lockstep client simulates every
 player, so an N-player session carries N players' workload; its FPS against N solo
 instances is printed for information only.
-same session guarantees under the network conditions.
 
 ### Profiling
 

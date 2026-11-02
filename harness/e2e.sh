@@ -82,7 +82,7 @@ fi
 
 k=0
 for id in "${IDS[@]}"; do
-  CPUSET=""
+  CPUSET="${NOITA_CPUSET:-}"
   # --pin: client k gets physical core PIN_BASE+k (both SMT threads; default base 2); cores
   # 0-1 stay free for the X server, wineservers and the game server. Concurrent harness
   # runs use different NOITA_PIN_BASE values so they never share cores.
