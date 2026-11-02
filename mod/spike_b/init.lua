@@ -536,22 +536,47 @@ end
 -- RNG probes: redirect direct CALLs inside the sim window through a stub that reports glcg
 -- before the callee runs (site order = execution order within DeathMatch::Update FUN_006b26f0).
 local PROBE_SITES = { 0x006b3267, 0x006b3279, 0x006b3284, 0x006b3295, 0x006b32a1, 0x006b32d8,
-  0x006b32e4, 0x006b32e9 } -- 0x006b32ae (world update) skipped: XMM1 carries dt there
+  0x006b32e4, 0x006b32e9 }
+if os.getenv("SPIKE_B_PROBE") == "2" then
+  -- inside the world update: FUN_006363b0, world update FUN_006f1d40 entry, FUN_00657680, grid
+  -- FUN_0071a6b0, WorldLightAndFog job submit (after grid, before the vtbl+0x60(dt) updates), after.
+  PROBE_SITES = { 0x006b32a1, 0x006b32ae, 0x006f1d74, 0x006f1eed, 0x006f1f13, 0x006b32d8 }
+elseif os.getenv("SPIKE_B_PROBE") == "3" then
+  -- inside the grid update FUN_0071a6b0 (in call order)
+  PROBE_SITES = { 0x0071a741, 0x0071a748, 0x0071a74f, 0x0071a75a, 0x0071a769, 0x0071a779, 0x0071a780, 0x0071a787,
+    0x0071a7bf, 0x0071a7f2, 0x0071a825 }
+end
 local probe_vals = {}
 local probe_cb
 local function install_probes()
   probe_cb = ffi.cast("void(__cdecl*)(int)", function(i)
     probe_vals[i] = string.format("%08x/%08x", U32(0x0120741c), U32(RAND_STATE))
+    if i == 7 and os.getenv("SPIKE_B_PROBE") == "3" then
+      local gw = gridworld()
+      probe_vals.q7 = string.format("new=%d pend=%d bud=%d", (U32(gw + 0x5a8) - U32(gw + 0x5a4)) / 4,
+        (U32(gw + 0x5b4) - U32(gw + 0x5b0)) / 4, I32(gw + 0x5bc))
+    end
   end)
   local cb = tonumber(ffi.cast("uint32_t", probe_cb))
+  local xs = tonumber(ffi.cast("uint32_t", det_exec)) + 0xC00 -- XMM0..3 save area
   for i, site in ipairs(PROBE_SITES) do
     if U8(site) ~= 0xE8 then log(string.format("probe: site %08x not a CALL", site)) return end
     local target = site + 5 + ffi.cast("int32_t*", site + 1)[0]
-    local s = 0x200 + (i - 1) * 32
+    local s = 0x400 + (i - 1) * 80
     local sa = tonumber(ffi.cast("uint32_t", det_exec)) + s
-    local code = { 0x60, 0x9C, 0x6A, i, 0xB8 }
+    local code = { 0x60, 0x9C }
+    for r = 0, 3 do  -- movups [xs+16r], xmm_r  (XMM regs carry float args in LTCG code)
+      code[#code + 1] = 0x0F; code[#code + 1] = 0x11; code[#code + 1] = 0x05 + 8 * r
+      for _, b in ipairs(le32(xs + 16 * r)) do code[#code + 1] = b end
+    end
+    code[#code + 1] = 0x6A; code[#code + 1] = i; code[#code + 1] = 0xB8
     for _, b in ipairs(le32(cb)) do code[#code + 1] = b end
-    for _, b in ipairs({ 0xFF, 0xD0, 0x83, 0xC4, 0x04, 0x9D, 0x61, 0xE9 }) do code[#code + 1] = b end
+    for _, b in ipairs({ 0xFF, 0xD0, 0x83, 0xC4, 0x04 }) do code[#code + 1] = b end
+    for r = 0, 3 do  -- movups xmm_r, [xs+16r]
+      code[#code + 1] = 0x0F; code[#code + 1] = 0x10; code[#code + 1] = 0x05 + 8 * r
+      for _, b in ipairs(le32(xs + 16 * r)) do code[#code + 1] = b end
+    end
+    for _, b in ipairs({ 0x9D, 0x61, 0xE9 }) do code[#code + 1] = b end
     for _, b in ipairs(le32(target - (sa + #code + 4))) do code[#code + 1] = b end
     for k, b in ipairs(code) do det_exec[s + k - 1] = b end
     local rel = le32(sa - (site + 5))
@@ -559,13 +584,78 @@ local function install_probes()
   end
   log("probe: installed " .. #PROBE_SITES .. " sites")
 end
+-- Queue trace (SPIKE_B_QTRACE=1): hook vector<Cell*>::push_back FUN_0089d7a0 and record every push into
+-- GridWorld+0x5a4 (new items) / +0x5b0 (pending) with phase (1 = inside Pre..Post, 2 = outside), frame,
+-- return address, caller chain (EBP walk), cell, material, cell x/y. Source: run/re_camleak/qtrace.s
+local QT = nil
+local function install_qtrace()
+  if U8(0x0089d7a0) ~= 0x55 or U8(0x0089d7a3) ~= 0x56 or U8(0x0089d7a5) ~= 0xF1 then
+    log("qtrace: push_back prologue unexpected") return
+  end
+  local page = ffi.cast("uint8_t*", C.VirtualAlloc(nil, 0x20000, 0x3000, 0x40))
+  local base = tonumber(ffi.cast("uint32_t", page))
+  QT = { page = page, base = base, vnew = base + 0x200, vpend = base + 0x204, idx = base + 0x208, phase = base + 0x20c,
+    frame = base + 0x210, buf = base + 0x1000, rd = 0 }
+  local hex = "3b0d0100aaaa74143b0d0200aaaa740c5589e55689ce68a6d78900c3609c8b150300aaaa81e2ff030000c1e20681c20400aaaa" ..
+      "a10500aaaa8902a10600aaaa8942048b442424894208894a0c8b4424288b0089421085c074128b4814894a148b4818894a188b481c" ..
+      "894a1c89e8bb060000008d7a2089c129e181f900001000730d8b4804890f83c7048b004b75e7ff050300aaaa9d61e975ffffff"
+  local code = {}
+  for i = 1, #hex, 2 do code[#code + 1] = tonumber(hex:sub(i, i + 1), 16) end
+  local subst = { QT.vnew, QT.vpend, QT.idx, QT.buf, QT.phase, QT.frame }
+  local i = 1
+  while i <= #code - 3 do
+    if code[i + 2] == 0xaa and code[i + 3] == 0xaa and code[i + 1] == 0 and code[i] >= 1 and code[i] <= 6 then
+      local v = le32(subst[code[i]])
+      code[i], code[i + 1], code[i + 2], code[i + 3] = v[1], v[2], v[3], v[4]
+      i = i + 4
+    else
+      i = i + 1
+    end
+  end
+  for k, b in ipairs(code) do page[k - 1] = b end
+  local gw = gridworld()
+  ffi.cast("uint32_t*", QT.vnew)[0] = gw + 0x5a4
+  ffi.cast("uint32_t*", QT.vpend)[0] = gw + 0x5b0
+  local rel = le32(base - (0x0089d7a0 + 5))
+  patch_bytes(0x0089d7a0, { 0xE9, rel[1], rel[2], rel[3], rel[4], 0x90 })
+  log(string.format("qtrace: installed stub %08x gw=%08x", base, gw))
+end
+local function qtrace_sizes(tag, f)
+  local gw = gridworld()
+  log(string.format("QS f=%d %s new=%d pend=%d bud=%d", f, tag, (U32(gw + 0x5a8) - U32(gw + 0x5a4)) / 4,
+    (U32(gw + 0x5b4) - U32(gw + 0x5b0)) / 4, I32(gw + 0x5bc)))
+end
+local function qtrace_dump()
+  if not QT then return end
+  local n = U32(QT.idx)
+  if n - QT.rd > 1024 then log(string.format("Q overflow lost=%d", n - QT.rd - 1024)) QT.rd = n - 1024 end
+  local mb = mat_begin()
+  local gw = gridworld()
+  while QT.rd < n do
+    local e = ffi.cast("uint32_t*", QT.buf + bit.band(QT.rd, 0x3ff) * 64)
+    local ch = {}
+    for k = 8, 13 do ch[#ch + 1] = string.format("%08x", e[k]) e[k] = 0 end
+    local mat = (e[5] ~= 0 and e[5] >= mb) and math.floor((e[5] - mb) / 0x290) or -1
+    log(string.format("Q ph=%d f=%d ret=%08x %s cell=%08x mat=%d xy=%d,%d chain=%s", e[0], e[1], e[2],
+      (e[3] == gw + 0x5a4) and "NEW" or "PEND", e[4], mat, tonumber(ffi.cast("int32_t", e[6])),
+      tonumber(ffi.cast("int32_t", e[7])), table.concat(ch, ",")))
+    QT.rd = QT.rd + 1
+  end
+end
 function mfsplit_step(f)
   if f == 1 then
     fix_seeds("frame1")
     make_unload_thunk()
-    if os.getenv("SPIKE_B_PROBE") == "1" then install_probes() end
+    if (os.getenv("SPIKE_B_PROBE") or "") ~= "" then install_probes() end
     rng_sim = rng_save()
     log(string.format("mfsplit: rng=%s simcam=%s", tostring(SPLIT_RNG), tostring(SPLIT_CAM)))
+    if os.getenv("SPIKE_B_QTRACE") == "1" then install_qtrace() end
+  end
+  if QT then
+    qtrace_dump()
+    ffi.cast("uint32_t*", QT.phase)[0] = 1
+    ffi.cast("uint32_t*", QT.frame)[0] = f
+    qtrace_sizes("pre", f)
   end
   -- enter sim window
   if SPLIT_RNG then rng_render = rng_save(); rng_load(rng_sim) end
@@ -599,19 +689,22 @@ function mfsplit_step(f)
   end
 end
 function mfsplit_post(f)
+  if QT then qtrace_dump() qtrace_sizes("post", f) end
   if probe_cb then
     local parts = { "0:" .. tostring(probe_vals[0]) }
     for i = 1, #PROBE_SITES do parts[#parts + 1] = i .. ":" .. tostring(probe_vals[i]) end
     parts[#parts + 1] = string.format("99:%08x/%08x", U32(0x0120741c), U32(RAND_STATE))
+    if probe_vals.q7 then parts[#parts + 1] = "q7:" .. probe_vals.q7 end
     log("PR f=" .. f .. " " .. table.concat(parts, " "))
   end
   own_unloader(f)                       -- still inside the sim window
   -- leave sim window
   if SPLIT_RNG then rng_sim = rng_save(); rng_load(rng_render) end
   if f >= 2 then
-    local off = (inst % 2 == 0) and 0 or 1000
+    local off = ((inst % 2 == 0) or os.getenv("SPIKE_B_SAMEVIEW") == "1") and 0 or 1000
     GameSetCameraPos(P[1] + off, P[2])  -- this client's own render camera
   end
+  if QT then ffi.cast("uint32_t*", QT.phase)[0] = 2 end
 end
 function mfdet_step(f)
   if MODE == "mfsplit" then return mfsplit_step(f) end

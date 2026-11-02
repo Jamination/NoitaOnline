@@ -246,7 +246,8 @@ local function globals_str()
   return string.format("plat=%08x pseed=%08x glcg=%08x wseed=%08x rand=%08x/%d srand=%08x tp=%d prng=%.0f entx=%08x cw=%d/%d %s",
     rd32(PLATFORM + 0xa0), rd32(PLATFORM + 0xa4), rd32(GLOBAL_LCG), rd32(WORLD_SEED),
     rd32(RAND_STATE), rd32(RAND_COUNT), rd32(SRAND_LAST), ffi.cast("uint8_t*", USE_CUSTOM_THREADPOOL)[0],
-    ffi.cast("double*", 0x01222388)[0], ex, cw.calls, cw.waited, particles_str())
+    ffi.cast("double*", 0x01222388)[0], ex, cw.calls, cw.waited, particles_str() ..
+    string.format(" gt=%08x", P(gg()) ~= 0 and rd32(P(gg()) + 8) or 0))
 end
 
 local function fix_seeds(where)

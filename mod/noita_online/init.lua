@@ -61,7 +61,15 @@ else
     error("noita_online: " .. NO.last_error())
   end
   log(string.format("determinism patches applied (mask %x)", mask))
-  local rc = NO.lib.no_connect(cfg.server, cfg.name, Config.GAME_BUILD, 0, cfg.netsim or "")
+  -- Every client must run the same mods (they change the simulation); the server compares this.
+  local mods = ModGetActiveModIDs() or {}
+  table.sort(mods)
+  local mod_hash = 5381
+  for _, ch in ipairs({ string.byte(table.concat(mods, ",") .. "|" .. Config.MOD_VERSION, 1, -1) }) do
+    mod_hash = (mod_hash * 33 + ch) % 4294967296
+  end
+  log("active mods: " .. table.concat(mods, ","))
+  local rc = NO.lib.no_connect(cfg.server, cfg.name, Config.GAME_BUILD, mod_hash, cfg.netsim or "")
   if rc ~= 0 then error("noita_online: connect failed (" .. rc .. ")") end
   log("connecting to " .. cfg.server .. " as " .. cfg.name)
   local st = -1
@@ -79,6 +87,9 @@ else
   log(string.format("session started: seed=%d delay=%d me=%d players=%s", info.seed, info.input_delay, info.player, table.concat(info.players, ",")))
 end
 
+-- Lockstep sessions stream chunks around every player (foci) with a deterministic unloader
+-- instead of the per-client camera and wall-clock unloader, and never cap grid updates
+-- (the cap keeps the tiles nearest each client's own camera).
 local magic = string.format([[<MagicNumbers
   WORLD_SEED="%d"
   DEBUG_NO_PAUSE_ON_WINDOW_FOCUS_LOST="1"
@@ -86,7 +97,8 @@ local magic = string.format([[<MagicNumbers
   DEBUG_THREADED_WORLD_CREATION="0"
   BOX2D_THREAD_MAX_WAIT_IN_MS="100000"
   GRID_FLEXIBLE_MAX_UPDATES="0"
-/>]], session.seed)
+  %s
+/>]], session.seed, solo and "" or 'STREAMING_ENABLED="0" GRID_MAX_UPDATES_PER_FRAME="100000"')
 ModTextFileSetContent("mods/noita_online/files/session_magic.xml", magic)
 ModMagicNumbersFileAdd("mods/noita_online/files/session_magic.xml")
 
@@ -106,6 +118,8 @@ function OnPlayerSpawned(player)
     Players.setup_solo(player)
   else
     Players.setup(player, session.players, session.player)
+    -- The camera is driven by us from now on (sim camera inside the window, own outside).
+    GameSetCameraFree(true)
   end
   ready = true
   log("players ready at frame " .. GameGetFrameNum())
@@ -124,6 +138,42 @@ end
 
 local lockstep_alive = true
 
+-- Focus rectangles (one per player slot, slot order): chunks there stay loaded and simulated.
+local FOCUS_HW, FOCUS_HH = 400, 300
+local UNLOAD_MARGIN, UNLOAD_EVERY, UNLOAD_MAX = 512, 30, 2
+local ffi = require("ffi")
+local foci_buf = ffi.new("int32_t[128]")
+
+local function current_foci()
+  local foci = {}
+  for _, slot in ipairs(Players.slots) do
+    if EntityGetIsAlive(slot.entity) then
+      local x, y = EntityGetTransform(slot.entity)
+      x, y = math.floor(x), math.floor(y)
+      foci[#foci + 1] = { x - FOCUS_HW, y - FOCUS_HH, x + FOCUS_HW, y + FOCUS_HH, x = x, y = y }
+    end
+  end
+  return foci
+end
+
+-- Inside the simulation window every client uses the same camera (first live player),
+-- because camera-dependent engine systems feed the simulation; rendering uses our own.
+local render_cam = nil
+local function set_sim_camera(foci)
+  if foci[1] then GameSetCameraPos(foci[1].x, foci[1].y) end
+end
+local function set_render_camera()
+  local slot = Players.local_slot()
+  if not slot or not EntityGetIsAlive(slot.entity) then return end
+  local x, y = EntityGetTransform(slot.entity)
+  if not render_cam then render_cam = { x = x, y = y } end
+  render_cam.x = render_cam.x + (x - render_cam.x) * 0.2
+  render_cam.y = render_cam.y + (y - render_cam.y) * 0.2
+  GameSetCameraPos(render_cam.x, render_cam.y)
+end
+
+local in_sim_window = false
+
 function OnWorldPreUpdate()
   if finished then return end
   local f = GameGetFrameNum()
@@ -136,7 +186,6 @@ function OnWorldPreUpdate()
     end
     return
   end
-  if f == 1 then NO.lib.no_fix_seeds(session.seed) end
   if not lockstep_alive then return end
   NO.send_input(f + session.input_delay, Input.encode(local_input(f)))
   local tick, err
@@ -149,8 +198,14 @@ function OnWorldPreUpdate()
     lockstep_alive = false
     return
   end
+  NO.lib.no_sim_enter()
+  in_sim_window = true
+  if f == 1 then NO.lib.no_fix_seeds(session.seed) end
   if ready then
+    local foci = current_foci()
+    set_sim_camera(foci)
     Players.apply_tick(f, tick)
+    for _, r in ipairs(foci) do NO.lib.no_stream_focus(r[1], r[2], r[3], r[4]) end
     if session.scenario == "bot" then Bot.world_events(f, Players.slots) end
   end
 end
@@ -158,11 +213,34 @@ end
 function OnWorldPostUpdate()
   if finished then return end
   local f = GameGetFrameNum()
-  if not solo and ready and lockstep_alive and f % 60 == 0 then
-    local h, positions = State.collect(Players.proxy)
-    NO.report_state(f, h, positions)
+  if in_sim_window then
+    if ready and f % UNLOAD_EVERY == 0 then
+      local foci = current_foci()
+      for i, r in ipairs(foci) do
+        for k = 1, 4 do foci_buf[(i - 1) * 4 + k - 1] = r[k] end
+      end
+      NO.lib.no_unload_far(foci_buf, #foci, UNLOAD_MARGIN, UNLOAD_MAX)
+    end
+    if ready and f % 60 == 0 then
+      local h, positions = State.collect(Players.proxy)
+      local us = NO.report_state(f, h, positions)
+      if f % 600 == 0 or us > 8000 then log(string.format("state report f=%d chunk-hash %.2f ms", f, us / 1000)) end
+    end
+    NO.lib.no_sim_leave()
+    in_sim_window = false
+    if ready then set_render_camera() end
   end
   if f % 600 == 0 then drain_events() end
+  if cfg.debug and ready and f % 60 == 0 then
+    local slot = Players.local_slot()
+    if slot and EntityGetIsAlive(slot.entity) then
+      local x, y = EntityGetTransform(slot.entity)
+      local pressed = {}
+      for k, v in pairs(slot.prev.buttons) do if v then pressed[#pressed + 1] = k end end
+      table.sort(pressed)
+      log(string.format("debug f=%d local=(%.1f,%.1f) buttons=%s mouse=(%.1f,%.1f)", f, x, y, table.concat(pressed, "+"), slot.prev.mx, slot.prev.my))
+    end
+  end
   if cfg.duration and ready and f >= cfg.duration then
     finished = true
     quit_game("duration reached at frame " .. f)

@@ -2,6 +2,8 @@
 -- in-game mod settings (settings.lua).
 local M = {}
 
+-- Bumped with every change that affects the simulation; clients must match exactly.
+M.MOD_VERSION = "0.1.0"
 -- The only Noita build whose memory layout the native runtime supports.
 M.GAME_BUILD = "noita-2025-01-25-6794ee3c"
 
@@ -27,6 +29,7 @@ function M.load()
   c.solo_seed = tonumber(env("NOITA_ONLINE_SOLO_SEED") or "123456789")
   c.duration = tonumber(env("NOITA_ONLINE_DURATION") or "")
   c.exit_on_finish = env("NOITA_ONLINE_EXIT") == "1"
+  c.debug = env("NOITA_ONLINE_DEBUG") == "1"
   local root = env("NOITA_ONLINE_ROOT")
   local inst = env("NOITA_ONLINE_INSTANCE") or "0"
   local out = env("NOITA_ONLINE_OUT") or (root and (root .. "/run/logs"))

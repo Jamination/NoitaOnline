@@ -2,7 +2,8 @@
 --
 -- Wire format (little endian):
 --   u32 buttons bitmask (BUTTONS order), u8 change-item-right count, u8 change-item-left
---   count, i32 mouse x * 8, i32 mouse y * 8, i32 aim x * 1024, i32 aim y * 1024.
+--   count, i32 mouse x * 8, i32 mouse y * 8, i32 aim x * 1024, i32 aim y * 1024,
+--   u8 quick-slot select (0 = none, 1..8 = number key pressed this frame).
 -- Quantising floats at capture time means every client applies bit-identical values.
 local M = {}
 
@@ -29,7 +30,7 @@ local function q(v, scale)
   return math.floor(v * scale + 0.5)
 end
 
--- state: { buttons = {Fire=true,...}, count_r=, count_l=, mx=, my=, ax=, ay= }
+-- state: { buttons = {Fire=true,...}, count_r=, count_l=, mx=, my=, ax=, ay=, select= }
 function M.encode(state)
   local mask = 0
   for i = 1, NB do
@@ -38,12 +39,14 @@ function M.encode(state)
   return u32le(mask) .. string.char(math.min(255, state.count_r or 0), math.min(255, state.count_l or 0))
     .. u32le(q(state.mx or 0, 8)) .. u32le(q(state.my or 0, 8))
     .. u32le(q(state.ax or 0, 1024)) .. u32le(q(state.ay or 0, 1024))
+    .. string.char(state.select or 0)
 end
 
-M.NEUTRAL = { buttons = {}, count_r = 0, count_l = 0, mx = 0, my = 0, ax = 0, ay = 0 }
+M.NEUTRAL = { buttons = {}, count_r = 0, count_l = 0, mx = 0, my = 0, ax = 0, ay = 0, select = 0 }
+M.SIZE = 23
 
 function M.decode(s)
-  if s == nil or #s < 22 then return M.NEUTRAL end
+  if s == nil or #s < M.SIZE then return M.NEUTRAL end
   local mask = rd_u32(s, 1)
   local buttons = {}
   for i = 1, NB do
@@ -57,6 +60,7 @@ function M.decode(s)
     my = rd_u32(s, 11) / 8,
     ax = rd_u32(s, 15) / 1024,
     ay = rd_u32(s, 19) / 1024,
+    select = s:byte(23),
   }
 end
 
@@ -70,11 +74,16 @@ function M.capture_from(controls)
   end
   local mx, my = ComponentGetValue2(controls, "mMousePosition")
   local ax, ay = ComponentGetValue2(controls, "mAimingVector")
+  local select = 0
+  for k = 1, 8 do
+    if InputIsKeyJustDown(29 + k) then select = k end -- Key_1 .. Key_8 (SDL scancodes 30..37)
+  end
   return {
     buttons = buttons,
     count_r = ComponentGetValue2(controls, "mButtonCountChangeItemR"),
     count_l = ComponentGetValue2(controls, "mButtonCountChangeItemL"),
     mx = mx, my = my, ax = ax, ay = ay,
+    select = select,
   }
 end
 

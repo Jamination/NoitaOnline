@@ -96,17 +96,13 @@ impl Exec {
     }
 }
 
-struct Installed {
-    rand_state: u32,
-}
-
 static RAND_STATE_ADDR: AtomicU32 = AtomicU32::new(0);
 pub static CHUNK_WAITS: AtomicU32 = AtomicU32::new(0);
 pub static CHUNK_WAIT_MS: AtomicU32 = AtomicU32::new(0);
 
 /// Replace msvcr120 rand/srand (per-thread state) with one process-wide LCG, so the grid's
 /// per-frame std::random_shuffle calls see the same sequence on every client.
-unsafe fn patch_rand(ex: &mut Exec) -> Result<Installed, PatchError> {
+unsafe fn patch_rand(ex: &mut Exec) -> Result<(), PatchError> {
     let state = ex.alloc_data(8);
     let s = state.to_le_bytes();
     // mov eax,[state]; imul eax,eax,0x343fd; add eax,0x269ec3; mov [state],eax;
@@ -120,7 +116,7 @@ unsafe fn patch_rand(ex: &mut Exec) -> Result<Installed, PatchError> {
     write_code(IAT_RAND, &rand_at.to_le_bytes())?;
     write_code(IAT_SRAND, &srand_at.to_le_bytes())?;
     RAND_STATE_ADDR.store(state, Ordering::Relaxed);
-    Ok(Installed { rand_state: state })
+    Ok(())
 }
 
 /// Streaming throttle runs every STREAMING_FREQUENCY seconds of *wall-clock* time; give it
@@ -228,13 +224,16 @@ pub unsafe fn apply_all() -> Result<u32, PatchError> {
         return Ok(APPLIED.load(Ordering::Relaxed));
     }
     let mut ex = Exec::new()?;
-    let installed = patch_rand(&mut ex)?;
-    let _ = installed.rand_state;
+    patch_rand(&mut ex)?;
     patch_stream_clock(&mut ex)?;
     patch_chunk_wait(&mut ex)?;
     patch_inline_jobs()?;
-    APPLIED.store(0b1111, Ordering::Relaxed);
-    Ok(0b1111)
+    patch_particle_init()?;
+    patch_camera_loads()?;
+    patch_fixed_dt(&mut ex)?;
+    let mask = 0b111_1111;
+    APPLIED.store(mask, Ordering::Relaxed);
+    Ok(mask)
 }
 
 /// Overwrite every time/pid-seeded engine RNG with values derived from the session seed.
@@ -247,8 +246,186 @@ pub unsafe fn fix_seeds(seed: u32) {
     *((PLATFORM + 0xa4) as *mut u32) = seed;
     *(GLOBAL_LCG as *mut u32) = seed ^ 0xc;
     *(GLOBAL_PM as *mut f64) = seed as f64;
+    *(PARTICLE_RNG as *mut f64) = seed as f64;
     let rs = RAND_STATE_ADDR.load(Ordering::Relaxed);
     if rs != 0 {
         *(rs as *mut u32) = seed.wrapping_mul(0x9e37_79b9) | 1;
     }
+    // The simulation RNG bank starts from exactly these values.
+    SIM_BANK.with(|b| *b.borrow_mut() = Some(RngBank::capture()));
+}
+
+// --- multi-focus streaming, particles, fixed timestep, simulation RNG bank ---------------
+
+/// GridParticles RNG (double), seeded from the platform RNG.
+const PARTICLE_RNG: u32 = 0x0122_2388;
+/// Particle constructor: `and byte [esi+0x6a],0x02` / `and byte [esi+0x6c],0xfc` keep
+/// uninitialised heap bits (they pick the collision world); clear them fully instead.
+const PARTICLE_CTOR_AND_6A: u32 = 0x0071_213e;
+const PARTICLE_CTOR_AND_6C: u32 = 0x0071_2144;
+/// Camera-driven GridWorld::RequestLoad calls (camera rect + look-ahead).
+const CAMERA_LOAD_CALLS: [u32; 2] = [0x0072_0210, 0x0072_0290];
+/// StreamingKeepAlive: RequestLoad(rect) + keep chunks in rect±256 loaded for 10 frames.
+const KEEP_ALIVE_RECT_FN: u32 = 0x0073_e080;
+/// Unload one chunk: fastcall(ecx = ChunkMap*, edx = int[3]{cx, cy, index}, stack: 1).
+const UNLOAD_CHUNK_FN: u32 = 0x0074_0e70;
+/// DeathMatch::Update(this, float dt): dt is wall-clock time and feeds the simulation.
+const DEATHMATCH_UPDATE: u32 = 0x006b_26f0;
+
+unsafe fn patch_particle_init() -> Result<(), PatchError> {
+    expect(PARTICLE_CTOR_AND_6A, &[0x02])?;
+    expect(PARTICLE_CTOR_AND_6C, &[0xFC])?;
+    write_code(PARTICLE_CTOR_AND_6A, &[0x00])?;
+    write_code(PARTICLE_CTOR_AND_6C, &[0x00])
+}
+
+/// Chunks are loaded around every player (identically on all clients) instead of around
+/// each client's own camera.
+unsafe fn patch_camera_loads() -> Result<(), PatchError> {
+    for site in CAMERA_LOAD_CALLS {
+        if *(site as *const u8) != 0xE8 {
+            return Err(PatchError(format!("camera load call at {site:08x} not found")));
+        }
+    }
+    for site in CAMERA_LOAD_CALLS {
+        // call RequestLoad (cdecl, 2 args) -> add esp,8; nop; nop
+        write_code(site, &[0x83, 0xC4, 0x08, 0x90, 0x90])?;
+    }
+    Ok(())
+}
+
+unsafe fn patch_fixed_dt(ex: &mut Exec) -> Result<(), PatchError> {
+    expect(DEATHMATCH_UPDATE, &[0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0])?;
+    let stub_at = ex.base + ex.used;
+    // mov dword [esp+4], 1/60f; push ebp; mov ebp,esp; and esp,-16; jmp DEATHMATCH_UPDATE+6
+    let mut stub = vec![0xC7, 0x44, 0x24, 0x04, 0x89, 0x88, 0x88, 0x3C, 0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0, 0xE9];
+    stub.extend_from_slice(&rel32(stub_at + stub.len() as u32 + 4, DEATHMATCH_UPDATE + 6));
+    let at = ex.put(&stub);
+    let mut jmp = vec![0xE9];
+    jmp.extend_from_slice(&rel32(DEATHMATCH_UPDATE + 5, at));
+    jmp.push(0x90);
+    write_code(DEATHMATCH_UPDATE, &jmp)
+}
+
+/// Request loading of (and keep alive) the chunks around a focus rectangle this frame.
+///
+/// # Safety
+/// Game thread, inside the simulation window, world initialised.
+pub unsafe fn stream_focus(x0: i32, y0: i32, x1: i32, y1: i32) {
+    let rect = [x0, y0, x1, y1];
+    let f: extern "fastcall" fn(*const i32) = std::mem::transmute(KEEP_ALIVE_RECT_FN as usize);
+    f(rect.as_ptr());
+}
+
+/// Deterministic replacement for the wall-clock streaming unloader: unload up to `max`
+/// loaded chunks (ascending table index) that lie outside every focus rect grown by
+/// `margin`. Returns how many were unloaded.
+///
+/// # Safety
+/// Game thread, inside the simulation window, world initialised.
+pub unsafe fn unload_far_chunks(foci: &[[i32; 4]], margin: i32, max: u32) -> u32 {
+    let gg = rd(GAME_GLOBAL_PTR);
+    if gg == 0 {
+        return 0;
+    }
+    let world_data = rd(gg + 0x0c);
+    let grid_world = if world_data != 0 { rd(world_data + 0x44) } else { 0 };
+    if grid_world == 0 {
+        return 0;
+    }
+    let chunk_map = grid_world + 0x500;
+    let table = rd(chunk_map + 8) as *const u32;
+    if table.is_null() {
+        return 0;
+    }
+    let unload: extern "fastcall" fn(u32, *const i32, i32) = std::mem::transmute(UNLOAD_CHUNK_FN as usize);
+    let mut n = 0;
+    for idx in 0..512 * 512u32 {
+        if n >= max {
+            break;
+        }
+        if *table.add(idx as usize) == 0 {
+            continue;
+        }
+        let cx = (idx % 512) as i32 - 256;
+        let cy = (idx / 512) as i32 - 256;
+        let (x0, y0) = (cx * 512, cy * 512);
+        let keep = foci.iter().any(|r| {
+            x0 < r[2] + margin && x0 + 512 > r[0] - margin && y0 < r[3] + margin && y0 + 512 > r[1] - margin
+        });
+        if !keep {
+            let coords = [cx, cy, idx as i32];
+            unload(chunk_map, coords.as_ptr(), 1);
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Every engine RNG state, so the simulation can run on its own stream while rendering
+/// and other per-client code (camera-dependent) consumes a separate one.
+#[derive(Clone, Copy)]
+struct RngBank {
+    lcg: u32,
+    plat_a0: u32,
+    plat_a4: u32,
+    pm: f64,
+    particle: f64,
+    rand: u32,
+}
+
+impl RngBank {
+    unsafe fn capture() -> Self {
+        let rs = RAND_STATE_ADDR.load(Ordering::Relaxed);
+        Self {
+            lcg: rd(GLOBAL_LCG),
+            plat_a0: rd(PLATFORM + 0xa0),
+            plat_a4: rd(PLATFORM + 0xa4),
+            pm: *(GLOBAL_PM as *const f64),
+            particle: *(PARTICLE_RNG as *const f64),
+            rand: if rs != 0 { rd(rs) } else { 0 },
+        }
+    }
+    unsafe fn restore(&self) {
+        *(GLOBAL_LCG as *mut u32) = self.lcg;
+        *((PLATFORM + 0xa0) as *mut u32) = self.plat_a0;
+        *((PLATFORM + 0xa4) as *mut u32) = self.plat_a4;
+        *(GLOBAL_PM as *mut f64) = self.pm;
+        *(PARTICLE_RNG as *mut f64) = self.particle;
+        let rs = RAND_STATE_ADDR.load(Ordering::Relaxed);
+        if rs != 0 {
+            *(rs as *mut u32) = self.rand;
+        }
+    }
+}
+
+thread_local! {
+    static SIM_BANK: std::cell::RefCell<Option<RngBank>> = const { std::cell::RefCell::new(None) };
+    static RENDER_BANK: std::cell::RefCell<Option<RngBank>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Entering the simulation window: stash the per-client RNG states, load the sim stream.
+///
+/// # Safety
+/// Game thread.
+pub unsafe fn sim_rng_enter() {
+    RENDER_BANK.with(|b| *b.borrow_mut() = Some(RngBank::capture()));
+    SIM_BANK.with(|b| {
+        if let Some(s) = *b.borrow() {
+            s.restore();
+        }
+    });
+}
+
+/// Leaving the simulation window: save the sim stream, put the per-client states back.
+///
+/// # Safety
+/// Game thread.
+pub unsafe fn sim_rng_leave() {
+    SIM_BANK.with(|b| *b.borrow_mut() = Some(RngBank::capture()));
+    RENDER_BANK.with(|b| {
+        if let Some(r) = *b.borrow() {
+            r.restore();
+        }
+    });
 }

@@ -360,6 +360,60 @@ pub extern "C" fn no_fix_seeds(seed: u32) {
     let _ = seed;
 }
 
+/// Keep the chunks around a focus rectangle loaded/simulated this frame (call once per
+/// player per frame, in slot order, inside the simulation window).
+#[no_mangle]
+pub extern "C" fn no_stream_focus(x0: i32, y0: i32, x1: i32, y1: i32) {
+    #[cfg(all(windows, target_arch = "x86"))]
+    unsafe {
+        patches::stream_focus(x0, y0, x1, y1)
+    };
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    let _ = (x0, y0, x1, y1);
+}
+
+/// Unload up to `max` chunks outside every focus rect (`foci`: n × {x0,y0,x1,y1}) grown
+/// by `margin`. Deterministic replacement for the engine's wall-clock unloader.
+///
+/// # Safety
+/// `foci` must point at `4 * n` readable i32.
+#[no_mangle]
+pub unsafe extern "C" fn no_unload_far(foci: *const i32, n: u32, margin: i32, max: u32) -> u32 {
+    #[cfg(all(windows, target_arch = "x86"))]
+    {
+        let rects: Vec<[i32; 4]> = (0..n as usize)
+            .map(|i| {
+                let p = foci.add(i * 4);
+                [*p, *p.add(1), *p.add(2), *p.add(3)]
+            })
+            .collect();
+        patches::unload_far_chunks(&rects, margin, max)
+    }
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    {
+        let _ = (foci, n, margin, max);
+        0
+    }
+}
+
+/// Enter the simulation window: switch every engine RNG to the shared simulation stream.
+#[no_mangle]
+pub extern "C" fn no_sim_enter() {
+    #[cfg(all(windows, target_arch = "x86"))]
+    unsafe {
+        patches::sim_rng_enter()
+    };
+}
+
+/// Leave the simulation window: save the simulation stream, restore this client's own.
+#[no_mangle]
+pub extern "C" fn no_sim_leave() {
+    #[cfg(all(windows, target_arch = "x86"))]
+    unsafe {
+        patches::sim_rng_leave()
+    };
+}
+
 static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
 
 fn set_last_error(s: String) {

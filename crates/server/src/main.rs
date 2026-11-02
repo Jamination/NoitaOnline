@@ -181,6 +181,7 @@ fn run(args: Args) -> std::io::Result<()> {
     let mut cpu_peak = 0.0f64;
     let mut ticks_sent: u64 = 0;
     let mut had_session = false;
+    let mut expected_mods: Option<u64> = None;
 
     loop {
         server.update();
@@ -233,6 +234,18 @@ fn run(args: Args) -> std::io::Result<()> {
                     match msg {
                         ClientMsg::Hello { protocol, game_build, mod_hash, name } => {
                             let build_ok = args.game_build.as_ref().is_none_or(|b| *b == game_build);
+                            // Every client must run the same mod set (mods change the simulation):
+                            // the first client to say hello defines it for the session.
+                            let mods_ok = *expected_mods.get_or_insert(mod_hash) == mod_hash;
+                            if !mods_ok {
+                                let reason = format!("mod list differs from the session's ({mod_hash:016x})");
+                                logs.event(&format!("client {id}: {reason}"));
+                                let _ = server.send(client, CH_RELIABLE, &ServerMsg::Kick { reason }.encode());
+                                server.flush();
+                                server.kick(client);
+                                players.remove(&id);
+                                continue;
+                            }
                             if protocol != GAME_PROTOCOL_VERSION || !build_ok {
                                 let reason = format!("version mismatch (protocol {protocol}, build {game_build})");
                                 logs.event(&format!("client {id}: {reason}"));
@@ -379,9 +392,12 @@ fn run(args: Args) -> std::io::Result<()> {
             write_summary(&logs, &args, &phase, &players, &departed, &perf, &verifier, cpu_start, wall_start, cpu_peak, ticks_sent);
             return Ok(());
         }
-        if players.is_empty() && matches!(phase, Phase::Running { .. }) {
-            logs.event("session ended (no players); back to lobby");
-            phase = Phase::Lobby;
+        if players.is_empty() {
+            expected_mods = None;
+            if matches!(phase, Phase::Running { .. }) {
+                logs.event("session ended (no players); back to lobby");
+                phase = Phase::Lobby;
+            }
         }
         std::thread::sleep(Duration::from_millis(1));
     }

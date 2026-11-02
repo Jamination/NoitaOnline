@@ -30,6 +30,7 @@ while [[ $# -gt 0 ]]; do
     --timeout) TIMEOUT_S="$2"; shift 2 ;;
     --seed) SEED="$2"; shift 2 ;;
     --pin) PIN=1; shift ;;
+    --human) HUMAN=1; shift ;;
     *) echo "unknown arg $1" >&2; exit 2 ;;
   esac
 done
@@ -49,9 +50,16 @@ cleanup() {
 trap cleanup EXIT
 
 export NOITA_MODS=noita_online
-export NOITA_ONLINE_BOT=1
-export NOITA_ONLINE_DURATION="$FRAMES"
-export NOITA_ONLINE_EXIT=1
+SCENARIO=bot
+if [[ "${HUMAN:-0}" == 1 ]]; then
+  # Manual play: real input via the proxy, no scripted events, no auto-exit.
+  SCENARIO=""
+  export NOITA_ONLINE_BOT=0 NOITA_ONLINE_DEBUG=1
+else
+  export NOITA_ONLINE_BOT=1
+  export NOITA_ONLINE_DURATION="$FRAMES"
+  export NOITA_ONLINE_EXIT=1
+fi
 export NOITA_ONLINE_OUT="$OUT"
 [[ -n "$SEED" ]] && export NOITA_ONLINE_SOLO_SEED="$SEED"
 
@@ -59,7 +67,7 @@ if [[ "$SOLO" == 1 ]]; then
   export NOITA_ONLINE_SOLO=1
   log "solo baseline: ${PLAYERS} instances x ${FRAMES} frames"
 else
-  SRV_ARGS=(--bind "127.0.0.1:$PORT" --players "$PLAYERS" --log-dir "$OUT" --exit-when-empty --scenario bot
+  SRV_ARGS=(--bind "127.0.0.1:$PORT" --players "$PLAYERS" --log-dir "$OUT" --exit-when-empty --scenario "$SCENARIO"
             --game-build "noita-2025-01-25-6794ee3c")
   [[ -n "$NETSIM" ]] && SRV_ARGS+=(--netsim "$NETSIM")
   [[ -n "$SEED" ]] && SRV_ARGS+=(--seed "$SEED")

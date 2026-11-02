@@ -33,6 +33,10 @@ int32_t no_apply_patches(void);
 void no_fix_seeds(uint32_t seed);
 int32_t no_last_error(uint8_t* out, uint32_t cap);
 int32_t no_start_params(uint8_t* out, uint32_t cap);
+void no_stream_focus(int32_t x0, int32_t y0, int32_t x1, int32_t y1);
+uint32_t no_unload_far(const int32_t* foci, uint32_t n, int32_t margin, uint32_t max);
+void no_sim_enter(void);
+void no_sim_leave(void);
 ]])
 
 local M = {}
