@@ -86,14 +86,14 @@ else
   session = info
   -- Scenario comes from the server so every client runs the same world events.
   session.scenario = info.params.scenario or ""
-  log(string.format("session started: seed=%d delay=%d me=%d players=%s", info.seed, info.input_delay, info.player, table.concat(info.players, ",")))
+  log(string.format("session started: seed=%.0f delay=%d me=%d players=%s", info.seed, info.input_delay, info.player, table.concat(info.players, ",")))
 end
 
 -- Lockstep sessions stream chunks around every player (foci) with a deterministic unloader
 -- instead of the per-client camera and wall-clock unloader, and never cap grid updates
 -- (the cap keeps the tiles nearest each client's own camera).
 local magic = string.format([[<MagicNumbers
-  WORLD_SEED="%d"
+  WORLD_SEED="%.0f"
   DEBUG_NO_PAUSE_ON_WINDOW_FOCUS_LOST="1"
   DEBUG_SINGLE_THREADED_LOADING="1"
   DEBUG_THREADED_WORLD_CREATION="0"

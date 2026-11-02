@@ -30,6 +30,9 @@ NOITA_DIR="${NOITA_DIR:-/home/james/.local/share/Steam/steamapps/common/Noita}"
   set_attr "$CFG" window_h "${NOITA_WINDOW_H:-360}"
   set_attr "$CFG" backbuffer_width "${NOITA_WINDOW_W:-640}"
   set_attr "$CFG" backbuffer_height "${NOITA_WINDOW_H:-360}"
+  # Render target at window size (rendering is software on the virtual test displays).
+  set_attr "$CFG" internal_size_w "${NOITA_WINDOW_W:-640}"
+  set_attr "$CFG" internal_size_h "${NOITA_WINDOW_H:-360}"
   set_attr "$CFG" check_for_updates 0
   set_attr "$CFG" vsync 0
   set_attr "$CFG" audio_fmod 0

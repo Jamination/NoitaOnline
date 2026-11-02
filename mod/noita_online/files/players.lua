@@ -16,6 +16,8 @@ M.proxy = nil
 M.proxy_controls = nil
 M.local_id = nil
 
+-- PlatformShooterPlayerComponent stays: it is part of how Noita turns raw keyboard/mouse
+-- state into the ControlsComponent fields we capture (camera centring is turned off below).
 local KEEP_ON_PROXY = { ControlsComponent = true, PlatformShooterPlayerComponent = true }
 
 local function make_proxy_inert(e)
@@ -31,11 +33,19 @@ local function make_proxy_inert(e)
     EntityRemoveTag(e, tag)
   end
   EntityAddTag(e, "noita_online_proxy")
-  -- Drop the proxy's own starting items so its inventory cannot act.
+  -- Remove everything hanging off the proxy: its starting items, and the arm/cape/emitter
+  -- child entities, which follow this client's own aim (local input) and could otherwise
+  -- touch the shared simulation. Done identically on every client.
   for _, child in ipairs(EntityGetAllChildren(e) or {}) do
-    for _, item in ipairs(EntityGetAllChildren(child) or {}) do
-      EntityRemoveFromParent(item)
-      EntityKill(item)
+    local name = EntityGetName(child)
+    if name == "inventory_quick" or name == "inventory_full" then
+      for _, item in ipairs(EntityGetAllChildren(child) or {}) do
+        EntityRemoveFromParent(item)
+        EntityKill(item)
+      end
+    else
+      EntityRemoveFromParent(child)
+      EntityKill(child)
     end
   end
 end

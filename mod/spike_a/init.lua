@@ -83,6 +83,7 @@ local EXEC = det.page
 local RAND_STATE, RAND_COUNT, SRAND_LAST = det.rand_state, det.rand_count, det.srand_last
 local chunkwait_stats = { calls = 0, waited = 0, ms = 0, maxms = 0, timeouts = 0, other = 0 }
 if has("zalloc") then inst_log = inst_log .. "," .. dofile("mods/spike_a/files/zalloc.lua").install() end
+if has("stackzero") then inst_log = inst_log .. "," .. dofile("mods/spike_a/files/stackzero.lua").install() end
 log("patched=" .. inst_log .. string.format(" exec=%08x", EXEC))
 -- SPIKE_TRACE=from-to: native entry trace of particle/explosion functions, dumped per frame (tracer.lua)
 local TR_FROM, TR_TO = (os.getenv("SPIKE_TRACE") or ""):match("(%d+)-(%d+)")

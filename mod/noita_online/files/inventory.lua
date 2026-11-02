@@ -133,17 +133,23 @@ function M.draw(player)
       end
     end
   end
-  local x0, y0 = 20, 40
-  GuiText(gui, x0, y0 - 12, "Wands (click a spell, then a slot)")
+  -- Wand rows below Noita's quick-inventory bar; spell inventory in the bottom-right corner.
+  local sw, sh = GuiGetScreenDimensions(gui)
+  local step = 18
+  local x0, y0 = 10, 84
+  GuiText(gui, x0, y0 - 12, "Wands - click a spell, then a slot (Inventory key closes)")
+  local row = 0
   for c = 1, 4 do
     local ce, cap = container(player, c)
     if ce then
-      for s = 0, cap - 1 do slot_button(c, s, ce, x0 + s * 20, y0 + (c - 1) * 22) end
+      for s = 0, cap - 1 do slot_button(c, s, ce, x0 + s * step, y0 + row * step) end
+      row = row + 1
     end
   end
   local ce = container(player, 0)
-  GuiText(gui, x0, y0 + 4 * 22, "Spells")
-  for s = 0, 15 do slot_button(0, s, ce, x0 + (s % 8) * 20, y0 + 4 * 22 + 12 + math.floor(s / 8) * 22) end
+  local sx, sy = sw - 8 * step - 6, sh - 2 * step - 6
+  GuiText(gui, sx, sy - 12, "Spells")
+  for s = 0, 15 do slot_button(0, s, ce, sx + (s % 8) * step, sy + math.floor(s / 8) * step) end
 end
 
 return M

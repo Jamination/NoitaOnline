@@ -54,7 +54,13 @@ fn parse_args() -> Result<Args, String> {
             "--bind" => a.bind = v()?,
             "--players" => a.players = v()?.parse().map_err(|_| "bad --players")?,
             "--max-players" => a.max_players = v()?.parse().map_err(|_| "bad --max-players")?,
-            "--seed" => a.seed = Some(v()?.parse().map_err(|_| "bad --seed")?),
+            "--seed" => {
+                let s: u32 = v()?.parse().map_err(|_| "bad --seed")?;
+                if s == 0 || s > i32::MAX as u32 {
+                    return Err("--seed must be in 1..=2147483647".into());
+                }
+                a.seed = Some(s);
+            }
             "--input-delay" => {
                 let s = v()?;
                 a.input_delay = if s == "auto" { None } else { Some(s.parse().map_err(|_| "bad --input-delay")?) };
@@ -312,7 +318,8 @@ fn run(args: Args) -> std::io::Result<()> {
         if matches!(phase, Phase::Lobby) {
             let ready: Vec<u8> = players.iter().filter(|(_, p)| p.hello).map(|(i, _)| *i).collect();
             if ready.len() >= args.players as usize {
-                let seed = args.seed.unwrap_or_else(|| (rudp_random() as u32) | 1);
+                // Noita parses WORLD_SEED as a signed 32-bit int: keep it in 1..=i32::MAX.
+                let seed = args.seed.unwrap_or_else(|| (rudp_random() % i32::MAX as u64) as u32 + 1);
                 let session_id = rudp_random();
                 let roster: Vec<(u8, String)> = ready.iter().map(|i| (*i, players[i].name.clone())).collect();
                 let max_rtt = ready.iter().filter_map(|i| server.connection(*i as u16)).map(|c| c.rtt_us()).max().unwrap_or(0);
