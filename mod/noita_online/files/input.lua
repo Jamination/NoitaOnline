@@ -30,19 +30,32 @@ local function q(v, scale)
   return math.floor(v * scale + 0.5)
 end
 
--- state: { buttons = {Fire=true,...}, count_r=, count_l=, mx=, my=, ax=, ay=, select= }
+-- state: { buttons = {Fire=true,...}, count_r=, count_l=, mx=, my=, ax=, ay=, select=,
+--          cmds = { {sc=, ss=, dc=, ds=}, ... } }
+-- Inventory commands (wand edits) follow the fixed part: u8 count, count x 4 bytes.
 function M.encode(state)
   local mask = 0
   for i = 1, NB do
     if state.buttons[M.BUTTONS[i]] then mask = bit.bor(mask, bit.lshift(1, i - 1)) end
   end
-  return u32le(mask) .. string.char(math.min(255, state.count_r or 0), math.min(255, state.count_l or 0))
+  local s = u32le(mask) .. string.char(math.min(255, state.count_r or 0), math.min(255, state.count_l or 0))
     .. u32le(q(state.mx or 0, 8)) .. u32le(q(state.my or 0, 8))
     .. u32le(q(state.ax or 0, 1024)) .. u32le(q(state.ay or 0, 1024))
     .. string.char(state.select or 0)
+  local cmds = state.cmds
+  if cmds and #cmds > 0 then
+    local n = math.min(#cmds, 16)
+    local parts = { s, string.char(n) }
+    for i = 1, n do
+      local c = cmds[i]
+      parts[#parts + 1] = string.char(c.sc, c.ss, c.dc, c.ds)
+    end
+    s = table.concat(parts)
+  end
+  return s
 end
 
-M.NEUTRAL = { buttons = {}, count_r = 0, count_l = 0, mx = 0, my = 0, ax = 0, ay = 0, select = 0 }
+M.NEUTRAL = { buttons = {}, count_r = 0, count_l = 0, mx = 0, my = 0, ax = 0, ay = 0, select = 0, cmds = {} }
 M.SIZE = 23
 
 function M.decode(s)
@@ -61,7 +74,19 @@ function M.decode(s)
     ax = rd_u32(s, 15) / 1024,
     ay = rd_u32(s, 19) / 1024,
     select = s:byte(23),
+    cmds = M.decode_cmds(s),
   }
+end
+
+function M.decode_cmds(s)
+  local cmds = {}
+  local n = s:byte(24) or 0
+  for i = 0, n - 1 do
+    local p = 25 + i * 4
+    if #s < p + 3 then break end
+    cmds[#cmds + 1] = { sc = s:byte(p), ss = s:byte(p + 1), dc = s:byte(p + 2), ds = s:byte(p + 3) }
+  end
+  return cmds
 end
 
 -- Read what Noita's own input system wrote into an *enabled* ControlsComponent (used on the

@@ -6,6 +6,7 @@
 -- own spawned player ("proxy") is made inert on every client and only serves as the sink for
 -- this client's real keyboard/mouse/gamepad input, which we read and send to the server.
 local Input = dofile_once("mods/noita_online/files/input.lua")
+local Inventory = dofile_once("mods/noita_online/files/inventory.lua")
 
 local M = {}
 
@@ -93,6 +94,12 @@ function M.capture_local()
     local px, py = EntityGetTransform(slot.entity)
     s.ax, s.ay = s.mx - px, s.my - py
   end
+  -- The Inventory key opens our lockstep-safe editor locally; Noita's own inventory screen
+  -- is never opened for player slots (it would edit entities on this client only).
+  if s.buttons.Inventory and not M.inventory_key_down then Inventory.toggle() end
+  M.inventory_key_down = s.buttons.Inventory
+  s.buttons.Inventory = false
+  s.cmds = Inventory.take_pending()
   return s
 end
 
@@ -168,6 +175,7 @@ function M.apply_tick(frame, tick)
       local state = Input.decode(bytes)
       Input.apply(slot.controls, state, slot.prev, frame)
       if state.select and state.select > 0 then select_quick_slot(slot, state.select) end
+      for _, cmd in ipairs(state.cmds or {}) do Inventory.apply(slot.entity, cmd) end
       slot.prev = state
     end
   end
