@@ -427,7 +427,8 @@ unsafe fn patch_threaded_render(ex: &mut Exec) -> Result<(), PatchError> {
 
 /// Unpatched copy of the group submit for [`patch_threaded_render`] (taken once, before
 /// [`patch_inline_group`]). Pathfinding jobs (FUN_00864590, call 0x0086470c) were tried on
-/// it too and forked seed 1717171717 at f=1383; they stay inline.
+/// it too and dropped after seed 1717171717 forked at f=1383; that fork turned out to be
+/// [`patch_free_solids_order`]'s, present without any threading. They stay inline (untested since).
 unsafe fn threaded_group_submit(ex: &mut Exec) -> Result<u32, PatchError> {
     static COPY: AtomicU32 = AtomicU32::new(0);
     if COPY.load(Ordering::Relaxed) == 0 {
@@ -650,29 +651,62 @@ unsafe fn install_particle_trace(ex: &mut Exec) -> Result<(), PatchError> {
         jmp.extend_from_slice(&[0x90; 5]);
         write_code(RENDER_FLASH_TEST, &jmp)?;
     }
+    // Body -> grid placement (FUN_007440a0, thiscall ecx = grid body; tag 4) and particle
+    // construction (FUN_00716ce0, args: material, &pos, &vel; tag 5): both `push ebp;
+    // mov ebp,esp; and esp,-8`.
+    for (tag, f) in [(4u8, BODY_TO_GRID_FN), (5, PARTICLE_CREATE_FN)] {
+        expect(f, &BODY_PARTICLE_PROLOGUE)?;
+        let stub_at = ex.base + ex.used;
+        let mut stub = vec![0x60, 0x54, 0x6A, tag, 0xB8, cb[0], cb[1], cb[2], cb[3], 0xFF, 0xD0, 0x83, 0xC4, 0x08, 0x61];
+        stub.extend_from_slice(&BODY_PARTICLE_PROLOGUE);
+        stub.push(0xE9);
+        stub.extend_from_slice(&rel32(stub_at + stub.len() as u32 + 4, f + 6));
+        let at = ex.put(&stub);
+        let mut jmp = vec![0xE9];
+        jmp.extend_from_slice(&rel32(f + 5, at));
+        jmp.push(0x90);
+        write_code(f, &jmp)?;
+    }
     Ok(())
 }
+
+const BODY_TO_GRID_FN: u32 = 0x0074_40a0;
+const PARTICLE_CREATE_FN: u32 = 0x0071_6ce0;
+const BODY_PARTICLE_PROLOGUE: [u8; 6] = [0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8];
 
 const TILE_MARK_DIRTY_FN: u32 = 0x0072_b080;
 const TILE_MARK_DIRTY_PROLOGUE: [u8; 6] = [0x55, 0x8B, 0xEC, 0x8B, 0x55, 0x08];
 
-extern "C" fn particle_trace(tag: u32, regs: *const u32) {
+/// The `NOITA_ONLINE_PTRACE=from-to` log: (from, to, `ptrace_<instance>.txt`).
+static PTRACE_LOG: std::sync::LazyLock<Option<(u32, u32, std::sync::Mutex<std::fs::File>)>> = std::sync::LazyLock::new(|| {
+    let v = std::env::var("NOITA_ONLINE_PTRACE").ok()?;
+    let (a, b) = v.split_once('-')?;
+    let out = std::env::var("NOITA_ONLINE_OUT").ok()?;
+    let inst = std::env::var("NOITA_ONLINE_INSTANCE").unwrap_or_default();
+    let f = std::fs::File::create(std::path::Path::new(&out).join(format!("ptrace_{inst}.txt"))).ok()?;
+    Some((a.parse().ok()?, b.parse().ok()?, std::sync::Mutex::new(f)))
+});
+
+/// The current engine frame if it is inside the `NOITA_ONLINE_PTRACE` range.
+unsafe fn ptrace_frame() -> Option<u32> {
+    let (a, b, _) = PTRACE_LOG.as_ref()?;
+    let gg = rd(GAME_GLOBAL_PTR);
+    let frame = if gg != 0 { rd(gg) } else { 0 };
+    (*a..=*b).contains(&frame).then_some(frame)
+}
+
+fn ptrace_write(line: &str) {
     use std::io::Write;
-    static LOG: std::sync::LazyLock<Option<(u32, u32, std::sync::Mutex<std::fs::File>)>> = std::sync::LazyLock::new(|| {
-        let v = std::env::var("NOITA_ONLINE_PTRACE").ok()?;
-        let (a, b) = v.split_once('-')?;
-        let out = std::env::var("NOITA_ONLINE_OUT").ok()?;
-        let inst = std::env::var("NOITA_ONLINE_INSTANCE").unwrap_or_default();
-        let f = std::fs::File::create(std::path::Path::new(&out).join(format!("ptrace_{inst}.txt"))).ok()?;
-        Some((a.parse().ok()?, b.parse().ok()?, std::sync::Mutex::new(f)))
-    });
-    unsafe {
-        let Some((a, b, file)) = LOG.as_ref() else { return };
-        let gg = rd(GAME_GLOBAL_PTR);
-        let frame = if gg != 0 { rd(gg) } else { 0 };
-        if frame < *a || frame > *b {
-            return;
+    if let Some((_, _, file)) = PTRACE_LOG.as_ref() {
+        if let Ok(mut f) = file.lock() {
+            let _ = writeln!(f, "{line}");
         }
+    }
+}
+
+extern "C" fn particle_trace(tag: u32, regs: *const u32) {
+    unsafe {
+        let Some(frame) = ptrace_frame() else { return };
         if tag == 2 && IN_WINDOW.load(Ordering::Relaxed) && std::env::var_os("NOITA_ONLINE_PTRACE_ALL").is_none() {
             return;
         }
@@ -689,6 +723,36 @@ extern "C" fn particle_trace(tag: u32, regs: *const u32) {
             format!("flash_clear x={} y={} set={} vt={:08x}", rd(cell + 0x18) as i32, rd(cell + 0x1c) as i32, rd(cell + 8) as i32, rd(cell))
         } else if tag == 2 {
             format!("dirty x={} y={}", rd(esp + 4) as i32, rd(esp + 8) as i32)
+        } else if tag == 4 {
+            let body = gp;
+            let b2 = rd(body);
+            let f64at = |a: u32| *(a as *const f64);
+            format!(
+                "body key={} f={} cells={} chg={} pos={:?},{:?} a={:?} v={:?},{:?} w={:?} cache={:?},{:?},{:?}",
+                rd(body + 0x1c) as i32,
+                f32::from_bits(rd(body + 0x20)),
+                (rd(body + 8).wrapping_sub(rd(body + 4))) / 4,
+                *((body + 0x24) as *const u8),
+                f64at(b2 + 0x18),
+                f64at(b2 + 0x20),
+                f64at(b2 + 0x70),
+                f64at(b2 + 0x80),
+                f64at(b2 + 0x88),
+                f64at(b2 + 0x90),
+                f64at(body + 0x50),
+                f64at(body + 0x58),
+                f64at(body + 0x60)
+            )
+        } else if tag == 5 {
+            let (p, v) = (rd(esp + 8), rd(esp + 12));
+            format!(
+                "create mat={:08x} pos={:?},{:?} vel={:?},{:?}",
+                rd(esp + 4),
+                f32::from_bits(rd(p)),
+                f32::from_bits(rd(p + 4)),
+                f32::from_bits(rd(v)),
+                f32::from_bits(rd(v + 4))
+            )
         } else {
             format!("n={}/{}", (rd(gp + 0x38).wrapping_sub(rd(gp + 0x34))) / 0x70, (rd(gp + 0x50).wrapping_sub(rd(gp + 0x4c))) / 0x70)
         };
@@ -704,9 +768,7 @@ extern "C" fn particle_trace(tag: u32, regs: *const u32) {
             line.push_str(&format!(" {:08x}", rd(ebp + 4)));
             ebp = rd(ebp);
         }
-        if let Ok(mut f) = file.lock() {
-            let _ = writeln!(f, "{line}");
-        }
+        ptrace_write(&line);
     }
 }
 
@@ -733,6 +795,8 @@ const PATCHES: &[(&str, PatchFn)] = &[
     ("freecam_static", |_| unsafe { patch_freecam_static() }),
     ("cell_flash", patch_cell_flash),
     ("cell_emitters", |_| unsafe { patch_cell_emitters() }),
+    ("box2d_freeze", |_| unsafe { patch_box2d_freeze() }),
+    ("free_solids_order", patch_free_solids_order),
 ];
 
 /// Overwrite every time/pid-seeded engine RNG with values derived from the session seed.
@@ -938,6 +1002,10 @@ pub unsafe fn sim_rng_enter() {
         }
     });
     rng_log('<');
+    let gg = rd(GAME_GLOBAL_PTR);
+    if gg != 0 {
+        crate::dump_window_entry(rd(gg));
+    }
     prof_window(true);
 }
 
@@ -1080,9 +1148,11 @@ unsafe fn rng_log(tag: char) {
             let gp = rd(grid_world + 0x540);
             let snap = if gp != 0 { rd(gp + 0x24) } else { 0 };
             let (sw, sh) = if snap != 0 { (rd(snap) as i32, rd(snap + 4) as i32) } else { (0, 0) };
+            let b2 = rd(grid_world + GW_B2WORLD);
+            let b2ms = if b2 != 0 { *((b2 + B2_STEP_MS) as *const f64) } else { 0.0 };
             let _ = writeln!(
                 f,
-                "C {frame} {tag} cam={},{},{},{} off={},{} req={},{} snap={sw}x{sh} view={},{},{},{} borders={},{},{},{}",
+                "C {frame} {tag} cam={},{},{},{} off={},{} req={},{} snap={sw}x{sh} view={},{},{},{} borders={},{},{},{} b2ms={b2ms:.3}",
                 fl(0),
                 fl(4),
                 fl(8),
@@ -1316,6 +1386,97 @@ unsafe fn patch_cell_emitters() -> Result<(), PatchError> {
     // jz rel32 -> jmp rel32; nop
     let rel = rel32(RENDER_EMITTER_JZ + 5, RENDER_EMITTER_JZ + 6 + 0x17f);
     write_code(RENDER_EMITTER_JZ, &[0xE9, rel[0], rel[1], rel[2], rel[3], 0x90])
+}
+
+/// GridWorld: the b2World (GridWorld+0x530); b2World+0x19270: wall-clock duration of the last
+/// Box2D step in ms (QueryPerformanceCounter, written at the end of b2World::Step FUN_009c0d00).
+const GW_B2WORLD: u32 = 0x530;
+const B2_STEP_MS: u32 = 0x19270;
+/// Body->grid update FUN_00718d50: `cmp byte [BOX2D_FREEZE_STUCK_BODIES],0; push esi;
+/// push edi; mov edi,ecx; mov [esp+0x38],edi; jz 0x00718d91` (skips the freeze test).
+const FREEZE_STUCK_TEST: u32 = 0x0071_8d5c;
+const FREEZE_STUCK_TEST_ORIG: [u8; 17] = [0x80, 0x3D, 0xF4, 0x32, 0x15, 0x01, 0x00, 0x56, 0x57, 0x8B, 0xF9, 0x89, 0x7C, 0x24, 0x38, 0x74, 0x24];
+
+/// At the start of the body->grid update (inside the window), with the magic number
+/// BOX2D_FREEZE_STUCK_BODIES (on by default), the engine puts the awake body with the largest
+/// stuck counter to sleep (FUN_00717aa0: zero velocity, counter reset) whenever the *previous
+/// Box2D step took longer than BOX2D_THREAD_MAX_WAIT_IN_MS (12 ms) of wall-clock time*
+/// (b2World+0x19270). Physics-heavy moments (an explosion's debris) sit near that threshold,
+/// so clients froze a body at different frames: seed 1717171717 forked at f=1382 in most
+/// runs, but not when diagnostics shifted the timing. The time test is skipped, i.e. the
+/// load-dependent freeze never runs (a deterministic stand-in would need a cost model).
+unsafe fn patch_box2d_freeze() -> Result<(), PatchError> {
+    expect(FREEZE_STUCK_TEST, &FREEZE_STUCK_TEST_ORIG)?;
+    // jz -> jmp
+    write_code(FREEZE_STUCK_TEST + 15, &[0xEB])
+}
+
+/// GridWorld: every grid physics body (`std::vector<b2Body*>` at +0x560, in creation order)
+/// and mFreeSolids (+0x59c, `std::map<b2Body*, std::vector<Cell*>>`: cells removed from a
+/// body this frame, grouped by body; MSVC tree head node, value at node+0x10).
+const GW_BODIES: u32 = 0x560;
+const GW_FREE_SOLIDS: u32 = 0x59c;
+/// FUN_0071d020 loop head: `mov esi,[ebx+0x59c]; mov eax,[ebx+0x564]; mov ecx,[ebx+0x560];
+/// mov esi,[esi]` (esi = the map's begin node, ebx = GridWorld).
+const FREE_SOLIDS_PICK: u32 = 0x0071_d058;
+const FREE_SOLIDS_PICK_ORIG: [u8; 20] =
+    [0x8B, 0xB3, 0x9C, 0x05, 0x00, 0x00, 0x8B, 0x83, 0x64, 0x05, 0x00, 0x00, 0x8B, 0x8B, 0x60, 0x05, 0x00, 0x00, 0x8B, 0x36];
+
+/// FUN_0071d020 (inside the window, after the grid update) rebuilds every body that lost
+/// cells this frame (FUN_0071e120 -> FUN_0071d230: the old body is removed from the body
+/// vector, the remaining cells become new bodies). It takes mFreeSolids' entries in key
+/// order, i.e. by b2Body *heap address*, which differs between clients. When an explosion
+/// broke several bodies in one frame, the new bodies landed at different body-vector
+/// positions; the next frame's body->grid pass (FUN_00718d50, sorted by vector position)
+/// then placed them in a different order, so displaced cells became particles in a different
+/// order and the same RNG draws went to different particles (seed 1717171717, f=1382).
+/// The loop now takes the entry whose body comes first in the body vector.
+unsafe fn patch_free_solids_order(ex: &mut Exec) -> Result<(), PatchError> {
+    expect(FREE_SOLIDS_PICK, &FREE_SOLIDS_PICK_ORIG)?;
+    let f = ((free_solid_next as extern "C" fn(u32) -> u32) as u32).to_le_bytes();
+    // push ebx; mov eax,free_solid_next; call eax; add esp,4; mov esi,eax; ret
+    let stub = ex.put(&[0x53, 0xB8, f[0], f[1], f[2], f[3], 0xFF, 0xD0, 0x83, 0xC4, 0x04, 0x8B, 0xF0, 0xC3]);
+    // mov esi,[ebx+0x59c] -> call stub; nop (eax, ecx and edx are reloaded right after)
+    let mut call = vec![0xE8];
+    call.extend_from_slice(&rel32(FREE_SOLIDS_PICK + 5, stub));
+    call.push(0x90);
+    write_code(FREE_SOLIDS_PICK, &call)?;
+    // mov esi,[esi] -> nop; nop
+    write_code(FREE_SOLIDS_PICK + 18, &[0x90, 0x90])
+}
+
+/// The mFreeSolids node to rebuild next: the one whose body has the lowest index in the
+/// body vector (identical on every client). Bodies missing from the vector (the engine's
+/// "body not found" error path) come last, in map order.
+extern "C" fn free_solid_next(grid_world: u32) -> u32 {
+    unsafe {
+        let head = rd(grid_world + GW_FREE_SOLIDS);
+        let (begin, end) = (rd(grid_world + GW_BODIES), rd(grid_world + GW_BODIES + 4));
+        let mut index = std::collections::HashMap::new();
+        for (i, p) in (begin..end).step_by(4).enumerate() {
+            index.entry(rd(p)).or_insert(i as u32);
+        }
+        let key = |node: u32| index.get(&rd(node + 0x10)).copied().unwrap_or(u32::MAX);
+        // In-order walk from the begin node (vanilla's pick); a strictly lower key wins, so
+        // map order breaks ties. Nil leaves point at the head (_Isnil at +0xd).
+        let mut best = rd(head);
+        let mut best_key = key(best);
+        let mut stack = Vec::new();
+        let mut n = rd(head + 4);
+        loop {
+            while n != head && *((n + 0xd) as *const u8) == 0 {
+                stack.push(n);
+                n = rd(n);
+            }
+            let Some(m) = stack.pop() else { break };
+            let k = key(m);
+            if k < best_key {
+                (best, best_key) = (m, k);
+            }
+            n = rd(m + 8);
+        }
+        best
+    }
 }
 
 static FREEZE_LAST: std::sync::Mutex<Vec<(f32, f32)>> = std::sync::Mutex::new(Vec::new());

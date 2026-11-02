@@ -47,6 +47,8 @@ Inside the window:
 | `freecam_static` | The free camera moves itself (keyboard, easing) inside the window. | Removed; only the mod moves the camera. |
 | `cell_flash` | The flash flag on a cell (`+0xc`) keeps its tile active, but only the render job cleared it, and only for on-screen cells. | The liquid update expires the flag itself; the render only reads it. |
 | `cell_emitters` | Material particle effects (sparkles over magic liquids, acid, lava) are emitted from on-screen cells found by the render job, then use the simulation particle RNG. | No longer emitted. These effects are purely cosmetic and are not drawn. |
+| `box2d_freeze` | With the magic number `BOX2D_FREEZE_STUCK_BODIES` (on by default), the body→grid update (`FUN_00718d50`) makes the most-stuck awake body static whenever the previous Box2D step took longer than `BOX2D_THREAD_MAX_WAIT_IN_MS` (12 ms) of wall-clock time (`b2World+0x19270`). Which frames cross 12 ms depends on machine load. | The time test is skipped, so the load-dependent freeze never runs. (Preventive: step times stayed under 11 ms in the runs measured so far.) |
+| `free_solids_order` | Bodies that lost cells in a frame (`mFreeSolids`, a `std::map<b2Body*, …>`) are rebuilt in `b2Body*` heap-address order (`FUN_0071d020`). Rebuilding removes the old body from the body vector and appends the new ones, so after an explosion broke several bodies the new bodies sat at client-specific vector positions. The next frame's body→grid pass places bodies in vector order, so displaced cells became particles in a different order (seed 1717171717, f=1382). | Rebuilt in body-vector order (the entry whose body has the lowest vector index goes first). |
 
 Seeds are set at world init and at frame 1 by `no_fix_seeds`:
 - the platform RNGs, the global LCG and PM, the particle RNG and the `rand` state;
@@ -75,7 +77,12 @@ compares all clients' reports per frame (`hashes.jsonl`). Setting
 
 Diagnostics used to find the root causes above, enabled by environment variables:
 - `NOITA_ONLINE_DENSE=a-b`: per-frame entity dumps.
-- `NOITA_ONLINE_RNGLOG`: RNG states and cameras at window entry and exit.
-- `NOITA_ONLINE_PTRACE`: call chains of particle creation.
-- `NOITA_ONLINE_DUMP`: chunk and cell dumps.
+- `NOITA_ONLINE_RNGLOG`: RNG states and cameras at window entry and exit, plus the last
+  Box2D step's wall time (`b2ms`).
+- `NOITA_ONLINE_PTRACE`: call chains of particle creation; also every body→grid placement
+  (body pose, velocity, vector key) and particle construction (position, velocity).
+- `NOITA_ONLINE_DUMP`: chunk and cell dumps. With `NOITA_ONLINE_DUMP_RECT` it adds
+  particles, the GridParticles side lists, the render material snapshot hash and the
+  physics bodies; `NOITA_ONLINE_DUMP_ENTRY=1` also dumps at window entry
+  (`dump_<inst>_<frame>e.*`).
 - `NOITA_ONLINE_PROF` / `NOITA_ONLINE_SAMPLE`: profilers.

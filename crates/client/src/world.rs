@@ -206,7 +206,9 @@ pub unsafe fn dump_cells(path: &std::path::Path, x0: i32, y0: i32, x1: i32, y1: 
 
 /// Diagnostics: every GridParticles particle (lists +0x34/+0x40/+0x4c, 0x70 bytes each), one
 /// line per particle: `list index x y` then dwords 0..27 (hex; dword 20 is the cell pointer,
-/// replaced by the cell's material id).
+/// replaced by the cell's material id). Then the side lists: `9c` (0x18-byte snapshot-colliding
+/// particles, +0x9c), `c8` (0x14-byte radial forces, +0xc8), and `hdr` (GridParticles dwords
+/// 0..0x40) and `snap` (GridWorld+0x474 material snapshot: width, height, FNV hash).
 ///
 /// # Safety
 /// See [`world_ptrs`]. Game thread, between simulation steps.
@@ -236,6 +238,59 @@ pub unsafe fn dump_particles(path: &std::path::Path) -> std::io::Result<()> {
             }
             writeln!(out)?;
         }
+    }
+    for (list, stride) in [(0x9cusize, 0x18usize), (0xc8, 0x14)] {
+        let b = *((gp + list) as *const usize);
+        let e = *((gp + list + 4) as *const usize);
+        for (i, p) in (b..e).step_by(stride).enumerate() {
+            write!(out, "{list:x} {i}")?;
+            for k in 0..stride / 4 {
+                write!(out, " {:08x}", *((p + 4 * k) as *const u32))?;
+            }
+            writeln!(out)?;
+        }
+    }
+    write!(out, "hdr")?;
+    for k in 0..0x40 {
+        write!(out, " {:08x}", *((gp + 4 * k) as *const u32))?;
+    }
+    writeln!(out)?;
+    let snap = grid_world + 0x474;
+    let (sw, sh, data) = (*(snap as *const u32), *((snap + 4) as *const u32), *((snap + 0x18) as *const usize));
+    let mut fnv = 0x811c_9dc5u32;
+    if data != 0 && sw < 4096 && sh < 4096 {
+        for k in 0..(sw * sh) as usize {
+            fnv = (fnv ^ *((data + 4 * k) as *const u32)).wrapping_mul(0x0100_0193);
+        }
+    }
+    writeln!(out, "snap {sw} {sh} {fnv:08x} view {} {}", *((grid_world + 0x498) as *const i32), *((grid_world + 0x49c) as *const i32))?;
+    // Physics: the b2World's body list (GridWorld+0x530 -> +0x1922c, next at body+0xb8), 0x100
+    // bytes per body; then the grid-body wrappers (GridWorld+0x560 vector -> +0x11c).
+    let b2 = *((grid_world + 0x530) as *const usize);
+    if b2 != 0 {
+        let mut body = *((b2 + 0x1922c) as *const usize);
+        let mut i = 0;
+        while body != 0 && i < 100_000 {
+            write!(out, "body {i}")?;
+            for k in 0..0x40 {
+                write!(out, " {:08x}", *((body + 4 * k) as *const u32))?;
+            }
+            writeln!(out)?;
+            body = *((body + 0xb8) as *const usize);
+            i += 1;
+        }
+    }
+    let (gb, ge) = (*((grid_world + 0x560) as *const usize), *((grid_world + 0x564) as *const usize));
+    for (i, p) in (gb..ge).step_by(4).enumerate() {
+        let elem = *(p as *const usize);
+        let wrap = if elem != 0 && (*((elem + 0xc) as *const u8) >> 5) & 1 != 0 { *((elem + 0x11c) as *const usize) } else { 0 };
+        write!(out, "gbody {i}")?;
+        if wrap != 0 {
+            for k in 0..0x20 {
+                write!(out, " {:08x}", *((wrap + 4 * k) as *const u32))?;
+            }
+        }
+        writeln!(out)?;
     }
     Ok(())
 }

@@ -246,6 +246,21 @@ fn dump_rect() -> Option<[i32; 4]> {
     *RECT
 }
 
+/// Diagnostics: `NOITA_ONLINE_DUMP_ENTRY=1` (with `NOITA_ONLINE_DUMP` and
+/// `NOITA_ONLINE_DUMP_RECT`) also dumps cells and particles at simulation-window entry, to
+/// `dump_<instance>_<frame>e.*`. The engine frame counter advances inside the window, so
+/// `<frame>e` is the state the step reported as `<frame + 1>` starts from.
+#[cfg(all(windows, target_arch = "x86"))]
+pub(crate) unsafe fn dump_window_entry(frame: u32) {
+    if std::env::var_os("NOITA_ONLINE_DUMP_ENTRY").is_none() {
+        return;
+    }
+    let (Some(path), Some([x0, y0, x1, y1])) = (dump_path(frame), dump_rect()) else { return };
+    let path = path.with_file_name(format!("{}e.bin", path.file_stem().and_then(|s| s.to_str()).unwrap_or("dump")));
+    let _ = world::dump_cells(&path.with_extension("cells.txt"), x0, y0, x1, y1);
+    let _ = world::dump_particles(&path.with_extension("parts.txt"));
+}
+
 /// Send this frame's state report. Chunk hashes are staggered: with `chunk_period` > 0
 /// only loaded chunks with `index % chunk_period == frame % chunk_period` are hashed, so
 /// every chunk is hashed and compared once per period without a per-period frame-time
