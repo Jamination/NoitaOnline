@@ -274,6 +274,23 @@ function OnWorldPostUpdate()
             local x, y, r, sx, sy = EntityGetTransform(e)
             log(string.format("entlog f=%d id=%d file=%s name=%s tags=%s parent=%d pos=%.4f,%.4f r=%.4f s=%.3f,%.3f",
               f, e, EntityGetFilename(e), EntityGetName(e), EntityGetTags(e) or "", EntityGetParent(e), x, y, r or 0, sx or 0, sy or 0))
+            if os.getenv("NOITA_ONLINE_ENTLOG_COMPS") then
+              -- Every component's scalar members, sorted, one line per component.
+              for _, c in ipairs(EntityGetAllComponents(e) or {}) do
+                local m = ComponentGetMembers(c) or {}
+                local keys = {}
+                for k in pairs(m) do keys[#keys + 1] = k end
+                table.sort(keys)
+                local parts = {}
+                for _, k in ipairs(keys) do parts[#parts + 1] = k .. "=" .. tostring(m[k]) end
+                log(string.format("entcomp f=%d id=%d c=%d %s en=%s %s", f, e, c, ComponentGetTypeName(c),
+                  tostring(ComponentGetIsEnabled(c)), table.concat(parts, " ")))
+              end
+              for _, ch in ipairs(EntityGetAllChildren(e) or {}) do
+                local cx, cy = EntityGetTransform(ch)
+                log(string.format("entchild f=%d id=%d child=%d file=%s pos=%.4f,%.4f", f, e, ch, EntityGetFilename(ch), cx, cy))
+              end
+            end
           end
         end
       end

@@ -554,7 +554,8 @@ pub extern "C" fn no_set_sim_camera(x: f32, y: f32) {
 }
 
 /// Publish the focus centres (n × {x, y} floats, slot order) for physics-body freezing and
-/// trigger the freeze pass when a focus moved far (call inside the simulation window).
+/// the pathfinding clearance refresh, and trigger the freeze pass when a focus moved far
+/// (call inside the simulation window).
 ///
 /// # Safety
 /// `xy` must point at `2 * n` readable f32.
@@ -563,6 +564,7 @@ pub unsafe extern "C" fn no_focus_freeze(xy: *const f32, n: u32) {
     #[cfg(all(windows, target_arch = "x86"))]
     {
         let foci: Vec<(f32, f32)> = (0..n as usize).map(|i| (*xy.add(2 * i), *xy.add(2 * i + 1))).collect();
+        patches::pathfinding_foci(&foci);
         patches::focus_freeze_step(&foci);
     }
     #[cfg(not(all(windows, target_arch = "x86")))]

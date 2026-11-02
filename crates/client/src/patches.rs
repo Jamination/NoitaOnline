@@ -667,8 +667,36 @@ unsafe fn install_particle_trace(ex: &mut Exec) -> Result<(), PatchError> {
         jmp.push(0x90);
         write_code(f, &jmp)?;
     }
+    // Body shapes (tags 6, 7): the cell-bitmap polygonizer FUN_0095bcf0 (ecx = bitmap
+    // {w, h, .., +0x18 Cell*[w*h]}, edx = shape vector, xmm2 = tolerance) and
+    // b2Body::CreateFixture FUN_009bc760 (ecx = body, [esp+4] = fixture def, def+0 = shape).
+    // XMM0-3 are saved around the callback (xmm2 is an argument).
+    for (tag, f, prologue) in [(6u8, POLYGONIZE_FN, &POLYGONIZE_PROLOGUE[..]), (7, CREATE_FIXTURE_FN, &CREATE_FIXTURE_PROLOGUE[..])] {
+        expect(f, prologue)?;
+        let stub_at = ex.base + ex.used;
+        // sub esp,64; movups [esp+0/16/32/48],xmm0..3
+        let mut stub = vec![0x83, 0xEC, 0x40, 0x0F, 0x11, 0x04, 0x24, 0x0F, 0x11, 0x4C, 0x24, 0x10, 0x0F, 0x11, 0x54, 0x24, 0x20, 0x0F, 0x11, 0x5C, 0x24, 0x30];
+        stub.extend_from_slice(&[0x60, 0x54, 0x6A, tag, 0xB8, cb[0], cb[1], cb[2], cb[3], 0xFF, 0xD0, 0x83, 0xC4, 0x08, 0x61]);
+        // movups xmm0..3,[esp+..]; add esp,64
+        stub.extend_from_slice(&[0x0F, 0x10, 0x04, 0x24, 0x0F, 0x10, 0x4C, 0x24, 0x10, 0x0F, 0x10, 0x54, 0x24, 0x20, 0x0F, 0x10, 0x5C, 0x24, 0x30, 0x83, 0xC4, 0x40]);
+        stub.extend_from_slice(prologue);
+        stub.push(0xE9);
+        stub.extend_from_slice(&rel32(stub_at + stub.len() as u32 + 4, f + prologue.len() as u32));
+        let at = ex.put(&stub);
+        let mut jmp = vec![0xE9];
+        jmp.extend_from_slice(&rel32(f + 5, at));
+        jmp.extend(std::iter::repeat(0x90).take(prologue.len() - 5));
+        write_code(f, &jmp)?;
+    }
     Ok(())
 }
+
+const POLYGONIZE_FN: u32 = 0x0095_bcf0;
+/// push ebp; mov ebp,esp; push -1
+const POLYGONIZE_PROLOGUE: [u8; 5] = [0x55, 0x8B, 0xEC, 0x6A, 0xFF];
+const CREATE_FIXTURE_FN: u32 = 0x009b_c760;
+/// push ebp; mov ebp,esp; sub esp,0x10
+const CREATE_FIXTURE_PROLOGUE: [u8; 6] = [0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x10];
 
 const BODY_TO_GRID_FN: u32 = 0x0074_40a0;
 const PARTICLE_CREATE_FN: u32 = 0x0071_6ce0;
@@ -711,10 +739,36 @@ extern "C" fn particle_trace(tag: u32, regs: *const u32) {
             return;
         }
         // pushad block: edi esi ebp esp ebx edx ecx eax
-        let esp = *regs.add(3);
+        // Tags 6/7 saved 64 bytes of XMM state below the return address.
+        let esp = *regs.add(3) + if tag >= 6 { 64 } else { 0 };
         let mut ebp = *regs.add(2);
         let gp = *regs.add(6);
-        let what = if tag == 3 {
+        let what = if tag == 6 {
+            // ecx = bitmap {w, h, .., +0x18 Cell*[w*h]}: its set pixels
+            let (w, h, data) = (rd(gp) as i32, rd(gp + 4) as i32, rd(gp + 0x18));
+            let mut s = format!("polygonize w={w} h={h} px=");
+            if data != 0 && (0..4096).contains(&(w * h)) {
+                for i in 0..(w * h) as u32 {
+                    if rd(data + 4 * i) != 0 {
+                        s.push_str(&format!("{},{};", i as i32 % w, i as i32 / w));
+                    }
+                }
+            }
+            s
+        } else if tag == 7 {
+            // b2Body::CreateFixture(def): the body's fixture count and the shape's words
+            let def = rd(esp + 4);
+            let shape = rd(def);
+            let mut s = format!("fixture body_fx={} def=", rd(gp + 0xc0));
+            for k in 1..12 {
+                s.push_str(&format!("{:08x}", rd(def + 4 * k)));
+            }
+            s.push_str(" shape=");
+            for k in 1..0x50 {
+                s.push_str(&format!("{:08x}", rd(shape + 4 * k)));
+            }
+            s
+        } else if tag == 3 {
             // edi = cell; only flags the render is about to clear
             let cell = *regs;
             if *((cell + 0xc) as *const u8) == 0 || (frame as i32).wrapping_sub(rd(cell + 8) as i32) < FLASH_FRAMES as i32 {
@@ -742,7 +796,18 @@ extern "C" fn particle_trace(tag: u32, regs: *const u32) {
                 f64at(body + 0x50),
                 f64at(body + 0x58),
                 f64at(body + 0x60)
-            )
+            ) + &{
+                // b2Body fixture count / mass, and the cells' last grid positions (+0x28/+0x2c)
+                let mut s = format!(" fx={} m={:?} at=", rd(b2 + 0xc0), f64at(b2 + 0xd0));
+                let (c0, c1) = (rd(body + 4), rd(body + 8));
+                for c in (c0..c1).step_by(4).take(64) {
+                    let cell = rd(c);
+                    if cell != 0 {
+                        s.push_str(&format!("{},{};", rd(cell + 0x28) as i32, rd(cell + 0x2c) as i32));
+                    }
+                }
+                s
+            }
         } else if tag == 5 {
             let (p, v) = (rd(esp + 8), rd(esp + 12));
             format!(
@@ -797,6 +862,7 @@ const PATCHES: &[(&str, PatchFn)] = &[
     ("cell_emitters", |_| unsafe { patch_cell_emitters() }),
     ("box2d_freeze", |_| unsafe { patch_box2d_freeze() }),
     ("free_solids_order", patch_free_solids_order),
+    ("pathfinding_refresh", patch_pathfinding_refresh),
 ];
 
 /// Overwrite every time/pid-seeded engine RNG with values derived from the session seed.
@@ -1152,7 +1218,7 @@ unsafe fn rng_log(tag: char) {
             let b2ms = if b2 != 0 { *((b2 + B2_STEP_MS) as *const f64) } else { 0.0 };
             let _ = writeln!(
                 f,
-                "C {frame} {tag} cam={},{},{},{} off={},{} req={},{} snap={sw}x{sh} view={},{},{},{} borders={},{},{},{} b2ms={b2ms:.3}",
+                "C {frame} {tag} cam={},{},{},{} off={},{} req={},{} snap={sw}x{sh} view={},{},{},{} borders={},{},{},{} b2ms={b2ms:.3} pfc={},{} pfs={:x}",
                 fl(0),
                 fl(4),
                 fl(8),
@@ -1168,13 +1234,48 @@ unsafe fn rng_log(tag: char) {
                 gi(0x4a8),
                 gi(0x4ac),
                 gi(0x4b0),
-                gi(0x4b4)
+                gi(0x4b4),
+                rd(PF_REFRESH_STATE + 4) as i32,
+                rd(PF_REFRESH_STATE + 8) as i32,
+                rd(PF_REFRESH_STATE + 0x18)
             );
+            let _ = f.write_all(body_hash_lines(frame, tag, grid_world).as_bytes());
         }
         if tag == '<' && std::env::var_os("NOITA_ONLINE_RNGLOG_TILES").is_some() {
             let _ = f.write_all(grid_tiles_dump(frame).as_bytes());
         }
     }
+}
+
+/// Diagnostics for [`rng_log`]: `B frame tag count hash` over every b2World body's motion
+/// state (dwords 6..43: transform, sweep, velocities; doubles), and with
+/// `NOITA_ONLINE_RNGLOG_BODIES=1` one `b frame tag index hash x y` line per body.
+unsafe fn body_hash_lines(frame: u32, tag: char, grid_world: u32) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let b2 = rd(grid_world + GW_B2WORLD);
+    if b2 == 0 {
+        return out;
+    }
+    let each = std::env::var_os("NOITA_ONLINE_RNGLOG_BODIES").is_some();
+    let (mut all, mut n) = (0x811c_9dc5u32, 0u32);
+    let mut body = rd(b2 + 0x1922c);
+    while body != 0 && n < 100_000 {
+        let mut h = 0x811c_9dc5u32;
+        for k in 6..44 {
+            h = (h ^ rd(body + 4 * k)).wrapping_mul(0x0100_0193);
+        }
+        all = (all ^ h).wrapping_mul(0x0100_0193);
+        if each {
+            let x = *((body + 0x18) as *const f64);
+            let y = *((body + 0x20) as *const f64);
+            let _ = writeln!(out, "b {frame} {tag} {n} {h:08x} {x} {y}");
+        }
+        n += 1;
+        body = rd(body + 0xb8);
+    }
+    let _ = writeln!(out, "B {frame} {tag} {n} {all:08x}");
+    out
 }
 
 /// Diagnostics: every 64x64 grid tile (tile map in key order) as `T frame x y rng` and the
@@ -1477,6 +1578,63 @@ extern "C" fn free_solid_next(grid_world: u32) -> u32 {
         }
         best
     }
+}
+
+/// The pathfinding job (FUN_00861a50, launched by DeathMatch::Update at 0x006b2be1, i.e.
+/// before the simulation window, and run inline by [`patch_inline_async`]): `call
+/// FUN_00439bb0; mov eax,[eax+0xc]` loads the camera rect (WorldData+0: float x, y, w, h)
+/// whose centre the next clearance-refresh cycle covers.
+const PF_REFRESH_VIEW: u32 = 0x0086_1abf;
+const PF_REFRESH_VIEW_ORIG: [u8; 8] = [0xE8, 0xEC, 0x80, 0xBD, 0xFF, 0x8B, 0x40, 0x0C];
+/// Clearance-refresh state (FUN_008605e0's coroutine): +4/+8 centre (int), +0x18 line.
+const PF_REFRESH_STATE: u32 = 0x0120_8520;
+
+/// Focus centres of the last simulation window (slot order), for the clearance refresh.
+static PF_FOCI: std::sync::Mutex<Vec<(f32, f32)>> = std::sync::Mutex::new(Vec::new());
+/// Refresh cycles started so far (picks the next focus in turn).
+static PF_REFRESH_CYCLES: AtomicU32 = AtomicU32::new(0);
+/// The rect handed to the job: `{x, y, 0, 0}` (f32 bits), so its centre is the focus.
+static PF_REFRESH_RECT: [AtomicU32; 4] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+
+/// With PATHFINDING_DISTANCE_FIELD_ENABLED (on by default) the pathfinding job refreshes the
+/// node clearance field (the byte at pf_chunk + 0x80009 + 3 * node, which the search reads as
+/// the room a mover has; nothing else computes it) of the 2×2 pathfinding chunks around the
+/// camera centre, one chunk per two frames (FUN_008605e0 -> FUN_00860150), and starts the
+/// next cycle when done. The job runs before the simulation window, so that camera is each
+/// client's *render* camera: clients refreshed different chunks at different frames, and an
+/// enemy whose path search ran in between got a different path (seed 1404389217, f=1554:
+/// rat 969's next path node). Each cycle now centres on a player instead, in turn (slot
+/// order, the focus centres published by the previous window), so every player's
+/// surroundings stay fresh as the local player's do in vanilla.
+unsafe fn patch_pathfinding_refresh(ex: &mut Exec) -> Result<(), PatchError> {
+    expect(PF_REFRESH_VIEW, &PF_REFRESH_VIEW_ORIG)?;
+    let f = ((pf_refresh_view as extern "C" fn() -> u32) as u32).to_le_bytes();
+    // mov eax,pf_refresh_view; call eax; ret (eax = rect; ecx/edx are dead at the site)
+    let stub = ex.put(&[0xB8, f[0], f[1], f[2], f[3], 0xFF, 0xD0, 0xC3]);
+    let mut call = vec![0xE8];
+    call.extend_from_slice(&rel32(PF_REFRESH_VIEW + 5, stub));
+    call.extend_from_slice(&[0x90; 3]);
+    write_code(PF_REFRESH_VIEW, &call)
+}
+
+/// Called once per clearance-refresh cycle (when the job captures a new centre): the rect of
+/// the next player in turn, or of the origin before any window published the players.
+extern "C" fn pf_refresh_view() -> u32 {
+    let foci = PF_FOCI.lock().unwrap_or_else(|p| p.into_inner());
+    let (x, y) = if foci.is_empty() {
+        (0.0f32, 0.0f32)
+    } else {
+        foci[PF_REFRESH_CYCLES.fetch_add(1, Ordering::Relaxed) as usize % foci.len()]
+    };
+    for (slot, v) in PF_REFRESH_RECT.iter().zip([x, y, 0.0, 0.0]) {
+        slot.store(v.to_bits(), Ordering::Relaxed);
+    }
+    PF_REFRESH_RECT.as_ptr() as u32
+}
+
+/// Publish this window's focus centres (slot order) for the clearance refresh.
+pub fn pathfinding_foci(foci: &[(f32, f32)]) {
+    *PF_FOCI.lock().unwrap_or_else(|p| p.into_inner()) = foci.to_vec();
 }
 
 static FREEZE_LAST: std::sync::Mutex<Vec<(f32, f32)>> = std::sync::Mutex::new(Vec::new());

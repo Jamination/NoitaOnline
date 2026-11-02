@@ -49,6 +49,7 @@ Inside the window:
 | `cell_emitters` | Material particle effects (sparkles over magic liquids, acid, lava) are emitted from on-screen cells found by the render job, then use the simulation particle RNG. | No longer emitted. These effects are purely cosmetic and are not drawn. |
 | `box2d_freeze` | With the magic number `BOX2D_FREEZE_STUCK_BODIES` (on by default), the body→grid update (`FUN_00718d50`) makes the most-stuck awake body static whenever the previous Box2D step took longer than `BOX2D_THREAD_MAX_WAIT_IN_MS` (12 ms) of wall-clock time (`b2World+0x19270`). Which frames cross 12 ms depends on machine load. | The time test is skipped, so the load-dependent freeze never runs. (Preventive: step times stayed under 11 ms in the runs measured so far.) |
 | `free_solids_order` | Bodies that lost cells in a frame (`mFreeSolids`, a `std::map<b2Body*, …>`) are rebuilt in `b2Body*` heap-address order (`FUN_0071d020`). Rebuilding removes the old body from the body vector and appends the new ones, so after an explosion broke several bodies the new bodies sat at client-specific vector positions. The next frame's body→grid pass places bodies in vector order, so displaced cells became particles in a different order (seed 1717171717, f=1382). | Rebuilt in body-vector order (the entry whose body has the lowest vector index goes first). |
+| `pathfinding_refresh` | With `PATHFINDING_DISTANCE_FIELD_ENABLED` (on by default), the pathfinding job (`FUN_00861a50`) keeps refreshing the node clearance field of the 2×2 pathfinding chunks around the camera centre: one chunk every two frames, then a new cycle. The search reads this clearance as the room a mover has, and nothing else computes it. The job runs before the simulation window, so it used each client's render camera. Clients refreshed different chunks at different frames, and an enemy searching in between got a different path (seed 1404389217, f=1554: a rat's next path node). | Each refresh cycle centres on a player in turn (slot order), using the focus centres from the previous window. |
 
 Seeds are set at world init and at frame 1 by `no_fix_seeds`:
 - the platform RNGs, the global LCG and PM, the particle RNG and the `rand` state;
@@ -76,9 +77,12 @@ compares all clients' reports per frame (`hashes.jsonl`). Setting
 `NOITA_ONLINE_HASH=full` reports full snapshots every 60 frames.
 
 Diagnostics used to find the root causes above, enabled by environment variables:
-- `NOITA_ONLINE_DENSE=a-b`: per-frame entity dumps.
+- `NOITA_ONLINE_DENSE=a-b`: per-frame entity dumps. With `NOITA_ONLINE_ENTLOG=id,...` it
+  logs those entities' transforms each dense frame; `NOITA_ONLINE_ENTLOG_COMPS=1` adds every
+  component's scalar members and the children.
 - `NOITA_ONLINE_RNGLOG`: RNG states and cameras at window entry and exit, plus the last
-  Box2D step's wall time (`b2ms`).
+  Box2D step's wall time (`b2ms`) and the pathfinding clearance-refresh centre and state
+  (`pfc`, `pfs`).
 - `NOITA_ONLINE_PTRACE`: call chains of particle creation; also every body→grid placement
   (body pose, velocity, vector key) and particle construction (position, velocity).
 - `NOITA_ONLINE_DUMP`: chunk and cell dumps. With `NOITA_ONLINE_DUMP_RECT` it adds
