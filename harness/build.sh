@@ -8,6 +8,8 @@ cargo build --release -p noita-online-server -p simclient
 cargo build --release -p noita-online-server --target x86_64-pc-windows-gnu
 cargo build --release -p noita_online_client --target i686-pc-windows-gnu
 mkdir -p mod/noita_online/bin
-cp target/i686-pc-windows-gnu/release/noita_online.dll mod/noita_online/bin/noita_online.dll
+# Atomic replace: running Noita instances keep their mapped (old) file intact.
+cp target/i686-pc-windows-gnu/release/noita_online.dll mod/noita_online/bin/.noita_online.dll.tmp
+mv -f mod/noita_online/bin/.noita_online.dll.tmp mod/noita_online/bin/noita_online.dll
 echo "built:"
 ls -la target/release/noita-online-server target/x86_64-pc-windows-gnu/release/noita-online-server.exe mod/noita_online/bin/noita_online.dll

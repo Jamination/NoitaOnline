@@ -102,7 +102,7 @@ impl Relay {
         let mut used = 0;
         let start = (from - self.history_base) as usize;
         for t in self.history.iter().skip(start) {
-            let len = protocol::tick_encoded_len(t);
+            let len = protocol::tick_encoded_len(out.last(), t);
             if used + len > budget && !out.is_empty() {
                 break;
             }
@@ -173,12 +173,13 @@ mod tests {
     #[test]
     fn ticks_respect_budget_and_trim() {
         let mut r = Relay::new(vec![0], 0);
-        for f in 0..100 {
-            r.submit(0, f, &[0u8; 50]);
+        for f in 0..100u32 {
+            r.submit(0, f, &[f as u8; 50]);
         }
         assert_eq!(r.advance(), 100);
         let (_, t) = r.ticks_from(0, 1100);
-        assert!(t.len() < 100 && t.iter().map(protocol::tick_encoded_len).sum::<usize>() <= 1100);
+        let used: usize = t.iter().enumerate().map(|(i, x)| protocol::tick_encoded_len(i.checked_sub(1).map(|j| &t[j]), x)).sum();
+        assert!(t.len() < 100 && used <= 1100);
         r.trim(60);
         let (first, t) = r.ticks_from(10, 100_000);
         assert_eq!((first, t.len()), (60, 40), "trimmed history starts at the min ack");

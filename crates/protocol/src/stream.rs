@@ -74,9 +74,9 @@ impl ClientStream {
     /// Datagram repeating every unacknowledged input (up to the stream budget).
     pub fn inputs_msg(&self) -> ClientMsg {
         let mut used = 0;
-        let mut inputs = Vec::new();
+        let mut inputs: Vec<Vec<u8>> = Vec::new();
         for i in &self.inputs {
-            let len = crate::varint_len(i.len() as u64) + i.len();
+            let len = crate::input_encoded_len(inputs.last().map(Vec::as_slice), i);
             if used + len > STREAM_BUDGET && !inputs.is_empty() {
                 break;
             }

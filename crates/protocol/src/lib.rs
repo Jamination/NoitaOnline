@@ -15,7 +15,7 @@ pub const CH_RELIABLE: u8 = 0;
 pub const CH_UNRELIABLE: u8 = 1;
 
 /// Bumped whenever the message format or lockstep rules change; server and clients must match.
-pub const GAME_PROTOCOL_VERSION: u32 = 2;
+pub const GAME_PROTOCOL_VERSION: u32 = 3;
 
 /// Budget for one unreliable lockstep datagram's payload (fits rudp's unreliable limit).
 pub const STREAM_BUDGET: usize = 1100;
@@ -87,8 +87,13 @@ impl ClientMsg {
             }
             ClientMsg::Inputs { tick_ack, first, inputs } => {
                 w.u8(2).varint(*tick_ack as u64).varint(*first as u64).varint(inputs.len() as u64);
-                for i in inputs {
-                    w.blob(i);
+                // Delta coding: 0 = same as the previous input, 1 = blob follows.
+                for (i, input) in inputs.iter().enumerate() {
+                    if i > 0 && inputs[i - 1] == *input {
+                        w.u8(0);
+                    } else {
+                        w.u8(1).blob(input);
+                    }
                 }
             }
             ClientMsg::StateHash { frame, entities, chunks, positions } => {
@@ -137,9 +142,16 @@ impl ClientMsg {
                 let tick_ack = r.varint()? as u32;
                 let first = r.varint()? as u32;
                 let n = bounded(r.varint()?, &r, 1)?;
-                let mut inputs = Vec::with_capacity(n);
+                let mut inputs: Vec<Vec<u8>> = Vec::with_capacity(n);
                 for _ in 0..n {
-                    inputs.push(r.blob()?.to_vec());
+                    match r.u8()? {
+                        0 => {
+                            let prev = inputs.last().ok_or(DecodeError)?.clone();
+                            inputs.push(prev);
+                        }
+                        1 => inputs.push(r.blob()?.to_vec()),
+                        _ => return Err(DecodeError),
+                    }
                 }
                 ClientMsg::Inputs { tick_ack, first, inputs }
             }
@@ -210,10 +222,37 @@ fn get_roster(r: &mut Reader) -> DecodeResult<Vec<(u8, String)>> {
     Ok(players)
 }
 
-/// Encoded size of one tick inside a `Ticks` message (for datagram budgeting).
-pub fn tick_encoded_len(t: &Tick) -> usize {
-    1 + t.iter().map(|(_, d)| 1 + varint_len(d.len() as u64) + d.len()).sum::<usize>()
+/// Encoded size of `t` inside a `Ticks` message whose previous tick is `prev` (entries equal
+/// to the same player's entry in `prev` cost one byte).
+pub fn tick_encoded_len(prev: Option<&Tick>, t: &Tick) -> usize {
+    1 + t
+        .iter()
+        .map(|(id, d)| {
+            if same_as_prev(prev, *id, d) {
+                1
+            } else {
+                1 + varint_len(d.len() as u64) + d.len()
+            }
+        })
+        .sum::<usize>()
 }
+
+fn same_as_prev(prev: Option<&Tick>, id: u8, data: &[u8]) -> bool {
+    prev.is_some_and(|p| p.iter().any(|(pid, pd)| *pid == id && pd.as_slice() == data))
+}
+
+/// Encoded size of `input` inside an `Inputs` message whose previous input is `prev`.
+pub fn input_encoded_len(prev: Option<&[u8]>, input: &[u8]) -> usize {
+    if prev == Some(input) {
+        1
+    } else {
+        1 + varint_len(input.len() as u64) + input.len()
+    }
+}
+
+/// Player ids are < 0x80; the high bit of the id byte marks "same input as this player's
+/// entry in the previous tick of this message" (no blob follows).
+const TICK_REPEAT_FLAG: u8 = 0x80;
 
 pub fn varint_len(mut v: u64) -> usize {
     let mut n = 1;
@@ -242,11 +281,18 @@ impl ServerMsg {
             }
             ServerMsg::Ticks { input_ack, first, ticks } => {
                 w.u8(4).varint(*input_ack as u64).varint(*first as u64).varint(ticks.len() as u64);
+                let mut prev: Option<&Tick> = None;
                 for t in ticks {
                     w.u8(t.len() as u8);
                     for (id, data) in t {
-                        w.u8(*id).blob(data);
+                        debug_assert!(*id < TICK_REPEAT_FLAG);
+                        if same_as_prev(prev, *id, data) {
+                            w.u8(*id | TICK_REPEAT_FLAG);
+                        } else {
+                            w.u8(*id).blob(data);
+                        }
                     }
+                    prev = Some(t);
                 }
             }
             ServerMsg::PlayerLeft { player } => {
@@ -282,12 +328,20 @@ impl ServerMsg {
                 let input_ack = r.varint()? as u32;
                 let first = r.varint()? as u32;
                 let n = bounded(r.varint()?, &r, 1)?;
-                let mut ticks = Vec::with_capacity(n);
+                let mut ticks: Vec<Tick> = Vec::with_capacity(n);
                 for _ in 0..n {
                     let m = r.u8()? as usize;
                     let mut t = Vec::with_capacity(m);
                     for _ in 0..m {
-                        t.push((r.u8()?, r.blob()?.to_vec()));
+                        let b = r.u8()?;
+                        let id = b & !TICK_REPEAT_FLAG;
+                        if b & TICK_REPEAT_FLAG != 0 {
+                            let prev = ticks.last().ok_or(DecodeError)?;
+                            let data = prev.iter().find(|(pid, _)| *pid == id).ok_or(DecodeError)?.1.clone();
+                            t.push((id, data));
+                        } else {
+                            t.push((id, r.blob()?.to_vec()));
+                        }
                     }
                     ticks.push(t);
                 }
@@ -347,11 +401,31 @@ mod tests {
     }
 
     #[test]
-    fn tick_len_matches_encoding() {
-        let t: Tick = vec![(0, vec![1; 6]), (3, vec![2; 200])];
-        let with = ServerMsg::Ticks { input_ack: 0, first: 0, ticks: vec![t.clone()] }.encode().len();
-        let without = ServerMsg::Ticks { input_ack: 0, first: 0, ticks: vec![] }.encode().len();
-        assert_eq!(with - without, tick_encoded_len(&t));
+    fn tick_len_matches_encoding_including_repeats() {
+        let t1: Tick = vec![(0, vec![1; 6]), (3, vec![2; 200])];
+        let t2: Tick = vec![(0, vec![1; 6]), (3, vec![9; 3])];
+        let empty = ServerMsg::Ticks { input_ack: 0, first: 0, ticks: vec![] }.encode().len();
+        let one = ServerMsg::Ticks { input_ack: 0, first: 0, ticks: vec![t1.clone()] }.encode().len();
+        let two = ServerMsg::Ticks { input_ack: 0, first: 0, ticks: vec![t1.clone(), t2.clone()] }.encode().len();
+        assert_eq!(one - empty, tick_encoded_len(None, &t1));
+        assert_eq!(two - one, tick_encoded_len(Some(&t1), &t2));
+        assert_eq!(tick_encoded_len(Some(&t1), &t2), 1 + 1 + (1 + 1 + 3), "player 0 repeats");
+    }
+
+    #[test]
+    fn repeated_inputs_and_ticks_roundtrip_compactly() {
+        let same = vec![7u8; 23];
+        let inputs = ClientMsg::Inputs { tick_ack: 1, first: 2, inputs: vec![same.clone(); 30] };
+        let enc = inputs.encode();
+        assert!(enc.len() < 23 + 2 + 30 + 8, "{} bytes", enc.len());
+        assert_eq!(ClientMsg::decode(&enc).unwrap(), inputs);
+        let tick: Tick = (0..4).map(|p| (p, same.clone())).collect();
+        let ticks = ServerMsg::Ticks { input_ack: 0, first: 0, ticks: vec![tick; 30] };
+        assert_eq!(ServerMsg::decode(&ticks.encode()).unwrap(), ticks);
+        // A repeat flag in the first tick (nothing to repeat) is malformed.
+        let mut w = Writer::new();
+        w.u8(4).varint(0).varint(0).varint(1).u8(1).u8(0x80);
+        assert!(ServerMsg::decode(&w.finish()).is_err());
     }
 
     #[test]
