@@ -53,6 +53,14 @@ local function quit_game(reason)
 end
 
 -- 1. Session setup (before the world exists).
+if NO.lib.no_status() ~= NO.STATUS.idle then
+  -- A new game in the same process (e.g. after a game over): the lockstep session belongs
+  -- to the previous world, which only this client left, so it cannot continue it.
+  log("new game after a session in this process: leaving the session, playing offline")
+  NO.lib.no_shutdown()
+  GamePrint("Noita Online: session ended (new game started); restart Noita to join again")
+  return
+end
 if solo then
   session = { seed = cfg.solo_seed, input_delay = 0, player = 0, players = { 0 }, scenario = cfg.bot and "bot" or "" }
   log("solo baseline mode, seed " .. session.seed)
@@ -110,6 +118,14 @@ end
 
 function OnWorldInitialized()
   if not solo then NO.lib.no_fix_seeds(session.seed) end
+end
+
+function OnPlayerDied(player)
+  log("OnPlayerDied entity=" .. tostring(player) .. " frame=" .. GameGetFrameNum())
+end
+
+function OnPausedChanged(is_paused, is_inventory_pause)
+  log(string.format("pause changed: paused=%s inventory=%s frame=%d", tostring(is_paused), tostring(is_inventory_pause), GameGetFrameNum()))
 end
 
 local ready = false

@@ -287,12 +287,19 @@ unsafe fn patch_chunk_wait(ex: &mut Exec) -> Result<(), PatchError> {
     write_code(CHUNK_INTEGRATE_CALL, &call)
 }
 
-/// Run every engine thread-pool job synchronously on the submitting thread. Pool jobs
-/// (particles, Box2D step, lighting, world generation) otherwise race on shared RNG state.
-unsafe fn patch_inline_jobs() -> Result<(), PatchError> {
+/// Group jobs (particles, lighting, ... — everything but the grid tiles, see
+/// [`patch_threaded_grid`]) run synchronously on the submitting thread: they otherwise race
+/// on shared RNG state.
+unsafe fn patch_inline_group() -> Result<(), PatchError> {
     expect(POOL_GROUP_JZ - 4, &[0x80, 0x7F, 0x25, 0x00, 0x74, 0x20])?;
+    write_code(POOL_GROUP_JZ, &[0x90, 0x90])
+}
+
+/// Async jobs (the Box2D step, cosmetic particles, chunk saving, ... — everything but chunk
+/// generation, see [`patch_threaded_chunkgen`]) run synchronously at submission: the
+/// Box2D step would otherwise overlap the next frame's simulation.
+unsafe fn patch_inline_async() -> Result<(), PatchError> {
     expect(POOL_ASYNC_SITE, &[0x8D, 0x45, 0xF4, 0x66, 0xC7, 0x43, 0x24, 0x00, 0x00, 0x50, 0x8D, 0x45, 0xEC, 0x89, 0x7B, 0x20])?;
-    write_code(POOL_GROUP_JZ, &[0x90, 0x90])?;
     // mov word [ebx+0x24],0; mov [ebx+0x20],edi; push ebx; call slot_runner; add esp,4;
     // mov eax,ebx; pop edi; pop esi; pop ebx; mov esp,ebp; pop ebp; ret 4
     let mut code = vec![0x66, 0xC7, 0x43, 0x24, 0x00, 0x00, 0x89, 0x7B, 0x20, 0x53, 0xE8];
@@ -373,30 +380,49 @@ unsafe fn patch_threaded_grid(ex: &mut Exec) -> Result<(), PatchError> {
 
 static APPLIED: AtomicU32 = AtomicU32::new(0);
 
-/// Install all determinism patches (idempotent). Returns the applied-set bitmask.
+/// Install all determinism patches (idempotent). Returns the applied-set bitmask (bit i =
+/// patch i of [`PATCHES`]). For experiments, `NOITA_ONLINE_PATCH_OFF=name,name` skips
+/// patches by name (never set in normal play: every patch is needed for determinism).
 ///
 /// # Safety
 /// Must run inside noita.exe build 0x6794ee3c, on the game thread, before the world exists.
 pub unsafe fn apply_all() -> Result<u32, PatchError> {
     if APPLIED.load(Ordering::Relaxed) != 0 {
-        return Ok(APPLIED.load(Ordering::Relaxed));
+        return Ok(APPLIED.load(Ordering::Relaxed) & !(1 << 31));
     }
+    let off = std::env::var("NOITA_ONLINE_PATCH_OFF").unwrap_or_default();
+    let skip = |name: &str| off.split(',').any(|s| s.trim() == name);
     let mut ex = Exec::new()?;
-    patch_rand(&mut ex)?;
-    patch_stream_clock(&mut ex)?;
-    patch_chunk_wait(&mut ex)?;
-    patch_threaded_chunkgen(&mut ex)?;
-    patch_threaded_grid(&mut ex)?;
-    patch_inline_jobs()?;
-    patch_particle_init()?;
-    patch_camera_loads()?;
-    patch_fixed_dt(&mut ex)?;
-    patch_focus_freeze(&mut ex)?;
-    patch_cosmetic_particles()?;
-    let mask = 0b111_1111_1111;
-    APPLIED.store(mask, Ordering::Relaxed);
+    let mut mask = 0u32;
+    for (i, (name, patch)) in PATCHES.iter().enumerate() {
+        if skip(name) {
+            continue;
+        }
+        patch(&mut ex).map_err(|e| PatchError(format!("{name}: {}", e.0)))?;
+        mask |= 1 << i;
+    }
+    APPLIED.store(mask | 1 << 31, Ordering::Relaxed);
     Ok(mask)
 }
+
+type PatchFn = unsafe fn(&mut Exec) -> Result<(), PatchError>;
+
+/// Every patch, in installation order (the threaded-job copies must be taken before the
+/// inline patches modify the original submit routines).
+const PATCHES: &[(&str, PatchFn)] = &[
+    ("rand", patch_rand),
+    ("streamclock", patch_stream_clock),
+    ("chunkwait", patch_chunk_wait),
+    ("threaded_chunkgen", patch_threaded_chunkgen),
+    ("threaded_grid", patch_threaded_grid),
+    ("inline_group", |_| unsafe { patch_inline_group() }),
+    ("inline_async", |_| unsafe { patch_inline_async() }),
+    ("particle_init", |_| unsafe { patch_particle_init() }),
+    ("camera_loads", |_| unsafe { patch_camera_loads() }),
+    ("fixed_dt", patch_fixed_dt),
+    ("focus_freeze", patch_focus_freeze),
+    ("cosmetic_particles", |_| unsafe { patch_cosmetic_particles() }),
+];
 
 /// Overwrite every time/pid-seeded engine RNG with values derived from the session seed.
 /// Call when the world seed is known and again when the world is (re)initialised.
