@@ -229,9 +229,16 @@ function OnWorldPostUpdate()
       end
       NO.lib.no_unload_far(foci_buf, #foci, UNLOAD_MARGIN, UNLOAD_MAX)
     end
-    if ready and f % 60 == 0 then
-      local h, positions = State.collect(Players.proxy)
-      local us = NO.report_state(f, h, positions)
+    -- State reports: entity digest + tracked positions every 60 frames; chunk hashes either
+    -- staggered (each loaded chunk hashed once per 60 frames, a few per frame: no frame-time
+    -- spike) or, in "full" mode, every loaded chunk at once on the 60-frame checkpoint.
+    local dense = cfg.dense_from and f >= cfg.dense_from and f <= cfg.dense_to
+    local checkpoint = f % 60 == 0
+    if ready and (checkpoint or dense or not cfg.full_hash) then
+      local h, positions = 0, {}
+      if checkpoint or dense then h, positions = State.collect(Players.proxy, dense) end
+      local period = (cfg.full_hash or dense) and 0 or 60
+      local us = NO.report_state(f, period, (checkpoint or dense) and 1 or 0, h, positions)
       if f % 600 == 0 or us > 8000 then
         local st = ffi.new("uint32_t[3]")
         NO.lib.no_chunk_stats(st)

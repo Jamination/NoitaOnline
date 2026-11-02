@@ -18,7 +18,8 @@ local function mix(h, v)
   return bit.bxor(h, bit.rshift(h, 15))
 end
 
-function M.collect(proxy)
+-- all_positions: also report every other entity (kind 2), for pinpointing divergences.
+function M.collect(proxy, all_positions)
   local ents = EntityGetInRadius(0, 0, 1e9)
   table.sort(ents)
   local h = 0x811c9dc5
@@ -35,6 +36,8 @@ function M.collect(proxy)
         kind = 0
       elseif EntityHasTag(e, "enemy") then
         kind = 1
+      elseif all_positions then
+        kind = 2
       end
       if kind then
         positions[#positions + 1] = { id = e, kind = kind, x = x, y = y }

@@ -36,12 +36,14 @@ local TEXT_LO, TEXT_HI = 0x00401000, 0x00f00000
 function M.refresh()
   main_tid = main_tid or C.GetCurrentThreadId()
   local snap = C.CreateToolhelp32Snapshot(4, 0)
-  if snap == nil then return end
+  if snap == nil or tonumber(ffi.cast("intptr_t", snap)) == -1 then M.err = "snapshot failed" return end
+  M.nseen = 0
   local e = ffi.new("TP_THREADENTRY32")
   e.dwSize = ffi.sizeof(e)
   local pid = C.GetCurrentProcessId()
   local ok = C.Thread32First(snap, e)
   while ok ~= 0 do
+    if e.th32OwnerProcessID == pid then M.nseen = M.nseen + 1 end
     if e.th32OwnerProcessID == pid and e.th32ThreadID ~= main_tid and not threads[e.th32ThreadID] then
       -- THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT|THREAD_QUERY_INFORMATION
       local h = C.OpenThread(0x0002 + 0x0008 + 0x0040, 0, e.th32ThreadID)
@@ -108,11 +110,12 @@ function M.report(log, top)
   top = top or 12
   local list = {}
   for tid, t in pairs(threads) do list[#list + 1] = { tid = tid, t = t } end
+  log(string.format("TPSUM err=%s seen=%s tracked=%d main=%s", tostring(M.err), tostring(M.nseen), #list, tostring(main_tid)))
   table.sort(list, function(a, b) return (a.t.cpu - (a.t.cpu0 or a.t.cpu)) > (b.t.cpu - (b.t.cpu0 or b.t.cpu)) end)
   for _, x in ipairs(list) do
     local t = x.t
     local d = (t.cpu - (t.cpu0 or t.cpu)) / 10000
-    if t.samples > 0 or d > 0 then
+    do
       local h = {}
       for k, n in pairs(t.hist) do h[#h + 1] = { k, n } end
       table.sort(h, function(a, b) return a[2] > b[2] end)

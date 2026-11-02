@@ -54,8 +54,9 @@ pub enum ClientMsg {
     /// Lockstep stream (unreliable). `tick_ack`: next tick frame the client still needs
     /// (all earlier ticks received). `inputs[i]` is the local input for frame `first + i`.
     Inputs { tick_ack: u32, first: u32, inputs: Vec<Vec<u8>> },
-    /// World/entity state at the end of simulation frame `frame`.
-    StateHash { frame: u32, entities: u64, chunks: Vec<ChunkHash>, positions: Vec<EntityPos> },
+    /// State at the end of simulation frame `frame`: hashes of the chunks scheduled for this
+    /// frame and, on entity checkpoints, the entity digest plus tracked positions.
+    StateHash { frame: u32, entities: Option<u64>, chunks: Vec<ChunkHash>, positions: Vec<EntityPos> },
     /// Periodic client-side performance report.
     Perf { frames: u32, avg_frame_us: u32, p99_frame_us: u32, max_frame_us: u32, wait_us: u32 },
     /// Free-form log line forwarded to the server log.
@@ -91,7 +92,11 @@ impl ClientMsg {
                 }
             }
             ClientMsg::StateHash { frame, entities, chunks, positions } => {
-                w.u8(3).varint(*frame as u64).u64(*entities);
+                w.u8(3).varint(*frame as u64);
+                match entities {
+                    Some(e) => w.u8(1).u64(*e),
+                    None => w.u8(0),
+                };
                 w.varint(chunks.len() as u64);
                 for c in chunks {
                     w.varint(c.index as u64).u64(c.hash);
@@ -140,7 +145,11 @@ impl ClientMsg {
             }
             3 => {
                 let frame = r.varint()? as u32;
-                let entities = r.u64()?;
+                let entities = match r.u8()? {
+                    0 => None,
+                    1 => Some(r.u64()?),
+                    _ => return Err(DecodeError),
+                };
                 let n = bounded(r.varint()?, &r, 9)?;
                 let mut chunks = Vec::with_capacity(n);
                 for _ in 0..n {
@@ -307,10 +316,11 @@ mod tests {
             ClientMsg::Inputs { tick_ack: 70_000, first: 70_003, inputs: vec![vec![1, 2, 3], vec![]] },
             ClientMsg::StateHash {
                 frame: 60,
-                entities: 3,
+                entities: Some(3),
                 chunks: vec![ChunkHash { index: 131328, hash: 42 }],
                 positions: vec![EntityPos { id: 7, kind: 1, x_bits: 1.5f32.to_bits(), y_bits: 0 }],
             },
+            ClientMsg::StateHash { frame: 61, entities: None, chunks: vec![], positions: vec![] },
             ClientMsg::Perf { frames: 60, avg_frame_us: 16666, p99_frame_us: 20000, max_frame_us: 30000, wait_us: 5 },
             ClientMsg::Log { text: "hi".into() },
             ClientMsg::Ping { t: 5 },
@@ -348,7 +358,7 @@ mod tests {
     fn hostile_counts_and_trailing_bytes_rejected() {
         // StateHash claiming 2^40 chunks in a tiny packet.
         let mut w = Writer::new();
-        w.u8(3).varint(1).u64(0).varint(1 << 40);
+        w.u8(3).varint(1).u8(1).u64(0).varint(1 << 40);
         assert!(ClientMsg::decode(&w.finish()).is_err());
         let mut enc = ServerMsg::Pong { t: 1 }.encode();
         enc.push(0);

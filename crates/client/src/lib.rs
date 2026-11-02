@@ -212,42 +212,40 @@ pub struct EntityPosC {
     pub y: f32,
 }
 
-/// Hash all loaded chunks now and send a state report for `frame` together with the given
-/// entity hash and tracked positions. Returns the time spent hashing in µs.
+/// Send this frame's state report. Chunk hashes are staggered: with `chunk_period` > 0
+/// only loaded chunks with `index % chunk_period == frame % chunk_period` are hashed, so
+/// every chunk is hashed and compared once per period without a per-period frame-time
+/// spike (0 = hash every loaded chunk now). `has_entities` attaches the entity digest and
+/// tracked positions (entity checkpoints). Returns the time spent hashing in µs.
 ///
 /// # Safety
 /// `positions` must point at `n` readable `EntityPosC`; must run on Noita's game thread.
 #[no_mangle]
-pub unsafe extern "C" fn no_report_state(frame: u32, entity_hash: u64, positions: *const EntityPosC, n: u32) -> i32 {
+pub unsafe extern "C" fn no_report_state(
+    frame: u32,
+    chunk_period: u32,
+    has_entities: u32,
+    entity_hash: u64,
+    positions: *const EntityPosC,
+    n: u32,
+) -> i32 {
     let t0 = Instant::now();
     #[cfg(all(windows, target_arch = "x86"))]
-    let chunks = world::hash_loaded_chunks();
+    let chunks = world::hash_loaded_chunks(|index| chunk_period == 0 || index % chunk_period == frame % chunk_period);
     #[cfg(not(all(windows, target_arch = "x86")))]
-    let chunks: Vec<protocol::ChunkHash> = Vec::new();
+    let chunks: Vec<protocol::ChunkHash> = {
+        let _ = chunk_period;
+        Vec::new()
+    };
     let elapsed = t0.elapsed().as_micros() as i32;
     let pos = if n == 0 { &[][..] } else { std::slice::from_raw_parts(positions, n as usize) };
     let positions: Vec<EntityPos> = pos
         .iter()
         .map(|p| EntityPos { id: p.id, kind: p.kind as u8, x_bits: p.x.to_bits(), y_bits: p.y.to_bits() })
         .collect();
-    with_rt((), |rt| rt.shared.send(CH_RELIABLE, &ClientMsg::StateHash { frame, entities: entity_hash, chunks, positions }));
+    let entities = (has_entities != 0).then_some(entity_hash);
+    with_rt((), |rt| rt.shared.send(CH_RELIABLE, &ClientMsg::StateHash { frame, entities, chunks, positions }));
     elapsed
-}
-
-/// Local-only: hash loaded chunks and return (count << 48) ^ combined hash, for diagnostics.
-#[no_mangle]
-pub extern "C" fn no_world_digest() -> u64 {
-    #[cfg(all(windows, target_arch = "x86"))]
-    unsafe {
-        let chunks = world::hash_loaded_chunks();
-        let mut h = 0u64;
-        for c in &chunks {
-            h = world::mix(h, c.hash ^ c.index as u64);
-        }
-        ((chunks.len() as u64) << 48) ^ (h & 0xffff_ffff_ffff)
-    }
-    #[cfg(not(all(windows, target_arch = "x86")))]
-    0
 }
 
 /// Mark the start of a game frame. Every 60 frames a performance report is sent (when

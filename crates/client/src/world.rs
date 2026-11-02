@@ -102,15 +102,19 @@ pub unsafe fn for_each_chunk(w: &WorldPtrs, mut f: impl FnMut(u32, *const usize)
     }
 }
 
-/// Hash all loaded chunks, spread over a few threads (the game thread waits; nothing else
-/// touches the world meanwhile).
+/// Hash the loaded chunks selected by `select(chunk_index)`, spread over a few threads
+/// (the game thread waits; nothing else touches the world meanwhile).
 ///
 /// # Safety
 /// See [`world_ptrs`]. Must be called on the game thread between simulation steps.
-pub unsafe fn hash_loaded_chunks() -> Vec<protocol::ChunkHash> {
+pub unsafe fn hash_loaded_chunks(select: impl Fn(u32) -> bool) -> Vec<protocol::ChunkHash> {
     let Some(w) = world_ptrs() else { return Vec::new() };
     let mut chunks: Vec<(u32, usize)> = Vec::with_capacity(32);
-    for_each_chunk(&w, |index, cells| chunks.push((index, cells as usize)));
+    for_each_chunk(&w, |index, cells| {
+        if select(index) {
+            chunks.push((index, cells as usize));
+        }
+    });
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 4);
     let begin = w.materials_begin;
     let mut out: Vec<protocol::ChunkHash> = Vec::with_capacity(chunks.len());

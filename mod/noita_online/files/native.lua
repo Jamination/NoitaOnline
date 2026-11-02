@@ -21,8 +21,7 @@ int32_t no_wait_started(uint32_t timeout_ms);
 int32_t no_start_info(no_start_info_t* out);
 int32_t no_send_input(uint32_t frame, const uint8_t* data, uint32_t len);
 int32_t no_wait_tick(uint32_t frame, uint32_t timeout_ms, uint8_t* out, uint32_t cap);
-int32_t no_report_state(uint32_t frame, uint64_t entity_hash, const no_entity_pos_t* positions, uint32_t n);
-uint64_t no_world_digest(void);
+int32_t no_report_state(uint32_t frame, uint32_t chunk_period, uint32_t has_entities, uint64_t entity_hash, const no_entity_pos_t* positions, uint32_t n);
 uint32_t no_frame_mark(void);
 int32_t no_perf_dump(const char* path);
 int32_t no_poll_event(uint8_t* out, uint32_t cap);
@@ -113,8 +112,9 @@ function M.send_input(frame, s)
 end
 
 local pos_buf = ffi.new("no_entity_pos_t[4096]")
--- positions: array of {id=, kind=, x=, y=}
-function M.report_state(frame, entity_hash, positions)
+-- chunk_period: 0 = hash every loaded chunk now, else only chunks with
+-- index % chunk_period == frame % chunk_period. positions: array of {id=, kind=, x=, y=}.
+function M.report_state(frame, chunk_period, has_entities, entity_hash, positions)
   local n = math.min(#positions, 4096)
   for i = 1, n do
     local p = positions[i]
@@ -124,7 +124,7 @@ function M.report_state(frame, entity_hash, positions)
     e.x = p.x
     e.y = p.y
   end
-  return lib.no_report_state(frame, entity_hash, pos_buf, n)
+  return lib.no_report_state(frame, chunk_period, has_entities, entity_hash, pos_buf, n)
 end
 
 return M

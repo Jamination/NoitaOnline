@@ -7,7 +7,8 @@ use std::io::Write;
 
 #[derive(Debug, Clone)]
 pub struct Report {
-    pub entities: u64,
+    /// Entity digest on entity checkpoints only.
+    pub entities: Option<u64>,
     pub chunks: Vec<ChunkHash>,
     pub positions: Vec<EntityPos>,
 }
@@ -41,6 +42,9 @@ pub struct Outcome {
     pub position_mismatches: usize,
     pub entity_hash_equal: bool,
     pub partial_chunks: usize,
+    /// Up to 8 mismatching chunk indices / (kind, entity id) pairs, for diagnosis.
+    pub bad_chunks: Vec<u32>,
+    pub bad_entities: Vec<(u8, u32)>,
 }
 
 impl Verifier {
@@ -98,8 +102,9 @@ impl Verifier {
             players.sort();
             let _ = writeln!(
                 f,
-                "{{\"frame\":{},\"players\":{:?},\"common_chunks\":{},\"chunk_mismatches\":{},\"partial_chunks\":{},\"common_positions\":{},\"position_mismatches\":{},\"entity_hash_equal\":{}}}",
-                o.frame, players, o.common_chunks, o.chunk_mismatches, o.partial_chunks, o.common_positions, o.position_mismatches, o.entity_hash_equal
+                "{{\"frame\":{},\"players\":{:?},\"common_chunks\":{},\"chunk_mismatches\":{},\"partial_chunks\":{},\"common_positions\":{},\"position_mismatches\":{},\"entity_hash_equal\":{},\"bad_chunks\":{:?},\"bad_entities\":[{}]}}",
+                o.frame, players, o.common_chunks, o.chunk_mismatches, o.partial_chunks, o.common_positions, o.position_mismatches, o.entity_hash_equal, o.bad_chunks,
+                o.bad_entities.iter().map(|(k, id)| format!("[{k},{id}]")).collect::<Vec<_>>().join(",")
             );
         }
     }
@@ -117,7 +122,8 @@ fn compare(frame: u32, reps: &HashMap<u8, Report>) -> Outcome {
     let mut common_chunks = 0;
     let mut chunk_mismatches = 0;
     let mut partial = 0;
-    for hs in chunk_hashes.values() {
+    let mut bad_chunks = Vec::new();
+    for (index, hs) in &chunk_hashes {
         if hs.len() < n {
             partial += 1;
         }
@@ -125,9 +131,12 @@ fn compare(frame: u32, reps: &HashMap<u8, Report>) -> Outcome {
             common_chunks += 1;
             if hs.iter().any(|h| *h != hs[0]) {
                 chunk_mismatches += 1;
+                bad_chunks.push(*index);
             }
         }
     }
+    bad_chunks.sort_unstable();
+    bad_chunks.truncate(8);
     let mut pos: HashMap<(u8, u32), Vec<(u32, u32)>> = HashMap::new();
     for r in reps.values() {
         for p in &r.positions {
@@ -136,16 +145,29 @@ fn compare(frame: u32, reps: &HashMap<u8, Report>) -> Outcome {
     }
     let mut common_positions = 0;
     let mut position_mismatches = 0;
-    for v in pos.values() {
-        if v.len() >= 2 {
-            common_positions += 1;
-            if v.len() < n || v.iter().any(|p| *p != v[0]) {
+    let mut bad_entities = Vec::new();
+    for (&(kind, id), v) in &pos {
+        let differs = v.len() < n || v.iter().any(|p| *p != v[0]);
+        // Kind 2 (all other entities) is only reported in diagnostic runs; it is listed but
+        // not counted against the tracked player/enemy positions.
+        if kind <= 1 {
+            if v.len() >= 2 {
+                common_positions += 1;
+            }
+            // Present on fewer clients than reported (even only one) is a divergence too.
+            if differs {
                 position_mismatches += 1;
             }
         }
+        if differs {
+            bad_entities.push((kind, id));
+        }
     }
-    let first = reps.values().next().unwrap().entities;
-    let entity_hash_equal = reps.values().all(|r| r.entities == first);
+    bad_entities.sort_unstable();
+    bad_entities.truncate(8);
+    let mut digests = reps.values().filter_map(|r| r.entities);
+    let first = digests.next();
+    let entity_hash_equal = first.is_none_or(|f| digests.all(|d| d == f));
     Outcome {
         frame,
         players: n,
@@ -155,6 +177,8 @@ fn compare(frame: u32, reps: &HashMap<u8, Report>) -> Outcome {
         position_mismatches,
         entity_hash_equal,
         partial_chunks: partial,
+        bad_chunks,
+        bad_entities,
     }
 }
 
@@ -164,7 +188,7 @@ mod tests {
 
     fn rep(chunks: &[(u32, u64)], pos: &[(u32, u8, f32, f32)]) -> Report {
         Report {
-            entities: 1,
+            entities: Some(1),
             chunks: chunks.iter().map(|&(index, hash)| ChunkHash { index, hash }).collect(),
             positions: pos
                 .iter()
@@ -191,6 +215,8 @@ mod tests {
                 position_mismatches: 1,
                 entity_hash_equal: true,
                 partial_chunks: 1,
+                bad_chunks: vec![2],
+                bad_entities: vec![(0, 5)],
             }]
         );
         assert_eq!(v.first_mismatch(), Some(60));

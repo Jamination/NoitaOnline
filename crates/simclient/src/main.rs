@@ -140,7 +140,7 @@ fn main() {
                     if b.frame % 60 == 59 {
                         let rep = ClientMsg::StateHash {
                             frame: b.frame,
-                            entities: b.state,
+                            entities: Some(b.state),
                             chunks: vec![ChunkHash { index: 0, hash: b.state }],
                             positions: vec![EntityPos { id: 1, kind: 0, x_bits: (b.state >> 32) as u32, y_bits: b.state as u32 }],
                         };

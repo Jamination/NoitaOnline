@@ -30,6 +30,15 @@ function M.load()
   c.duration = tonumber(env("NOITA_ONLINE_DURATION") or "")
   c.exit_on_finish = env("NOITA_ONLINE_EXIT") == "1"
   c.debug = env("NOITA_ONLINE_DEBUG") == "1"
+  -- "full": hash every loaded chunk at once on each 60-frame checkpoint (instead of the
+  -- default staggered hashing, one slice of chunks per frame).
+  c.full_hash = env("NOITA_ONLINE_HASH") == "full"
+  -- Diagnostics: report state every frame (all entity positions) in [from, to].
+  local dense = env("NOITA_ONLINE_DENSE")
+  if dense then
+    local a, b = dense:match("^(%d+)%-(%d+)$")
+    c.dense_from, c.dense_to = tonumber(a), tonumber(b)
+  end
   local root = env("NOITA_ONLINE_ROOT")
   local inst = env("NOITA_ONLINE_INSTANCE") or "0"
   local out = env("NOITA_ONLINE_OUT") or (root and (root .. "/run/logs"))

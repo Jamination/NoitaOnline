@@ -14,7 +14,9 @@ local SLEEP = tonumber(os.getenv("SPIKE_SLEEP") or "150")
 local SLEEP_FRAMES = tonumber(os.getenv("SPIKE_SLEEP_FRAMES") or "300")
 local PERF = os.getenv("SPIKE_PERF") == "1"
 local PROBE = tonumber(os.getenv("SPIKE_PROBE") or "0")
-local TPROBE = os.getenv("SPIKE_TPROBE") == "1" and dofile("mods/spike_a/files/threadprobe.lua") or nil
+local TPROBE = (os.getenv("SPIKE_TPROBE_" .. inst) or os.getenv("SPIKE_TPROBE")) == "1"
+  and dofile("mods/spike_a/files/threadprobe.lua") or nil
+local STALL = (os.getenv("SPIKE_STALL_" .. inst) or os.getenv("SPIKE_STALL")) == "1"
 local HASH_EVERY_UNTIL = tonumber(os.getenv("SPIKE_EVERY") or "120")
 local HASH_FROM = tonumber(os.getenv("SPIKE_FROM") or "1")
 local PD_FROM, PD_TO = (os.getenv("SPIKE_PDUMP") or ""):match("(%d+)-(%d+)")
@@ -81,6 +83,20 @@ local EXEC = det.page
 local RAND_STATE, RAND_COUNT, SRAND_LAST = det.rand_state, det.rand_count, det.srand_last
 local chunkwait_stats = { calls = 0, waited = 0, ms = 0, maxms = 0, timeouts = 0, other = 0 }
 log("patched=" .. inst_log .. string.format(" exec=%08x", EXEC))
+-- SPIKE_TRACE=from-to: native entry trace of particle/explosion functions, dumped per frame (tracer.lua)
+local TR_FROM, TR_TO = (os.getenv("SPIKE_TRACE") or ""):match("(%d+)-(%d+)")
+TR_FROM, TR_TO = tonumber(TR_FROM), tonumber(TR_TO)
+local TRACER
+if TR_FROM then
+  TRACER = dofile("mods/spike_a/files/tracer.lua")
+  log("tracer " .. TRACER.install({
+    { addr = 0x007168c0, orig = "558bec83ec20", tag = 1 },     -- AddAsParticle (cell -> particle)
+    { addr = 0x00716af0, orig = "558bec83ec14", tag = 2 },     -- create particle
+    { addr = 0x00717400, orig = "558bec803da44b200100", tag = 3 }, -- particle slot (lists 0x34/0x4c)
+    { addr = 0x007174e0, orig = "558bec803da44b200100", tag = 4 }, -- particle slot (lists 0x40/0x4c)
+    { addr = 0x00719670, orig = "558bec83e4f0", tag = 5 },     -- explosions / physics-bridge step
+  }))
+end
 
 local function gg() return ffi.cast("char**", GG_ADDR)[0] end
 local function fnv(h, v)
@@ -401,6 +417,64 @@ end
 local lf = 0
 local t_pre_end, t_last_pre = nil, nil
 local perf = { n = 0, upd = 0, frame = 0, upd_max = 0 }
+-- camera-area material snapshot used by cosmetic-particle collision: GridParticles(+0x24) -> {w,h,..,data@[6]}
+local function snapshot_str()
+  local gw = grid_world()
+  if not gw then return "nil" end
+  local gp = rdp(gw + 0x540)
+  if gp == 0 then return "nogp" end
+  local sb = rdp(gp + 0x24)
+  if sb == 0 then return "nosb" end
+  local s = ffi.cast("int32_t*", sb)
+  local w, hgt = s[0], s[1]
+  local d = ffi.cast("int32_t*", s[6])
+  local h = 0
+  if w > 0 and hgt > 0 and w * hgt <= 4194304 and s[6] ~= 0 then
+    for i = 0, w * hgt - 1 do h = bit.tobit(h * 31 + d[i]) end
+  end
+  local gwi = ffi.cast("int32_t*", gw)
+  return string.format("%dx%d@%d,%d:%08x", w, hgt, gwi[0x126], gwi[0x127], h % 0x100000000)
+end
+local snap_pre = ""
+-- per-list content hashes of GridParticles lists (0x70-byte particles at +0x34/+0x40/+0x4c, 0x18-byte at +0x9c).
+-- dword 20 (+0x50, heap pointer) excluded; byte 0x6c is a 2-bit bitfield (copy ops copy only bits 0..1), so bits 2..7
+-- and bytes 0x6d..0x6f are padding (garbage, hashed separately as pg=).
+local function particle_hashes(gp)
+  local out = {}
+  local gh = 0
+  for _, off in ipairs({ 0x34, 0x40, 0x4c }) do
+    local b, e = rd32(gp + off), rd32(gp + off + 4)
+    local n = (e - b) / 0x70
+    local p = ffi.cast("uint32_t*", b)
+    local h = 0
+    for i = 0, n - 1 do
+      local q = p + i * 28
+      for k = 0, 19 do h = bit.tobit(h * 31 + q[k]) end
+      for k = 21, 26 do h = bit.tobit(h * 31 + q[k]) end
+      h = bit.tobit(h * 31 + bit.band(q[27], 0x3))
+      gh = bit.tobit(gh * 31 + bit.rshift(q[27], 2))
+    end
+    out[#out + 1] = string.format("%d:%08x", n, h % 0x100000000)
+  end
+  local b, e = rd32(gp + 0x9c), rd32(gp + 0xa0)
+  local n = (e - b) / 0x18
+  local p = ffi.cast("uint32_t*", b)
+  local h = 0
+  for i = 0, n * 6 - 1 do h = bit.tobit(h * 31 + p[i]) end
+  out[#out + 1] = string.format("%d:%08x", n, h % 0x100000000)
+  return "ph=" .. table.concat(out, "/") .. string.format(" t_pg=%08x", gh % 0x100000000)
+end
+local PDPOST = {}
+for n in (os.getenv("SPIKE_PDPOST") or ""):gmatch("%d+") do PDPOST[tonumber(n)] = true end
+local function dump_particles_post(f, gp)
+  local fh = io.open(root .. "/run/re_race/parts_" .. inst .. "_" .. f .. ".bin", "wb")
+  for _, off in ipairs({ 0x34, 0x40, 0x4c, 0x9c }) do
+    local b, e = rd32(gp + off), rd32(gp + off + 4)
+    fh:write(ffi.string(ffi.new("uint32_t[2]", off, e - b), 8))
+    if e > b then fh:write(ffi.string(ffi.cast("void*", b), e - b)) end
+  end
+  fh:close()
+end
 function OnWorldPreUpdate()
   lf = lf + 1
   local f = lf
@@ -408,6 +482,7 @@ function OnWorldPreUpdate()
   apply_frame_patches(f)
   stress(f)
   stress2(f)
+  if PROBE >= 3 then snap_pre = snapshot_str() end
   if f <= SLEEP_FRAMES and SLEEP > 0 then C.Sleep(SLEEP) end
   if f == 2 then
     local mf = io.open(root .. "/run/re_grid/materials_" .. inst .. ".txt", "w")
@@ -449,6 +524,13 @@ function OnWorldPostUpdate()
     end
   end
   local f = GameGetFrameNum()
+  if TRACER then
+    if f >= TR_FROM and f <= TR_TO then TRACER.dump(log, f) else TRACER.reset() end
+  end
+  if STALL and f >= 200 and f % 37 == 0 then
+    -- inject wall-clock stalls (one instance only) to test for wall-clock dependencies
+    C.Sleep((f * 7) % 150 + 30)
+  end
   if TPROBE then
     if f == 30 or f % 300 == 0 then TPROBE.refresh() end
     if f >= 30 then TPROBE.sample() end
@@ -468,6 +550,9 @@ function OnWorldPostUpdate()
       n4 = (rd32(gp + 0xa0) - rd32(gp + 0x9c)) / 0x18
     end
     local pr = ffi.cast("uint32_t*", 0x01222388)
+    local phs = ""
+    if PROBE >= 4 and gp ~= 0 then phs = " " .. particle_hashes(gp) end
+    if PDPOST[f] and gp ~= 0 then dump_particles_post(f, gp) end
     -- physics bridge P=[GridWorld+0x530]: node list at P+0x1922c (next +0xb8); step wall time (ms, double) P+0x19270
     local pn, ph, pms = 0, 0x811c9dc5, -1
     local pb = gw and rdp(gw + 0x530) or 0
@@ -481,9 +566,10 @@ function OnWorldPostUpdate()
         nd = q[0x2e]
       end
     end
-    log(string.format("P %d %d g=%08x p=%08x%08x r=%08x/%d ne=%d np=%d/%d/%d ex=%08x pl=%d:%08x t_phys=%.2f", f, lf,
+    local sn = PROBE >= 3 and (" snp=" .. snap_pre .. " sn=" .. snapshot_str()) or ""
+    log(string.format("P %d %d g=%08x p=%08x%08x r=%08x/%d ne=%d np=%d/%d/%d ex=%08x pl=%d:%08x t_phys=%.2f%s", f, lf,
       rd32(GLOBAL_LCG), pr[1], pr[0], rd32(RAND_STATE), rd32(RAND_COUNT), ne, n1, n3, n4, ex, pn, bit.tobit(ph) % 0x100000000,
-      pms))
+      pms, sn .. phs))
   end
   if f % 60 == 0 and f <= POST_UNTIL then
     local nc, wh, parts = world_hash(nil)
