@@ -504,6 +504,20 @@ pub extern "C" fn no_sim_leave() {
     };
 }
 
+/// Set the simulation camera centre (inside the simulation window). Unlike Lua's
+/// GameSetCameraPos it forces the move: the engine otherwise ignores requests while its
+/// per-client camera-lock flag is set, which left the simulation camera on last frame's
+/// position on some clients and frames.
+#[no_mangle]
+pub extern "C" fn no_set_sim_camera(x: f32, y: f32) {
+    #[cfg(all(windows, target_arch = "x86"))]
+    unsafe {
+        patches::set_camera_pos(x, y)
+    };
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    let _ = (x, y);
+}
+
 /// Publish the focus centres (n × {x, y} floats, slot order) for physics-body freezing and
 /// trigger the freeze pass when a focus moved far (call inside the simulation window).
 ///

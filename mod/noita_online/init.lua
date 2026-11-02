@@ -179,7 +179,8 @@ end
 -- because camera-dependent engine systems feed the simulation; rendering uses our own.
 local render_cam = nil
 local function set_sim_camera(foci)
-  if foci[1] then GameSetCameraPos(foci[1].x, foci[1].y) end
+  -- Forced set: GameSetCameraPos is ignored while the engine's per-client camera lock is on.
+  if foci[1] then NO.lib.no_set_sim_camera(foci[1].x, foci[1].y) end
 end
 local function set_render_camera()
   local slot = Players.local_slot()
@@ -190,6 +191,8 @@ local function set_render_camera()
   render_cam.y = render_cam.y + (y - render_cam.y) * 0.2
   GameSetCameraPos(render_cam.x, render_cam.y)
 end
+
+local ENTLOG = os.getenv("NOITA_ONLINE_ENTLOG")
 
 local in_sim_window = false
 
@@ -225,6 +228,11 @@ function OnWorldPreUpdate()
   if ready then
     local foci = current_foci()
     set_sim_camera(foci)
+    if ENTLOG and cfg.dense_from and f >= cfg.dense_from and f <= cfg.dense_to and Players.slots[1] then
+      local x, y = EntityGetTransform(Players.slots[1].entity)
+      local cx, cy = GameGetCameraPos()
+      log(string.format("prelog f=%d p0=%.6f,%.6f cam=%.4f,%.4f", f, x, y, cx, cy))
+    end
     Players.apply_tick(f, tick)
     for _, r in ipairs(foci) do NO.lib.no_stream_focus(r[1], r[2], r[3], r[4]) end
     for i, r in ipairs(foci) do
@@ -257,6 +265,17 @@ function OnWorldPostUpdate()
       if checkpoint or dense then h, positions = State.collect(Players.proxy, dense) end
       local period = (cfg.full_hash or dense) and 0 or 60
       local us = NO.report_state(f, period, (checkpoint or dense) and 1 or 0, h, positions)
+      if dense and ENTLOG then
+        -- Diagnostics: NOITA_ONLINE_ENTLOG=id[,id...] logs those entities every dense frame.
+        for id in ENTLOG:gmatch("%d+") do
+          local e = tonumber(id)
+          if EntityGetIsAlive(e) then
+            local x, y, r, sx, sy = EntityGetTransform(e)
+            log(string.format("entlog f=%d id=%d file=%s name=%s tags=%s parent=%d pos=%.4f,%.4f r=%.4f s=%.3f,%.3f",
+              f, e, EntityGetFilename(e), EntityGetName(e), EntityGetTags(e) or "", EntityGetParent(e), x, y, r or 0, sx or 0, sy or 0))
+          end
+        end
+      end
       if f % 600 == 0 or us > 8000 then
         local st = ffi.new("uint32_t[3]")
         NO.lib.no_chunk_stats(st)

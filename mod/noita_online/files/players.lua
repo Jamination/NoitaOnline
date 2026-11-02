@@ -19,6 +19,8 @@ M.local_id = nil
 -- PlatformShooterPlayerComponent stays: it is part of how Noita turns raw keyboard/mouse
 -- state into the ControlsComponent fields we capture (camera centring is turned off below).
 local KEEP_ON_PROXY = { ControlsComponent = true, PlatformShooterPlayerComponent = true }
+-- Diagnostics: NOITA_ONLINE_PROXY_NOSHOOTER=1 also disables the proxy's PlatformShooterPlayer.
+if os.getenv("NOITA_ONLINE_PROXY_NOSHOOTER") == "1" then KEEP_ON_PROXY.PlatformShooterPlayerComponent = nil end
 
 local function make_proxy_inert(e)
   for _, c in ipairs(EntityGetAllComponents(e) or {}) do

@@ -405,8 +405,120 @@ pub unsafe fn apply_all() -> Result<u32, PatchError> {
     if std::env::var_os("NOITA_ONLINE_PTRACE").is_some() {
         install_particle_trace(&mut ex)?;
     }
+    if std::env::var_os("NOITA_ONLINE_PROF").is_some() {
+        install_job_profiler(&mut ex)?;
+    }
     APPLIED.store(mask | 1 << 31, Ordering::Relaxed);
     Ok(mask)
+}
+
+/// Job-pool submit routines profiled by [`install_job_profiler`]: (entry, 6-byte prologue,
+/// stack argument count). Jobs that run inline are timed inside the submit call.
+const PROFILED_SUBMITS: [(u32, [u8; 6], u8); 2] = [
+    (POOL_GROUP_FN, [0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x14], 2),
+    (POOL_ASYNC_FN, [0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x18], 1),
+];
+
+/// Diagnostics: `NOITA_ONLINE_PROF=1` times every call of the (original) job submit routines
+/// by call site (inline jobs run inside them) and writes per-site totals every 600 frames to
+/// `$NOITA_ONLINE_OUT/prof_<instance>.txt`. Threaded copies taken earlier are not affected.
+unsafe fn install_job_profiler(ex: &mut Exec) -> Result<(), PatchError> {
+    let enter = ((prof_enter as extern "C" fn(u32)) as u32).to_le_bytes();
+    let exit = ((prof_exit as extern "C" fn()) as u32).to_le_bytes();
+    for (f, prologue, nargs) in PROFILED_SUBMITS {
+        expect(f, &prologue)?;
+        // trampoline: original prologue; jmp f+6
+        let tramp_at = ex.base + ex.used;
+        let mut tramp = prologue.to_vec();
+        tramp.push(0xE9);
+        tramp.extend_from_slice(&rel32(tramp_at + 11, f + 6));
+        let tramp = ex.put(&tramp);
+        // push ecx; push [esp+4]; mov eax,enter; call eax; add esp,4; pop ecx;
+        // n × push [esp+4n]; call tramp; push eax; mov eax,exit; call eax; pop eax; ret 4n
+        let stub_at = ex.base + ex.used;
+        let mut s = vec![0x51, 0xFF, 0x74, 0x24, 0x04, 0xB8, enter[0], enter[1], enter[2], enter[3], 0xFF, 0xD0, 0x83, 0xC4, 0x04, 0x59];
+        for _ in 0..nargs {
+            s.extend_from_slice(&[0xFF, 0x74, 0x24, 4 * nargs]);
+        }
+        s.push(0xE8);
+        s.extend_from_slice(&rel32(stub_at + s.len() as u32 + 4, tramp));
+        s.extend_from_slice(&[0x50, 0xB8, exit[0], exit[1], exit[2], exit[3], 0xFF, 0xD0, 0x58, 0xC2, 4 * nargs, 0x00]);
+        let at = ex.put(&s);
+        let mut jmp = vec![0xE9];
+        jmp.extend_from_slice(&rel32(f + 5, at));
+        jmp.push(0x90);
+        write_code(f, &jmp)?;
+    }
+    Ok(())
+}
+
+thread_local! {
+    /// (call site, start, time spent in nested profiled calls)
+    static PROF_STACK: std::cell::RefCell<Vec<(u32, std::time::Instant, std::time::Duration)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+/// call site -> (calls, inclusive, exclusive)
+static PROF_SITES: std::sync::Mutex<Option<std::collections::BTreeMap<u32, (u64, std::time::Duration, std::time::Duration)>>> =
+    std::sync::Mutex::new(None);
+
+extern "C" fn prof_enter(ret: u32) {
+    PROF_STACK.with(|s| s.borrow_mut().push((ret, std::time::Instant::now(), std::time::Duration::ZERO)));
+}
+
+extern "C" fn prof_exit() {
+    let Some((ret, t0, child)) = PROF_STACK.with(|s| s.borrow_mut().pop()) else { return };
+    let dt = t0.elapsed();
+    PROF_STACK.with(|s| {
+        if let Some(parent) = s.borrow_mut().last_mut() {
+            parent.2 += dt;
+        }
+    });
+    let mut m = PROF_SITES.lock().unwrap_or_else(|p| p.into_inner());
+    let e = m.get_or_insert_with(Default::default).entry(ret).or_default();
+    e.0 += 1;
+    e.1 += dt;
+    e.2 += dt.saturating_sub(child);
+}
+
+/// Window timing for the profiler: (frames, time inside the simulation window).
+static PROF_WINDOW: std::sync::Mutex<(u32, std::time::Duration, Option<std::time::Instant>, Option<std::time::Instant>)> =
+    std::sync::Mutex::new((0, std::time::Duration::ZERO, None, None));
+
+unsafe fn prof_window(enter: bool) {
+    use std::io::Write;
+    if std::env::var_os("NOITA_ONLINE_PROF").is_none() {
+        return;
+    }
+    let mut w = PROF_WINDOW.lock().unwrap_or_else(|p| p.into_inner());
+    if enter {
+        w.2 = Some(std::time::Instant::now());
+        if w.3.is_none() {
+            w.3 = w.2;
+        }
+        return;
+    }
+    if let Some(t) = w.2.take() {
+        w.0 += 1;
+        w.1 += t.elapsed();
+    }
+    let gg = rd(GAME_GLOBAL_PTR);
+    let frame = if gg != 0 { rd(gg) } else { 0 };
+    if frame % 600 != 0 || w.0 == 0 {
+        return;
+    }
+    let wall = w.3.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+    let (n, inside) = (w.0, w.1);
+    *w = (0, std::time::Duration::ZERO, None, None);
+    drop(w);
+    let sites = PROF_SITES.lock().unwrap_or_else(|p| p.into_inner()).take().unwrap_or_default();
+    let (Ok(out), inst) = (std::env::var("NOITA_ONLINE_OUT"), std::env::var("NOITA_ONLINE_INSTANCE").unwrap_or_default()) else { return };
+    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(std::path::Path::new(&out).join(format!("prof_{inst}.txt"))) else { return };
+    let per = |d: std::time::Duration| d.as_secs_f64() * 1000.0 / n as f64;
+    let _ = writeln!(f, "frame {frame}: {n} frames, wall {:.2} ms/frame, sim window {:.2} ms/frame", per(wall), per(inside));
+    let mut v: Vec<_> = sites.into_iter().collect();
+    v.sort_by(|a, b| b.1 .2.cmp(&a.1 .2));
+    for (site, (calls, incl, excl)) in v {
+        let _ = writeln!(f, "  site {site:08x}: {:.1} calls/frame incl {:.3} excl {:.3} ms/frame", calls as f64 / n as f64, per(incl), per(excl));
+    }
 }
 
 /// Particle slot allocators (every grid particle is created through one of them); their
@@ -432,8 +544,24 @@ unsafe fn install_particle_trace(ex: &mut Exec) -> Result<(), PatchError> {
         jmp.extend_from_slice(&rel32(f + 5, at));
         write_code(f, &jmp)?;
     }
+    // Tile dirty-AABB mark (GridWorldThreaded vtbl+0x14, `push ebp; mov ebp,esp; mov edx,[ebp+8]`):
+    // logged only outside the simulation window, where any world write is a per-client leak.
+    expect(TILE_MARK_DIRTY_FN, &TILE_MARK_DIRTY_PROLOGUE)?;
+    let stub_at = ex.base + ex.used;
+    let mut stub = vec![0x60, 0x54, 0x6A, 0x02, 0xB8, cb[0], cb[1], cb[2], cb[3], 0xFF, 0xD0, 0x83, 0xC4, 0x08, 0x61];
+    stub.extend_from_slice(&TILE_MARK_DIRTY_PROLOGUE);
+    stub.push(0xE9);
+    stub.extend_from_slice(&rel32(stub_at + stub.len() as u32 + 4, TILE_MARK_DIRTY_FN + 6));
+    let at = ex.put(&stub);
+    let mut jmp = vec![0xE9];
+    jmp.extend_from_slice(&rel32(TILE_MARK_DIRTY_FN + 5, at));
+    jmp.push(0x90);
+    write_code(TILE_MARK_DIRTY_FN, &jmp)?;
     Ok(())
 }
+
+const TILE_MARK_DIRTY_FN: u32 = 0x0072_b080;
+const TILE_MARK_DIRTY_PROLOGUE: [u8; 6] = [0x55, 0x8B, 0xEC, 0x8B, 0x55, 0x08];
 
 extern "C" fn particle_trace(tag: u32, regs: *const u32) {
     use std::io::Write;
@@ -452,17 +580,19 @@ extern "C" fn particle_trace(tag: u32, regs: *const u32) {
         if frame < *a || frame > *b {
             return;
         }
+        if tag == 2 && IN_WINDOW.load(Ordering::Relaxed) && std::env::var_os("NOITA_ONLINE_PTRACE_ALL").is_none() {
+            return;
+        }
         // pushad block: edi esi ebp esp ebx edx ecx eax
         let esp = *regs.add(3);
         let mut ebp = *regs.add(2);
         let gp = *regs.add(6);
-        let mut line = format!(
-            "{frame} t{} a{tag} n={}/{} ret={:08x}",
-            GetCurrentThreadId(),
-            (rd(gp + 0x38).wrapping_sub(rd(gp + 0x34))) / 0x70,
-            (rd(gp + 0x50).wrapping_sub(rd(gp + 0x4c))) / 0x70,
-            rd(esp)
-        );
+        let what = if tag == 2 {
+            format!("dirty x={} y={}", rd(esp + 4) as i32, rd(esp + 8) as i32)
+        } else {
+            format!("n={}/{}", (rd(gp + 0x38).wrapping_sub(rd(gp + 0x34))) / 0x70, (rd(gp + 0x50).wrapping_sub(rd(gp + 0x4c))) / 0x70)
+        };
+        let mut line = format!("{frame} t{} a{tag} {what} ret={:08x}", GetCurrentThreadId(), rd(esp));
         for _ in 0..8 {
             if ebp <= esp || ebp > esp + 0x10_0000 || ebp & 3 != 0 {
                 break;
@@ -495,6 +625,7 @@ const PATCHES: &[(&str, PatchFn)] = &[
     ("cosmetic_particles", |_| unsafe { patch_cosmetic_particles() }),
     ("clock", |_| unsafe { crate::clock::install(write_code) }),
     ("early_window", patch_early_window),
+    ("freecam_static", |_| unsafe { patch_freecam_static() }),
 ];
 
 /// Overwrite every time/pid-seeded engine RNG with values derived from the session seed.
@@ -699,6 +830,7 @@ pub unsafe fn sim_rng_enter() {
         }
     });
     rng_log('<');
+    prof_window(true);
 }
 
 /// Leaving the simulation window: save the sim stream, put the per-client states back,
@@ -711,6 +843,7 @@ pub unsafe fn sim_rng_leave() {
         return;
     }
     rng_log('>');
+    prof_window(false);
     SIM_BANK.with(|b| *b.borrow_mut() = Some(RngBank::capture()));
     RENDER_BANK.with(|b| {
         if let Some(r) = *b.borrow() {
@@ -731,6 +864,28 @@ const PRE_UPDATE_DISPATCH: u32 = 0x006b_3201;
 const SET_CAMERA_POS_FN: u32 = 0x0063_6580;
 /// GameGlobal: last position requested through SetCameraPos (float x, y).
 const GG_CAMERA_REQUEST: u32 = 0xc8;
+
+/// Camera update (FUN_006b3ff0, inside the simulation window): in free-camera mode it moves
+/// the camera itself, by keyboard and by easing toward its own target (DeathMatch+0xac/0xb0,
+/// initialised from each client's render camera), through `call FUN_006b5c30` (1 stack arg).
+const FREECAM_MOVE_CALLS: [u32; 2] = [0x006b_5462, 0x006b_548f];
+const FREECAM_MOVE_FN: u32 = 0x006b_5c30;
+
+/// The lockstep camera is driven only by the mod (simulation camera inside the window,
+/// render camera outside). The free camera's own movement runs inside the window and
+/// reads this client's keyboard (and eases toward a per-client target), so it would move
+/// the simulation camera differently per client during human play; it is removed.
+unsafe fn patch_freecam_static() -> Result<(), PatchError> {
+    for site in FREECAM_MOVE_CALLS {
+        let rel = rel32(site + 5, FREECAM_MOVE_FN);
+        expect(site, &[0xE8, rel[0], rel[1], rel[2], rel[3]])?;
+    }
+    for site in FREECAM_MOVE_CALLS {
+        // call FUN_006b5c30 (RET 4) -> add esp,4; nop; nop
+        write_code(site, &[0x83, 0xC4, 0x04, 0x90, 0x90])?;
+    }
+    Ok(())
+}
 
 /// The vanilla `data/scripts/init.lua` has its own `OnWorldPreUpdate` (weather: it emits rain
 /// particles around the camera with `GameEmitRainParticles`), and it runs before ours, i.e.
@@ -755,14 +910,26 @@ unsafe fn patch_early_window(ex: &mut Exec) -> Result<(), PatchError> {
 extern "C" fn early_window_entry() {
     unsafe {
         let Some((x, y)) = ARMED_CAMERA.lock().unwrap_or_else(|p| p.into_inner()).take() else { return };
-        let gg = rd(GAME_GLOBAL_PTR);
-        if gg == 0 {
+        if rd(GAME_GLOBAL_PTR) == 0 {
             return;
         }
         sim_rng_enter();
-        let set: extern "thiscall" fn(u32, *const f32, i32) = std::mem::transmute(SET_CAMERA_POS_FN as usize);
-        set(gg, [x, y].as_ptr(), 0);
+        set_camera_pos(x, y);
     }
+}
+
+/// GameGlobal::SetCameraPos with `force`: a non-forced request is ignored while the
+/// GameGlobal+0x3c camera-lock flag is set, which differs between clients.
+///
+/// # Safety
+/// Game thread, world initialised.
+pub unsafe fn set_camera_pos(x: f32, y: f32) {
+    let gg = rd(GAME_GLOBAL_PTR);
+    if gg == 0 {
+        return;
+    }
+    let set: extern "thiscall" fn(u32, *const f32, i32) = std::mem::transmute(SET_CAMERA_POS_FN as usize);
+    set(gg, [x, y].as_ptr(), 1);
 }
 
 /// Diagnostics: `NOITA_ONLINE_RNGLOG=from-to` appends the simulation RNG states at every
@@ -796,13 +963,20 @@ unsafe fn rng_log(tag: char) {
         if world_data != 0 && grid_world != 0 {
             let fl = |o: u32| *((world_data + o) as *const f32);
             let gi = |o: u32| rd(grid_world + o) as i32;
+            let gp = rd(grid_world + 0x540);
+            let snap = if gp != 0 { rd(gp + 0x24) } else { 0 };
+            let (sw, sh) = if snap != 0 { (rd(snap) as i32, rd(snap + 4) as i32) } else { (0, 0) };
             let _ = writeln!(
                 f,
-                "C {frame} {tag} cam={},{},{},{} view={},{},{},{} borders={},{},{},{}",
+                "C {frame} {tag} cam={},{},{},{} off={},{} req={},{} snap={sw}x{sh} view={},{},{},{} borders={},{},{},{}",
                 fl(0),
                 fl(4),
                 fl(8),
                 fl(12),
+                fl(0x50),
+                fl(0x54),
+                *((gg + GG_CAMERA_REQUEST) as *const f32),
+                *((gg + GG_CAMERA_REQUEST + 4) as *const f32),
                 gi(0x498),
                 gi(0x49c),
                 gi(0x4a0),
