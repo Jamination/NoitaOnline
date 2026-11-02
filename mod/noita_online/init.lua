@@ -13,7 +13,7 @@ local Config = dofile_once(ROOT .. "config.lua")
 local cfg = Config.load()
 
 local logf = nil
-if cfg.log_path then logf = io.open(cfg.log_path, "w") end
+if cfg.log_path then logf = io.open(cfg.log_path, "a") end
 local function log(msg)
   local line = "[noita_online] " .. msg
   print(line)
