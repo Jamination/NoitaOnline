@@ -63,6 +63,15 @@ C.QueryPerformanceFrequency(qf)
 local qfreq = tonumber(qf[0])
 local qc = ffi.new("int64_t[1]")
 local function now_ms() C.QueryPerformanceCounter(qc) return tonumber(qc[0]) * 1000 / qfreq end
+-- native: returns (x87 control word << 16) | MXCSR of the calling (main) thread
+local fpstate
+do
+  local code = { 0x83, 0xEC, 0x08, 0x0F, 0xAE, 0x1C, 0x24, 0xD9, 0x7C, 0x24, 0x04, 0x0F, 0xB7, 0x44, 0x24, 0x04,
+    0xC1, 0xE0, 0x10, 0x66, 0x8B, 0x04, 0x24, 0x83, 0xC4, 0x08, 0xC3 }
+  local mem = ffi.cast("uint8_t*", C.VirtualAlloc(nil, 0x1000, 0x3000, 0x40))
+  for i, b in ipairs(code) do mem[i - 1] = b end
+  fpstate = ffi.cast("uint32_t (__cdecl *)(void)", mem)
+end
 
 -- noita.exe facts (build 0x6794ee3c)
 local USE_CUSTOM_THREADPOOL = 0x01153177
@@ -85,11 +94,13 @@ local chunkwait_stats = { calls = 0, waited = 0, ms = 0, maxms = 0, timeouts = 0
 if has("zalloc") then inst_log = inst_log .. "," .. dofile("mods/spike_a/files/zalloc.lua").install() end
 if has("stackzero") then inst_log = inst_log .. "," .. dofile("mods/spike_a/files/stackzero.lua").install() end
 log("patched=" .. inst_log .. string.format(" exec=%08x", EXEC))
--- SPIKE_TRACE=from-to: native entry trace of particle/explosion functions, dumped per frame (tracer.lua)
-local TR_FROM, TR_TO = (os.getenv("SPIKE_TRACE") or ""):match("(%d+)-(%d+)")
-TR_FROM, TR_TO = tonumber(TR_FROM), tonumber(TR_TO)
+-- SPIKE_TRACE=from-to[,from-to...]: native entry trace of particle/explosion functions, dumped per frame (tracer.lua)
+local TR_FRAMES = {}
+for a, b in (os.getenv("SPIKE_TRACE") or ""):gmatch("(%d+)-(%d+)") do
+  for i = tonumber(a), tonumber(b) do TR_FRAMES[i] = true end
+end
 local TRACER
-if TR_FROM then
+if next(TR_FRAMES) then
   TRACER = dofile("mods/spike_a/files/tracer.lua")
   log("tracer " .. TRACER.install({
     { addr = 0x007168c0, orig = "558bec83ec20", tag = 1 },     -- AddAsParticle (cell -> particle)
@@ -477,9 +488,17 @@ local function dump_particles_post(f, gp)
   end
   fh:close()
 end
+local fp_pre, fp_first = 0, nil
+local function fp_check(where, f)
+  local v = fpstate()
+  fp_first = fp_first or v
+  if v ~= fp_first then log(string.format("FPCHANGE %s f=%d fp=%08x first=%08x", where, f, v, fp_first)) end
+  return v
+end
 function OnWorldPreUpdate()
   lf = lf + 1
   local f = lf
+  fp_pre = fp_check("pre", f)
   local t0 = now_ms()
   apply_frame_patches(f)
   stress(f)
@@ -515,6 +534,7 @@ end
 
 function OnWorldPostUpdate()
   local tpost = now_ms()
+  fp_check("post", lf)
   if PERF and t_pre_end and lf > SLEEP_FRAMES + 10 then
     local d = tpost - t_pre_end
     perf.n = perf.n + 1
@@ -527,7 +547,7 @@ function OnWorldPostUpdate()
   end
   local f = GameGetFrameNum()
   if TRACER then
-    if f >= TR_FROM and f <= TR_TO then TRACER.dump(log, f) else TRACER.reset() end
+    if TR_FRAMES[f] then TRACER.dump(log, f) else TRACER.reset() end
   end
   if STALL and f >= 200 and f % 37 == 0 then
     -- inject wall-clock stalls (one instance only) to test for wall-clock dependencies

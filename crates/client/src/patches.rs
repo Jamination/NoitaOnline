@@ -313,6 +313,32 @@ const CHUNKGEN_SUBMIT_CALL: u32 = 0x0073_c3f1;
 /// runs it on worker threads, racing the main thread on the global RNG.
 const CELL_CTOR_LCG_STORE: u32 = 0x0070_f4cc;
 
+/// Copy an (unpatched) engine function into the stub page, relocating its rel32 calls.
+unsafe fn copy_function(ex: &mut Exec, addr: u32, len: usize, relcalls: &[usize]) -> Result<u32, PatchError> {
+    let mut body = std::slice::from_raw_parts(addr as *const u8, len).to_vec();
+    let copy_at = ex.base + ex.used;
+    for &off in relcalls {
+        if body[off] != 0xE8 {
+            return Err(PatchError(format!("layout of {addr:08x} changed at +{off:#x}")));
+        }
+        let old_rel = i32::from_le_bytes(body[off + 1..off + 5].try_into().unwrap());
+        let target = (addr + off as u32 + 5).wrapping_add(old_rel as u32);
+        body[off + 1..off + 5].copy_from_slice(&rel32(copy_at + off as u32 + 5, target));
+    }
+    let at = ex.put(&body);
+    debug_assert_eq!(at, copy_at);
+    Ok(at)
+}
+
+/// Point the `call` at `site` (currently calling `orig`) at `new_target`.
+unsafe fn redirect_call(site: u32, orig: u32, new_target: u32) -> Result<(), PatchError> {
+    let orig_rel = rel32(site + 5, orig);
+    expect(site, &[0xE8, orig_rel[0], orig_rel[1], orig_rel[2], orig_rel[3]])?;
+    let mut call = vec![0xE8];
+    call.extend_from_slice(&rel32(site + 5, new_target));
+    write_code(site, &call)
+}
+
 /// Keep world generation on the engine's worker threads (it is expensive: 17-36 ms per
 /// chunk) while everything else runs inline: chunk jobs get an unpatched copy of the
 /// async submit, and their only shared-RNG write is removed. Integration stays
@@ -320,25 +346,29 @@ const CELL_CTOR_LCG_STORE: u32 = 0x0070_f4cc;
 /// [`patch_inline_jobs`] (it copies the original submit routine).
 unsafe fn patch_threaded_chunkgen(ex: &mut Exec) -> Result<(), PatchError> {
     expect(CELL_CTOR_LCG_STORE, &[0xA3, 0x1C, 0x74, 0x20, 0x01])?;
-    let orig_rel = rel32(CHUNKGEN_SUBMIT_CALL + 5, POOL_ASYNC_FN);
-    expect(CHUNKGEN_SUBMIT_CALL, &[0xE8, orig_rel[0], orig_rel[1], orig_rel[2], orig_rel[3]])?;
     expect(POOL_ASYNC_FN, &[0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x18])?;
-    let mut body = std::slice::from_raw_parts(POOL_ASYNC_FN as *const u8, POOL_ASYNC_LEN).to_vec();
-    let copy_at = ex.base + ex.used;
-    for off in POOL_ASYNC_RELCALLS {
-        if body[off] != 0xE8 {
-            return Err(PatchError(format!("async submit layout changed at +{off:#x}")));
-        }
-        let old_rel = i32::from_le_bytes(body[off + 1..off + 5].try_into().unwrap());
-        let target = (POOL_ASYNC_FN + off as u32 + 5).wrapping_add(old_rel as u32);
-        body[off + 1..off + 5].copy_from_slice(&rel32(copy_at + off as u32 + 5, target));
-    }
-    let at = ex.put(&body);
-    debug_assert_eq!(at, copy_at);
-    let mut call = vec![0xE8];
-    call.extend_from_slice(&rel32(CHUNKGEN_SUBMIT_CALL + 5, at));
-    write_code(CHUNKGEN_SUBMIT_CALL, &call)?;
+    let copy = copy_function(ex, POOL_ASYNC_FN, POOL_ASYNC_LEN, &POOL_ASYNC_RELCALLS)?;
+    redirect_call(CHUNKGEN_SUBMIT_CALL, POOL_ASYNC_FN, copy)?;
     write_code(CELL_CTOR_LCG_STORE, &[0x90; 5])
+}
+
+/// Group job submit (FUN_0084c240): 0xd4 bytes, rel32 calls at +0x64 and +0x92.
+const POOL_GROUP_FN: u32 = 0x0084_c240;
+const POOL_GROUP_LEN: usize = 0xd4;
+const POOL_GROUP_RELCALLS: [usize; 2] = [0x64, 0x92];
+/// The falling-sand tile dispatches inside the grid update (FUN_00726340).
+const GRID_TILE_SUBMIT_CALLS: [u32; 3] = [0x0072_7d5a, 0x0072_8051, 0x0072_82b5];
+
+/// The falling-sand grid's 64x64 tiles run in parallel deterministically (each tile owns
+/// its RNG and the four checkerboard passes never let tiles race), so they keep the
+/// worker threads; other pool jobs run inline. Must run before [`patch_inline_jobs`].
+unsafe fn patch_threaded_grid(ex: &mut Exec) -> Result<(), PatchError> {
+    expect(POOL_GROUP_FN, &[0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x14])?;
+    let copy = copy_function(ex, POOL_GROUP_FN, POOL_GROUP_LEN, &POOL_GROUP_RELCALLS)?;
+    for site in GRID_TILE_SUBMIT_CALLS {
+        redirect_call(site, POOL_GROUP_FN, copy)?;
+    }
+    Ok(())
 }
 
 static APPLIED: AtomicU32 = AtomicU32::new(0);
@@ -356,13 +386,14 @@ pub unsafe fn apply_all() -> Result<u32, PatchError> {
     patch_stream_clock(&mut ex)?;
     patch_chunk_wait(&mut ex)?;
     patch_threaded_chunkgen(&mut ex)?;
+    patch_threaded_grid(&mut ex)?;
     patch_inline_jobs()?;
     patch_particle_init()?;
     patch_camera_loads()?;
     patch_fixed_dt(&mut ex)?;
     patch_focus_freeze(&mut ex)?;
     patch_cosmetic_particles()?;
-    let mask = 0b11_1111_1111;
+    let mask = 0b111_1111_1111;
     APPLIED.store(mask, Ordering::Relaxed);
     Ok(mask)
 }

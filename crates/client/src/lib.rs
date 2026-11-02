@@ -248,6 +248,45 @@ pub unsafe extern "C" fn no_report_state(
     elapsed
 }
 
+/// Diagnostics: process working set in MiB and number of loaded chunks.
+///
+/// # Safety
+/// `out` must point at 2 writable u32.
+#[no_mangle]
+pub unsafe extern "C" fn no_mem_stats(out: *mut u32) {
+    #[cfg(all(windows, target_arch = "x86"))]
+    {
+        #[repr(C)]
+        #[derive(Default)]
+        struct Counters {
+            cb: u32,
+            page_faults: u32,
+            peak_ws: usize,
+            ws: usize,
+            quota_peak_paged: usize,
+            quota_paged: usize,
+            quota_peak_nonpaged: usize,
+            quota_nonpaged: usize,
+            pagefile: usize,
+            peak_pagefile: usize,
+        }
+        extern "system" {
+            fn GetCurrentProcess() -> isize;
+            fn K32GetProcessMemoryInfo(p: isize, c: *mut Counters, cb: u32) -> i32;
+        }
+        let mut c = Counters { cb: std::mem::size_of::<Counters>() as u32, ..Default::default() };
+        let ok = K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb);
+        *out = if ok != 0 { (c.ws >> 20) as u32 } else { 0 };
+        let mut n = 0u32;
+        if let Some(w) = world::world_ptrs() {
+            world::for_each_chunk(&w, |_, _| n += 1);
+        }
+        *out.add(1) = n;
+    }
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    std::ptr::write_bytes(out, 0, 2);
+}
+
 /// Cap the frame rate at `fps` (0 = uncapped), measured between frame marks; stands in
 /// for vsync where the display cannot provide it.
 #[no_mangle]

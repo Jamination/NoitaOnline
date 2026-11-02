@@ -24,6 +24,7 @@ int32_t no_wait_tick(uint32_t frame, uint32_t timeout_ms, uint8_t* out, uint32_t
 int32_t no_report_state(uint32_t frame, uint32_t chunk_period, uint32_t has_entities, uint64_t entity_hash, const no_entity_pos_t* positions, uint32_t n);
 uint32_t no_frame_mark(void);
 void no_set_frame_cap(uint32_t fps);
+void no_mem_stats(uint32_t* out);
 int32_t no_perf_dump(const char* path);
 int32_t no_poll_event(uint8_t* out, uint32_t cap);
 void no_log(const char* text);

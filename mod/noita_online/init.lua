@@ -90,8 +90,8 @@ else
 end
 
 -- Lockstep sessions stream chunks around every player (foci) with a deterministic unloader
--- instead of the per-client camera and wall-clock unloader, and never cap grid updates
--- (the cap keeps the tiles nearest each client's own camera).
+-- instead of the per-client camera and wall-clock unloader. The grid-update cap stays: it
+-- prefers tiles nearest the camera, which is the shared simulation camera in the window.
 local magic = string.format([[<MagicNumbers
   WORLD_SEED="%.0f"
   DEBUG_NO_PAUSE_ON_WINDOW_FOCUS_LOST="1"
@@ -100,7 +100,7 @@ local magic = string.format([[<MagicNumbers
   BOX2D_THREAD_MAX_WAIT_IN_MS="100000"
   GRID_FLEXIBLE_MAX_UPDATES="0"
   %s
-/>]], session.seed, solo and "" or 'STREAMING_ENABLED="0" GRID_MAX_UPDATES_PER_FRAME="100000"')
+/>]], session.seed, solo and "" or 'STREAMING_ENABLED="0"')
 ModTextFileSetContent("mods/noita_online/files/session_magic.xml", magic)
 ModMagicNumbersFileAdd("mods/noita_online/files/session_magic.xml")
 
