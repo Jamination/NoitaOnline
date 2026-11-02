@@ -79,7 +79,13 @@ harness/evaluate.py --run run/e2e/full --baseline run/e2e/baseline --netsim-run 
 ## Limitations
 
 - Lockstep: a session starts with all players present; players cannot join mid-session.
-  A player who leaves or dies becomes a frozen spectator.
-- Inventory/wand editing through the inventory GUI is not yet synchronised.
+  A player who leaves or dies becomes a frozen spectator. Starting a new game ends that
+  client's session (restart Noita to join another).
+- The vanilla inventory screen pauses the game and is not synchronised; the mod's own
+  wand editor (inventory key) edits wands and spells through lockstep commands.
+- Pausing (escape menu) stalls every client: lockstep advances only with all inputs.
+- Cosmetic material sparkles (over magic liquids, acid, lava) are not drawn, and the
+  free camera does not move on its own; see [determinism](docs/determinism.md).
+- Every client simulates every player, so a client's CPU load grows with the player count.
 - Only the Noita build of 2025-01-25 (PE timestamp `0x6794ee3c`) is supported; the
   runtime verifies every patched instruction and refuses to run on another build.
