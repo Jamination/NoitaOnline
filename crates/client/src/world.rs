@@ -142,3 +142,95 @@ pub unsafe fn hash_loaded_chunks(select: impl Fn(u32) -> bool) -> Vec<protocol::
     });
     out
 }
+
+/// Diagnostics: write every loaded chunk as `[index u32][material id u16 × CHUNK_CELLS]`
+/// (0xffff = empty) to `path`, for cell-level comparison of two clients' worlds.
+///
+/// # Safety
+/// See [`world_ptrs`]. Game thread, between simulation steps.
+pub unsafe fn dump_chunks(path: &std::path::Path) -> std::io::Result<()> {
+    use std::io::Write;
+    let Some(w) = world_ptrs() else { return Ok(()) };
+    let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+    let mut err = Ok(());
+    for_each_chunk(&w, |index, cells| {
+        let mut buf = Vec::with_capacity(4 + 2 * CHUNK_CELLS);
+        buf.extend_from_slice(&index.to_le_bytes());
+        for i in 0..CHUNK_CELLS {
+            let c = *cells.add(i);
+            let id = if c == 0 { 0xffff } else { ((*((c + 0x14) as *const usize)).wrapping_sub(w.materials_begin) / 0x290) as u16 };
+            buf.extend_from_slice(&id.to_le_bytes());
+        }
+        if err.is_ok() {
+            err = out.write_all(&buf);
+        }
+    });
+    err
+}
+
+/// Diagnostics: raw bytes (0x40) of every non-empty cell in the world rect [x0,x1)×[y0,y1),
+/// one line per cell: `x y +00 +04 ...` (dwords, hex).
+///
+/// # Safety
+/// See [`world_ptrs`]. Game thread, between simulation steps.
+pub unsafe fn dump_cells(path: &std::path::Path, x0: i32, y0: i32, x1: i32, y1: i32) -> std::io::Result<()> {
+    use std::io::Write;
+    let Some(w) = world_ptrs() else { return Ok(()) };
+    let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let idx = (((y >> 9) + 256) & 511) as usize * 512 + (((x >> 9) + 256) & 511) as usize;
+            let chunk = *w.chunk_table.add(idx);
+            if chunk == 0 {
+                continue;
+            }
+            let cells = *(chunk as *const usize) as *const usize;
+            let c = *cells.add((((y & 511) as usize) << 9) | (x & 511) as usize);
+            if c == 0 {
+                continue;
+            }
+            write!(out, "{x} {y} mat={}", (*((c + 0x14) as *const usize)).wrapping_sub(w.materials_begin) / 0x290)?;
+            for k in 0..16 {
+                write!(out, " {:08x}", *((c + 4 * k) as *const u32))?;
+            }
+            writeln!(out)?;
+        }
+    }
+    Ok(())
+}
+
+/// Diagnostics: every GridParticles particle (lists +0x34/+0x40/+0x4c, 0x70 bytes each), one
+/// line per particle: `list index x y` then dwords 0..27 (hex; dword 20 is the cell pointer,
+/// replaced by the cell's material id).
+///
+/// # Safety
+/// See [`world_ptrs`]. Game thread, between simulation steps.
+pub unsafe fn dump_particles(path: &std::path::Path) -> std::io::Result<()> {
+    use std::io::Write;
+    let Some(w) = world_ptrs() else { return Ok(()) };
+    let gg = *(GAME_GLOBAL_PTR as *const usize);
+    let grid_world = *((*((gg + 0x0c) as *const usize) + 0x44) as *const usize);
+    let gp = *((grid_world + 0x540) as *const usize);
+    if gp == 0 {
+        return Ok(());
+    }
+    let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+    for list in [0x34usize, 0x40, 0x4c] {
+        let b = *((gp + list) as *const usize);
+        let e = *((gp + list + 4) as *const usize);
+        for (i, p) in (b..e).step_by(0x70).enumerate() {
+            let d = |k: usize| *((p + 4 * k) as *const u32);
+            write!(out, "{list:x} {i} {} {}", f32::from_bits(d(7)), f32::from_bits(d(8)))?;
+            for k in 0..28 {
+                let v = if k == 20 && d(20) != 0 {
+                    ((*((d(20) as usize + 0x14) as *const usize)).wrapping_sub(w.materials_begin) / 0x290) as u32
+                } else {
+                    d(k)
+                };
+                write!(out, " {v:08x}")?;
+            }
+            writeln!(out)?;
+        }
+    }
+    Ok(())
+}

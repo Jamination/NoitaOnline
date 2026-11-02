@@ -14,6 +14,7 @@ extern "system" {
     fn FlushInstructionCache(process: isize, addr: *const u8, size: usize) -> Bool;
     fn GetCurrentProcess() -> isize;
     fn Sleep(ms: u32);
+    fn GetCurrentThreadId() -> u32;
 }
 
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
@@ -401,8 +402,78 @@ pub unsafe fn apply_all() -> Result<u32, PatchError> {
         patch(&mut ex).map_err(|e| PatchError(format!("{name}: {}", e.0)))?;
         mask |= 1 << i;
     }
+    if std::env::var_os("NOITA_ONLINE_PTRACE").is_some() {
+        install_particle_trace(&mut ex)?;
+    }
     APPLIED.store(mask | 1 << 31, Ordering::Relaxed);
     Ok(mask)
+}
+
+/// Particle slot allocators (every grid particle is created through one of them); their
+/// first 10 bytes `push ebp; mov ebp,esp; cmp byte [0x01204ba4],0` are relocatable.
+const PARTICLE_SLOT_FNS: [u32; 2] = [0x0071_7400, 0x0071_74e0];
+const PARTICLE_SLOT_PROLOGUE: [u8; 10] = [0x55, 0x8B, 0xEC, 0x80, 0x3D, 0xA4, 0x4B, 0x20, 0x01, 0x00];
+
+/// Diagnostics: `NOITA_ONLINE_PTRACE=from-to` logs every grid-particle creation in that frame
+/// range (thread, allocator, EBP-chain return addresses, list sizes) to
+/// `$NOITA_ONLINE_OUT/ptrace_<instance>.txt`.
+unsafe fn install_particle_trace(ex: &mut Exec) -> Result<(), PatchError> {
+    let cb = ((particle_trace as extern "C" fn(u32, *const u32)) as u32).to_le_bytes();
+    for (tag, f) in PARTICLE_SLOT_FNS.into_iter().enumerate() {
+        expect(f, &PARTICLE_SLOT_PROLOGUE)?;
+        let stub_at = ex.base + ex.used;
+        // pushad; push esp; push tag; mov eax,cb; call eax; add esp,8; popad; <prologue>; jmp f+10
+        let mut stub = vec![0x60, 0x54, 0x6A, tag as u8, 0xB8, cb[0], cb[1], cb[2], cb[3], 0xFF, 0xD0, 0x83, 0xC4, 0x08, 0x61];
+        stub.extend_from_slice(&PARTICLE_SLOT_PROLOGUE);
+        stub.push(0xE9);
+        stub.extend_from_slice(&rel32(stub_at + stub.len() as u32 + 4, f + 10));
+        let at = ex.put(&stub);
+        let mut jmp = vec![0xE9];
+        jmp.extend_from_slice(&rel32(f + 5, at));
+        write_code(f, &jmp)?;
+    }
+    Ok(())
+}
+
+extern "C" fn particle_trace(tag: u32, regs: *const u32) {
+    use std::io::Write;
+    static LOG: std::sync::LazyLock<Option<(u32, u32, std::sync::Mutex<std::fs::File>)>> = std::sync::LazyLock::new(|| {
+        let v = std::env::var("NOITA_ONLINE_PTRACE").ok()?;
+        let (a, b) = v.split_once('-')?;
+        let out = std::env::var("NOITA_ONLINE_OUT").ok()?;
+        let inst = std::env::var("NOITA_ONLINE_INSTANCE").unwrap_or_default();
+        let f = std::fs::File::create(std::path::Path::new(&out).join(format!("ptrace_{inst}.txt"))).ok()?;
+        Some((a.parse().ok()?, b.parse().ok()?, std::sync::Mutex::new(f)))
+    });
+    unsafe {
+        let Some((a, b, file)) = LOG.as_ref() else { return };
+        let gg = rd(GAME_GLOBAL_PTR);
+        let frame = if gg != 0 { rd(gg) } else { 0 };
+        if frame < *a || frame > *b {
+            return;
+        }
+        // pushad block: edi esi ebp esp ebx edx ecx eax
+        let esp = *regs.add(3);
+        let mut ebp = *regs.add(2);
+        let gp = *regs.add(6);
+        let mut line = format!(
+            "{frame} t{} a{tag} n={}/{} ret={:08x}",
+            GetCurrentThreadId(),
+            (rd(gp + 0x38).wrapping_sub(rd(gp + 0x34))) / 0x70,
+            (rd(gp + 0x50).wrapping_sub(rd(gp + 0x4c))) / 0x70,
+            rd(esp)
+        );
+        for _ in 0..8 {
+            if ebp <= esp || ebp > esp + 0x10_0000 || ebp & 3 != 0 {
+                break;
+            }
+            line.push_str(&format!(" {:08x}", rd(ebp + 4)));
+            ebp = rd(ebp);
+        }
+        if let Ok(mut f) = file.lock() {
+            let _ = writeln!(f, "{line}");
+        }
+    }
 }
 
 type PatchFn = unsafe fn(&mut Exec) -> Result<(), PatchError>;
@@ -422,6 +493,7 @@ const PATCHES: &[(&str, PatchFn)] = &[
     ("fixed_dt", patch_fixed_dt),
     ("focus_freeze", patch_focus_freeze),
     ("cosmetic_particles", |_| unsafe { patch_cosmetic_particles() }),
+    ("early_window", patch_early_window),
 ];
 
 /// Overwrite every time/pid-seeded engine RNG with values derived from the session seed.
@@ -604,30 +676,204 @@ thread_local! {
     static RENDER_BANK: std::cell::RefCell<Option<RngBank>> = const { std::cell::RefCell::new(None) };
 }
 
+static IN_WINDOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Simulation camera position at the last window exit; consumed by the early window entry
+/// of the next frame ([`early_window_entry`]). Only armed when [`patch_early_window`] is on.
+static ARMED_CAMERA: std::sync::Mutex<Option<(f32, f32)>> = std::sync::Mutex::new(None);
+static EARLY_WINDOW_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Entering the simulation window: stash the per-client RNG states, load the sim stream.
+/// Idempotent within a frame (the window may already have been entered early).
 ///
 /// # Safety
 /// Game thread.
 pub unsafe fn sim_rng_enter() {
+    if IN_WINDOW.swap(true, Ordering::Relaxed) {
+        return;
+    }
     RENDER_BANK.with(|b| *b.borrow_mut() = Some(RngBank::capture()));
     SIM_BANK.with(|b| {
         if let Some(s) = *b.borrow() {
             s.restore();
         }
     });
+    rng_log('<');
 }
 
-/// Leaving the simulation window: save the sim stream, put the per-client states back.
+/// Leaving the simulation window: save the sim stream, put the per-client states back,
+/// and arm the next frame's early entry with the current simulation camera.
 ///
 /// # Safety
 /// Game thread.
 pub unsafe fn sim_rng_leave() {
+    if !IN_WINDOW.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    rng_log('>');
     SIM_BANK.with(|b| *b.borrow_mut() = Some(RngBank::capture()));
     RENDER_BANK.with(|b| {
         if let Some(r) = *b.borrow() {
             r.restore();
         }
     });
+    let gg = rd(GAME_GLOBAL_PTR);
+    if gg != 0 && EARLY_WINDOW_ON.load(Ordering::Relaxed) {
+        let cam = (*((gg + GG_CAMERA_REQUEST) as *const f32), *((gg + GG_CAMERA_REQUEST + 4) as *const f32));
+        *ARMED_CAMERA.lock().unwrap_or_else(|p| p.into_inner()) = Some(cam);
+    }
+}
+
+/// DeathMatch::Update, right before the `OnWorldPreUpdate` dispatch loop over every mod's Lua
+/// state: `mov edi,[0x01207ea0]` (end of the mod-state vector).
+const PRE_UPDATE_DISPATCH: u32 = 0x006b_3201;
+/// GameGlobal::SetCameraPos(this = GameGlobal, const float pos[2], bool force), thiscall.
+const SET_CAMERA_POS_FN: u32 = 0x0063_6580;
+/// GameGlobal: last position requested through SetCameraPos (float x, y).
+const GG_CAMERA_REQUEST: u32 = 0xc8;
+
+/// The vanilla `data/scripts/init.lua` has its own `OnWorldPreUpdate` (weather: it emits rain
+/// particles around the camera with `GameEmitRainParticles`), and it runs before ours, i.e.
+/// with this client's render camera and render RNG stream. The rain particles are real grid
+/// particles that land as cells, so every seed with rain forked within ~20 frames. The
+/// simulation window (sim RNG stream + the last simulation camera) therefore opens natively
+/// before the dispatch to any mod.
+unsafe fn patch_early_window(ex: &mut Exec) -> Result<(), PatchError> {
+    expect(PRE_UPDATE_DISPATCH, &[0x8B, 0x3D, 0xA0, 0x7E, 0x20, 0x01])?;
+    let cb = ((early_window_entry as extern "C" fn()) as u32).to_le_bytes();
+    // pushad; mov eax,cb; call eax; popad; mov edi,[0x01207ea0]; ret
+    let stub = [0x60, 0xB8, cb[0], cb[1], cb[2], cb[3], 0xFF, 0xD0, 0x61, 0x8B, 0x3D, 0xA0, 0x7E, 0x20, 0x01, 0xC3];
+    let at = ex.put(&stub);
+    let mut call = vec![0xE8];
+    call.extend_from_slice(&rel32(PRE_UPDATE_DISPATCH + 5, at));
+    call.push(0x90);
+    write_code(PRE_UPDATE_DISPATCH, &call)?;
+    EARLY_WINDOW_ON.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+extern "C" fn early_window_entry() {
+    unsafe {
+        let Some((x, y)) = ARMED_CAMERA.lock().unwrap_or_else(|p| p.into_inner()).take() else { return };
+        let gg = rd(GAME_GLOBAL_PTR);
+        if gg == 0 {
+            return;
+        }
+        sim_rng_enter();
+        let set: extern "thiscall" fn(u32, *const f32, i32) = std::mem::transmute(SET_CAMERA_POS_FN as usize);
+        set(gg, [x, y].as_ptr(), 0);
+    }
+}
+
+/// Diagnostics: `NOITA_ONLINE_RNGLOG=from-to` appends the simulation RNG states at every
+/// window entry (`<`) and exit (`>`) in that frame range to `$NOITA_ONLINE_OUT/rng_<instance>.txt`.
+unsafe fn rng_log(tag: char) {
+    use std::io::Write;
+    static LOG: std::sync::LazyLock<Option<(u32, u32, std::sync::Mutex<std::fs::File>)>> = std::sync::LazyLock::new(|| {
+        let v = std::env::var("NOITA_ONLINE_RNGLOG").ok()?;
+        let (a, b) = v.split_once('-')?;
+        let out = std::env::var("NOITA_ONLINE_OUT").ok()?;
+        let inst = std::env::var("NOITA_ONLINE_INSTANCE").unwrap_or_default();
+        let f = std::fs::File::create(std::path::Path::new(&out).join(format!("rng_{inst}.txt"))).ok()?;
+        Some((a.parse().ok()?, b.parse().ok()?, std::sync::Mutex::new(f)))
+    });
+    let Some((a, b, file)) = LOG.as_ref() else { return };
+    let gg = rd(GAME_GLOBAL_PTR);
+    let frame = if gg != 0 { rd(gg) } else { 0 };
+    if frame < *a || frame > *b {
+        return;
+    }
+    let s = RngBank::capture();
+    let world_data = if gg != 0 { rd(gg + 0x0c) } else { 0 };
+    let grid_world = if world_data != 0 { rd(world_data + 0x44) } else { 0 };
+    let gw_rng = if grid_world != 0 { rd(grid_world + 4) } else { 0 };
+    if let Ok(mut f) = file.lock() {
+        let _ = writeln!(
+            f,
+            "{frame} {tag} lcg={:08x} plat={:08x}/{:08x} pm={:.0} part={:.0} rand={:08x} gw={gw_rng:08x}",
+            s.lcg, s.plat_a0, s.plat_a4, s.pm, s.particle, s.rand
+        );
+        if world_data != 0 && grid_world != 0 {
+            let fl = |o: u32| *((world_data + o) as *const f32);
+            let gi = |o: u32| rd(grid_world + o) as i32;
+            let _ = writeln!(
+                f,
+                "C {frame} {tag} cam={},{},{},{} view={},{},{},{} borders={},{},{},{}",
+                fl(0),
+                fl(4),
+                fl(8),
+                fl(12),
+                gi(0x498),
+                gi(0x49c),
+                gi(0x4a0),
+                gi(0x4a4),
+                gi(0x4a8),
+                gi(0x4ac),
+                gi(0x4b0),
+                gi(0x4b4)
+            );
+        }
+        if tag == '<' && std::env::var_os("NOITA_ONLINE_RNGLOG_TILES").is_some() {
+            let _ = f.write_all(grid_tiles_dump(frame).as_bytes());
+        }
+    }
+}
+
+/// Diagnostics: every 64x64 grid tile (tile map in key order) as `T frame x y rng` and the
+/// active list in order as `A frame x,y ...`.
+unsafe fn grid_tiles_dump(frame: u32) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let gg = rd(GAME_GLOBAL_PTR);
+    let world_data = if gg != 0 { rd(gg + 0x0c) } else { 0 };
+    let grid_world = if world_data != 0 { rd(world_data + 0x44) } else { 0 };
+    let imp = if grid_world != 0 { rd(grid_world + 0x5d0) } else { 0 };
+    if imp == 0 {
+        return out;
+    }
+    let mgr = rd(imp + 0x40);
+    let head = if mgr != 0 { rd(mgr + 0x14) } else { 0 };
+    if head != 0 {
+        // in-order walk of the MSVC red-black tree (node: left, parent, right, .., isnil +0xd)
+        let mut stack = Vec::new();
+        let mut n = rd(head + 4);
+        loop {
+            while n != 0 && n != head && *((n + 0xd) as *const u8) == 0 {
+                stack.push(n);
+                n = rd(n);
+            }
+            let Some(m) = stack.pop() else { break };
+            let tile = rd(m + 0x20);
+            if tile != 0 {
+                let r = |o: u32| rd(tile + o) as i32;
+                let _ = writeln!(
+                    out,
+                    "T {frame} {} {} {:08x} d={},{},{},{} u={},{},{},{} w={}",
+                    r(0x540),
+                    r(0x544),
+                    rd(tile + 4),
+                    r(0x480),
+                    r(0x484),
+                    r(0x488),
+                    r(0x48c),
+                    r(0x550),
+                    r(0x554),
+                    r(0x558),
+                    r(0x55c),
+                    *((tile + 0x46c) as *const u8)
+                );
+            }
+            n = rd(m + 8);
+        }
+    }
+    let count = rd(imp) as usize;
+    let arr = rd(imp + 4);
+    let _ = write!(out, "A {frame} {count}");
+    for i in 0..count.min(4096) {
+        let tile = rd(arr + 4 * i as u32);
+        let _ = write!(out, " {},{}", rd(tile + 0x540) as i32, rd(tile + 0x544) as i32);
+    }
+    out.push('\n');
+    out
 }
 
 /// GridWorld::OnCameraRectChanged's call that freezes/destroys physics bodies far from the

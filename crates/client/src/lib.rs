@@ -212,6 +212,35 @@ pub struct EntityPosC {
     pub y: f32,
 }
 
+/// Diagnostics: `NOITA_ONLINE_DUMP=from-to` dumps every loaded chunk's materials at state
+/// reports in that frame range to `$NOITA_ONLINE_OUT/dump_<instance>_<frame>.bin`.
+#[cfg(all(windows, target_arch = "x86"))]
+fn dump_path(frame: u32) -> Option<std::path::PathBuf> {
+    static RANGE: std::sync::LazyLock<Option<(u32, u32)>> = std::sync::LazyLock::new(|| {
+        let v = std::env::var("NOITA_ONLINE_DUMP").ok()?;
+        let (a, b) = v.split_once('-')?;
+        Some((a.parse().ok()?, b.parse().ok()?))
+    });
+    let (a, b) = (*RANGE)?;
+    if frame < a || frame > b {
+        return None;
+    }
+    let out = std::env::var("NOITA_ONLINE_OUT").ok()?;
+    let inst = std::env::var("NOITA_ONLINE_INSTANCE").unwrap_or_default();
+    Some(std::path::Path::new(&out).join(format!("dump_{inst}_{frame}.bin")))
+}
+
+/// Diagnostics: `NOITA_ONLINE_DUMP_RECT=x0,y0,x1,y1` additionally dumps the raw cells of
+/// that world rect (with the `NOITA_ONLINE_DUMP` frames).
+#[cfg(all(windows, target_arch = "x86"))]
+fn dump_rect() -> Option<[i32; 4]> {
+    static RECT: std::sync::LazyLock<Option<[i32; 4]>> = std::sync::LazyLock::new(|| {
+        let v: Vec<i32> = std::env::var("NOITA_ONLINE_DUMP_RECT").ok()?.split(',').map(|s| s.trim().parse()).collect::<Result<_, _>>().ok()?;
+        v.try_into().ok()
+    });
+    *RECT
+}
+
 /// Send this frame's state report. Chunk hashes are staggered: with `chunk_period` > 0
 /// only loaded chunks with `index % chunk_period == frame % chunk_period` are hashed, so
 /// every chunk is hashed and compared once per period without a per-period frame-time
@@ -238,6 +267,14 @@ pub unsafe extern "C" fn no_report_state(
         Vec::new()
     };
     let elapsed = t0.elapsed().as_micros() as i32;
+    #[cfg(all(windows, target_arch = "x86"))]
+    if let Some(path) = dump_path(frame) {
+        let _ = world::dump_chunks(&path);
+        if let Some([x0, y0, x1, y1]) = dump_rect() {
+            let _ = world::dump_cells(&path.with_extension("cells.txt"), x0, y0, x1, y1);
+            let _ = world::dump_particles(&path.with_extension("parts.txt"));
+        }
+    }
     let pos = if n == 0 { &[][..] } else { std::slice::from_raw_parts(positions, n as usize) };
     let positions: Vec<EntityPos> = pos
         .iter()
