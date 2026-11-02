@@ -31,6 +31,7 @@ void no_log(const char* text);
 uint64_t no_rtt_us(void);
 void no_shutdown(void);
 int32_t no_apply_patches(void);
+void no_prof_install(void);
 void no_fix_seeds(uint32_t seed);
 void no_set_session_time(int64_t unix_secs);
 int32_t no_last_error(uint8_t* out, uint32_t cap);

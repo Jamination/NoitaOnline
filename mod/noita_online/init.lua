@@ -64,6 +64,7 @@ end
 if solo then
   session = { seed = cfg.solo_seed, input_delay = 0, player = 0, players = { 0 }, scenario = cfg.bot and "bot" or "" }
   log("solo baseline mode, seed " .. session.seed)
+  NO.lib.no_prof_install()
 else
   local mask = NO.lib.no_apply_patches()
   if mask < 0 then

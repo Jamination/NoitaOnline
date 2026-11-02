@@ -182,8 +182,9 @@ const CHUNK_DELAY_FRAMES: u32 = 8;
 struct ChunkGate {
     /// job key -> frame it was first seen in the pending map
     first_seen: std::collections::HashMap<[u32; 3], u32>,
-    /// finished-but-too-young jobs hidden from this frame's integration
-    hidden: Vec<u32>,
+    /// During the gated integration call: the jobs it may integrate (old enough, hence
+    /// finished). `None` outside it (e.g. the engine's flush-everything loop, FUN_007420f0).
+    allowed: Option<Vec<u32>>,
 }
 
 static CHUNK_GATE: std::sync::Mutex<Option<ChunkGate>> = std::sync::Mutex::new(None);
@@ -227,15 +228,16 @@ pub unsafe fn chunk_prewait() -> u32 {
 }
 
 /// Before the engine integrates finished chunk jobs: jobs old enough are finished (see
-/// [`chunk_prewait`]); finished jobs that are still too young are hidden for this frame.
+/// [`chunk_prewait`]) and are the only ones this frame's integration may take.
 extern "C" fn chunk_gate_pre() {
     unsafe {
         let gg = rd(GAME_GLOBAL_PTR);
         let frame = if gg != 0 { rd(gg) } else { 0 };
         let jobs = chunk_jobs();
         let mut g = CHUNK_GATE.lock().unwrap_or_else(|p| p.into_inner());
-        let gate = g.get_or_insert_with(|| ChunkGate { first_seen: Default::default(), hidden: Vec::new() });
+        let gate = g.get_or_insert_with(|| ChunkGate { first_seen: Default::default(), allowed: None });
         gate.first_seen.retain(|k, _| jobs.iter().any(|(jk, _)| jk == k));
+        let mut allowed = Vec::new();
         for &(key, job) in &jobs {
             let seen = *gate.first_seen.entry(key).or_insert(frame);
             if frame.wrapping_sub(seen) >= CHUNK_DELAY_FRAMES {
@@ -248,31 +250,44 @@ extern "C" fn chunk_gate_pre() {
                     }
                     CHUNK_GATE_FALLBACKS.fetch_add(1, Ordering::Relaxed);
                 }
-            } else if job_done(job) {
-                *((job + 0xc8) as *mut i32) = 0;
-                gate.hidden.push(job);
+                allowed.push(job);
             }
         }
+        gate.allowed = Some(allowed);
     }
 }
 
 pub static CHUNK_GATE_FALLBACKS: AtomicU32 = AtomicU32::new(0);
 
-/// After integration: un-hide the young finished jobs for later frames.
+/// After integration: integration is ungated again.
 extern "C" fn chunk_gate_post() {
-    unsafe {
-        let mut g = CHUNK_GATE.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(gate) = g.as_mut() {
-            for job in gate.hidden.drain(..) {
-                *((job + 0xc8) as *mut i32) = 1;
-            }
-        }
+    let mut g = CHUNK_GATE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(gate) = g.as_mut() {
+        gate.allowed = None;
+    }
+}
+
+/// The integration scan's "job finished" read (`job+0xc8 == 1`), replaced by
+/// [`chunk_job_state`]. A young job's state cannot be hidden by writing it: a worker that
+/// finishes between the gate and the scan would set it to 1 and the chunk would be
+/// integrated early, at a timing-dependent frame on this client only.
+const CHUNK_JOB_DONE_READ: u32 = 0x0073_d746;
+
+/// `job+0xc8` as the integration scan sees it: 0 (not finished) for every job the gate does
+/// not allow this frame.
+extern "C" fn chunk_job_state(job: u32) -> u32 {
+    let g = CHUNK_GATE.lock().unwrap_or_else(|p| p.into_inner());
+    match g.as_ref().and_then(|gate| gate.allowed.as_ref()) {
+        Some(allowed) if !allowed.contains(&job) => 0,
+        _ => unsafe { std::ptr::read_volatile((job + 0xc8) as *const u32) },
     }
 }
 
 unsafe fn patch_chunk_wait(ex: &mut Exec) -> Result<(), PatchError> {
     let orig_rel = rel32(CHUNK_INTEGRATE_CALL + 5, CHUNK_INTEGRATE_FN);
     expect(CHUNK_INTEGRATE_CALL, &[0xE8, orig_rel[0], orig_rel[1], orig_rel[2], orig_rel[3]])?;
+    // mov eax,[edi+0xc8]; cmp eax,1; jnz (not finished)
+    expect(CHUNK_JOB_DONE_READ, &[0x8B, 0x87, 0xC8, 0x00, 0x00, 0x00, 0x83, 0xF8, 0x01, 0x0F, 0x85])?;
     let pre = ((chunk_gate_pre as extern "C" fn()) as u32).to_le_bytes();
     let post = ((chunk_gate_post as extern "C" fn()) as u32).to_le_bytes();
     let stub_at = ex.base + ex.used;
@@ -283,6 +298,14 @@ unsafe fn patch_chunk_wait(ex: &mut Exec) -> Result<(), PatchError> {
     stub.extend_from_slice(&[0xB8, post[0], post[1], post[2], post[3], 0xFF, 0xD0, 0xC3]);
     let at = ex.put(&stub);
     debug_assert_eq!(at, stub_at);
+    let state = ((chunk_job_state as extern "C" fn(u32) -> u32) as u32).to_le_bytes();
+    // push ecx; push edx; push edi; mov eax,chunk_job_state; call eax; add esp,4; pop edx;
+    // pop ecx; cmp eax,1; ret (-> the original jnz)
+    let read = ex.put(&[0x51, 0x52, 0x57, 0xB8, state[0], state[1], state[2], state[3], 0xFF, 0xD0, 0x83, 0xC4, 0x04, 0x5A, 0x59, 0x83, 0xF8, 0x01, 0xC3]);
+    let mut call = vec![0xE8];
+    call.extend_from_slice(&rel32(CHUNK_JOB_DONE_READ + 5, read));
+    call.extend_from_slice(&[0x90; 4]);
+    write_code(CHUNK_JOB_DONE_READ, &call)?;
     let mut call = vec![0xE8];
     call.extend_from_slice(&rel32(CHUNK_INTEGRATE_CALL + 5, at));
     write_code(CHUNK_INTEGRATE_CALL, &call)
@@ -377,6 +400,57 @@ unsafe fn patch_threaded_grid(ex: &mut Exec) -> Result<(), PatchError> {
         redirect_call(site, POOL_GROUP_FN, copy)?;
     }
     Ok(())
+}
+
+/// GridWorld::RenderTiles (FUN_00723650, called by FUN_00722ef0 after `OnWorldPostUpdate`,
+/// i.e. outside the simulation window): its row-lambda dispatch (joined inside the
+/// function) and its per-tile `Function_DrawGrid` dispatch (joined by the world draw,
+/// FUN_00723bd0 from FUN_006f66a0).
+const RENDER_TILES_SUBMIT_CALLS: [u32; 2] = [0x0072_37d7, 0x0072_3a6e];
+/// Job group of the last `Function_DrawGrid` dispatch; pending jobs at group+0x1c.
+const DRAW_GRID_GROUP: u32 = 0x0120_7000;
+static THREADED_RENDER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Grid rendering (7-10 ms per frame inline in a 2-player session) only reads cells and
+/// writes this client's render buffers; its one shared-state write is the global LCG
+/// (cell colour noise), which outside the window is the per-client render stream. It keeps
+/// the worker threads; [`sim_rng_enter`] joins it before the render stream is stashed, so no
+/// job ever overlaps the simulation window. Must run before [`patch_inline_group`].
+unsafe fn patch_threaded_render(ex: &mut Exec) -> Result<(), PatchError> {
+    let copy = threaded_group_submit(ex)?;
+    for site in RENDER_TILES_SUBMIT_CALLS {
+        redirect_call(site, POOL_GROUP_FN, copy)?;
+    }
+    THREADED_RENDER.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Unpatched copy of the group submit for [`patch_threaded_render`] (taken once, before
+/// [`patch_inline_group`]). Pathfinding jobs (FUN_00864590, call 0x0086470c) were tried on
+/// it too and forked seed 1717171717 at f=1383; they stay inline.
+unsafe fn threaded_group_submit(ex: &mut Exec) -> Result<u32, PatchError> {
+    static COPY: AtomicU32 = AtomicU32::new(0);
+    if COPY.load(Ordering::Relaxed) == 0 {
+        expect(POOL_GROUP_FN, &[0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x14])?;
+        expect(POOL_GROUP_JZ - 4, &[0x80, 0x7F, 0x25, 0x00, 0x74, 0x20])?;
+        COPY.store(copy_function(ex, POOL_GROUP_FN, POOL_GROUP_LEN, &POOL_GROUP_RELCALLS)?, Ordering::Relaxed);
+    }
+    Ok(COPY.load(Ordering::Relaxed))
+}
+
+/// Wait for the last `Function_DrawGrid` dispatch. Normally the world draw has joined it
+/// already; this covers frames whose draw was skipped.
+unsafe fn join_render_tiles() {
+    if !THREADED_RENDER.load(Ordering::Relaxed) {
+        return;
+    }
+    let group = rd(DRAW_GRID_GROUP);
+    if group == 0 {
+        return;
+    }
+    while std::ptr::read_volatile((group + 0x1c) as *const i32) > 0 {
+        std::thread::yield_now();
+    }
 }
 
 static APPLIED: AtomicU32 = AtomicU32::new(0);
@@ -527,7 +601,8 @@ const PARTICLE_SLOT_FNS: [u32; 2] = [0x0071_7400, 0x0071_74e0];
 const PARTICLE_SLOT_PROLOGUE: [u8; 10] = [0x55, 0x8B, 0xEC, 0x80, 0x3D, 0xA4, 0x4B, 0x20, 0x01, 0x00];
 
 /// Diagnostics: `NOITA_ONLINE_PTRACE=from-to` logs every grid-particle creation in that frame
-/// range (thread, allocator, EBP-chain return addresses, list sizes) to
+/// range (thread, allocator, EBP-chain return addresses, list sizes), tile dirty marks outside
+/// the window, and (with `cell_flash` off) the render job's cell-flash clears to
 /// `$NOITA_ONLINE_OUT/ptrace_<instance>.txt`.
 unsafe fn install_particle_trace(ex: &mut Exec) -> Result<(), PatchError> {
     let cb = ((particle_trace as extern "C" fn(u32, *const u32)) as u32).to_le_bytes();
@@ -557,6 +632,24 @@ unsafe fn install_particle_trace(ex: &mut Exec) -> Result<(), PatchError> {
     jmp.extend_from_slice(&rel32(TILE_MARK_DIRTY_FN + 5, at));
     jmp.push(0x90);
     write_code(TILE_MARK_DIRTY_FN, &jmp)?;
+    // With `cell_flash` off: the render job's flash test, logged where vanilla clears the
+    // flag (tag 3: cell flash older than FLASH_FRAMES, i.e. cleared right after this).
+    let have = std::slice::from_raw_parts(RENDER_FLASH_TEST as *const u8, RENDER_FLASH_TEST_ORIG.len());
+    if have == RENDER_FLASH_TEST_ORIG {
+        let stub_at = ex.base + ex.used;
+        // pushad; push esp; push 3; mov eax,cb; call eax; add esp,8; popad;
+        // cmp byte [edi+0xc],0; jz RENDER_NO_FLASH; jmp RENDER_FLASH_TEST+10
+        let mut stub = vec![0x60, 0x54, 0x6A, 0x03, 0xB8, cb[0], cb[1], cb[2], cb[3], 0xFF, 0xD0, 0x83, 0xC4, 0x08, 0x61];
+        stub.extend_from_slice(&[0x80, 0x7F, 0x0C, 0x00, 0x0F, 0x84]);
+        stub.extend_from_slice(&rel32(stub_at + stub.len() as u32 + 4, RENDER_NO_FLASH));
+        stub.push(0xE9);
+        stub.extend_from_slice(&rel32(stub_at + stub.len() as u32 + 4, RENDER_FLASH_TEST + 10));
+        let at = ex.put(&stub);
+        let mut jmp = vec![0xE9];
+        jmp.extend_from_slice(&rel32(RENDER_FLASH_TEST + 5, at));
+        jmp.extend_from_slice(&[0x90; 5]);
+        write_code(RENDER_FLASH_TEST, &jmp)?;
+    }
     Ok(())
 }
 
@@ -587,7 +680,14 @@ extern "C" fn particle_trace(tag: u32, regs: *const u32) {
         let esp = *regs.add(3);
         let mut ebp = *regs.add(2);
         let gp = *regs.add(6);
-        let what = if tag == 2 {
+        let what = if tag == 3 {
+            // edi = cell; only flags the render is about to clear
+            let cell = *regs;
+            if *((cell + 0xc) as *const u8) == 0 || (frame as i32).wrapping_sub(rd(cell + 8) as i32) < FLASH_FRAMES as i32 {
+                return;
+            }
+            format!("flash_clear x={} y={} set={} vt={:08x}", rd(cell + 0x18) as i32, rd(cell + 0x1c) as i32, rd(cell + 8) as i32, rd(cell))
+        } else if tag == 2 {
             format!("dirty x={} y={}", rd(esp + 4) as i32, rd(esp + 8) as i32)
         } else {
             format!("n={}/{}", (rd(gp + 0x38).wrapping_sub(rd(gp + 0x34))) / 0x70, (rd(gp + 0x50).wrapping_sub(rd(gp + 0x4c))) / 0x70)
@@ -616,6 +716,7 @@ const PATCHES: &[(&str, PatchFn)] = &[
     ("chunkwait", patch_chunk_wait),
     ("threaded_chunkgen", patch_threaded_chunkgen),
     ("threaded_grid", patch_threaded_grid),
+    ("threaded_render", patch_threaded_render),
     ("inline_group", |_| unsafe { patch_inline_group() }),
     ("inline_async", |_| unsafe { patch_inline_async() }),
     ("particle_init", |_| unsafe { patch_particle_init() }),
@@ -626,6 +727,8 @@ const PATCHES: &[(&str, PatchFn)] = &[
     ("clock", |_| unsafe { crate::clock::install(write_code) }),
     ("early_window", patch_early_window),
     ("freecam_static", |_| unsafe { patch_freecam_static() }),
+    ("cell_flash", patch_cell_flash),
+    ("cell_emitters", |_| unsafe { patch_cell_emitters() }),
 ];
 
 /// Overwrite every time/pid-seeded engine RNG with values derived from the session seed.
@@ -823,6 +926,7 @@ pub unsafe fn sim_rng_enter() {
     if IN_WINDOW.swap(true, Ordering::Relaxed) {
         return;
     }
+    join_render_tiles();
     RENDER_BANK.with(|b| *b.borrow_mut() = Some(RngBank::capture()));
     SIM_BANK.with(|b| {
         if let Some(s) = *b.borrow() {
@@ -957,8 +1061,14 @@ unsafe fn rng_log(tag: char) {
     if let Ok(mut f) = file.lock() {
         let _ = writeln!(
             f,
-            "{frame} {tag} lcg={:08x} plat={:08x}/{:08x} pm={:.0} part={:.0} rand={:08x} gw={gw_rng:08x}",
-            s.lcg, s.plat_a0, s.plat_a4, s.pm, s.particle, s.rand
+            "{frame} {tag} lcg={:08x} plat={:08x}/{:08x} pm={:.0} part={:.0} rand={:08x} gw={gw_rng:08x} t={:08x}",
+            s.lcg,
+            s.plat_a0,
+            s.plat_a4,
+            s.pm,
+            s.particle,
+            s.rand,
+            if gg != 0 { rd(gg + 8) } else { 0 }
         );
         if world_data != 0 && grid_world != 0 {
             let fl = |o: u32| *((world_data + o) as *const f32);
@@ -1121,6 +1231,87 @@ unsafe fn patch_cosmetic_particles() -> Result<(), PatchError> {
         write_code(imm, &[0x00])?;
     }
     Ok(())
+}
+
+/// Liquid-cell update (FUN_0070c6e0, CLiquidCell vtbl+0x54): `cmp byte [edi+0xc],0; jz +0xf`
+/// guarding `mark_dirty(x, y, 0)`.
+const LIQUID_FLASH_TEST: u32 = 0x0070_c6ef;
+/// Grid render job (FUN_00724580, outside the simulation window, render view rect):
+/// `cmp byte [edi+0xc],0; jz 0x00724d23` choosing the flash-colour path.
+const RENDER_FLASH_TEST: u32 = 0x0072_4b04;
+const RENDER_FLASH_TEST_ORIG: [u8; 10] = [0x80, 0x7F, 0x0C, 0x00, 0x0F, 0x84, 0x15, 0x02, 0x00, 0x00];
+const RENDER_NO_FLASH: u32 = 0x0072_4d23;
+/// Inside the render job's flash path: `mov byte [edi+0xc],0` once the flash is 21 frames old.
+const RENDER_FLASH_CLEAR: u32 = 0x0072_4bdf;
+/// Frames a cell flash lasts (`cmp eax,0x15` in the render job).
+const FLASH_FRAMES: u8 = 21;
+
+/// Cell "flash" (cell+0xc flag, cell+8 = frame it was set; set by material conversion,
+/// FUN_00baac80): the liquid update keeps a flashing cell's tile dirty, but the flag was only
+/// ever cleared by the grid *render* job, for cells inside this client's render view, 21
+/// frames after it was set. Clients looking at different places therefore kept different
+/// tiles awake and forked (seed 2046634918, f=943). The expiry moves into the simulation:
+/// the liquid update clears an expired flag itself (after its dirty mark, i.e. the frame
+/// the on-screen render would have cleared it), and the render only reads the flag (an
+/// expired flag renders as no flash, as it would after vanilla's clear).
+unsafe fn patch_cell_flash(ex: &mut Exec) -> Result<(), PatchError> {
+    expect(LIQUID_FLASH_TEST, &[0x80, 0x7F, 0x0C, 0x00, 0x74, 0x0F])?;
+    expect(RENDER_FLASH_TEST, &RENDER_FLASH_TEST_ORIG)?;
+    expect(RENDER_FLASH_CLEAR, &[0xC6, 0x47, 0x0C, 0x00])?;
+    let gg = GAME_GLOBAL_PTR.to_le_bytes();
+    // eax = frame - cell+8:  push eax; mov eax,[GAME_GLOBAL_PTR]; mov eax,[eax]; sub eax,[edi+8]; cmp eax,FLASH_FRAMES
+    let age = [0x50, 0xA1, gg[0], gg[1], gg[2], gg[3], 0x8B, 0x00, 0x2B, 0x47, 0x08, 0x83, 0xF8, FLASH_FRAMES];
+    // Liquid update: cmp byte [edi+0xc],0; jz no_flag; <age>; jl keep; mov byte [edi+0xc],0;
+    // keep: pop eax; ret (-> mark dirty); no_flag: mov dword [esp],0x0070c704; ret
+    let mut sim = vec![0x80, 0x7F, 0x0C, 0x00, 0x74, 0x00];
+    sim.extend_from_slice(&age);
+    sim.extend_from_slice(&[0x7C, 0x04, 0xC6, 0x47, 0x0C, 0x00, 0x58, 0xC3]);
+    sim[5] = (sim.len() - 6) as u8;
+    sim.extend_from_slice(&[0xC7, 0x04, 0x24]);
+    sim.extend_from_slice(&(LIQUID_FLASH_TEST + 6 + 0x0F).to_le_bytes());
+    sim.push(0xC3);
+    let sim_at = ex.put(&sim);
+    // Render: cmp byte [edi+0xc],0; jz off; <age>; pop eax; jge off; ret (-> flash path);
+    // off: mov dword [esp],RENDER_NO_FLASH; ret
+    let mut render = vec![0x80, 0x7F, 0x0C, 0x00, 0x74, 0x00];
+    render.extend_from_slice(&age);
+    render.extend_from_slice(&[0x58, 0x7D, 0x01, 0xC3]);
+    render[5] = (render.len() - 6) as u8;
+    render.extend_from_slice(&[0xC7, 0x04, 0x24]);
+    render.extend_from_slice(&RENDER_NO_FLASH.to_le_bytes());
+    render.push(0xC3);
+    let render_at = ex.put(&render);
+    let mut call = vec![0xE8];
+    call.extend_from_slice(&rel32(LIQUID_FLASH_TEST + 5, sim_at));
+    call.push(0x90);
+    write_code(LIQUID_FLASH_TEST, &call)?;
+    let mut call = vec![0xE8];
+    call.extend_from_slice(&rel32(RENDER_FLASH_TEST + 5, render_at));
+    call.extend_from_slice(&[0x90; 5]);
+    write_code(RENDER_FLASH_TEST, &call)?;
+    // Unreachable now; the render must never write world state.
+    write_code(RENDER_FLASH_CLEAR, &[0x0F, 0x1F, 0x40, 0x00])?;
+    Ok(())
+}
+
+/// Grid render job: `jz 0x00724afc` skipping a cell whose material has no particle effect
+/// (`cmp dword [material+0x28c],0`); otherwise the cell is queued as a particle emitter.
+const RENDER_EMITTER_JZ: u32 = 0x0072_4977;
+
+/// Material particle effects (`<ParticleEffect render_on_grid="1">`: sparkles over magic
+/// liquids, acid, lava, ...) are emitted from the surface cells the grid *render* job finds
+/// in this client's view: it queues them (DAT_012080d8, in job/row order of the view), and
+/// FUN_00724480 creates the particles after the render, outside the simulation window. The
+/// particles then live in the shared GridParticles lists, whose in-window update draws from
+/// the simulation particle RNG (bounces, 0x01222388). Different views (or just a different
+/// view origin, which permutes the queue) forked the particle RNG (seed 2046634918, f=1385).
+/// The render no longer queues emitters, so these purely cosmetic effects are not drawn.
+unsafe fn patch_cell_emitters() -> Result<(), PatchError> {
+    expect(RENDER_EMITTER_JZ - 14, &[0x83, 0xB8, 0x8C, 0x02, 0x00, 0x00, 0x00])?;
+    expect(RENDER_EMITTER_JZ, &[0x0F, 0x84, 0x7F, 0x01, 0x00, 0x00])?;
+    // jz rel32 -> jmp rel32; nop
+    let rel = rel32(RENDER_EMITTER_JZ + 5, RENDER_EMITTER_JZ + 6 + 0x17f);
+    write_code(RENDER_EMITTER_JZ, &[0xE9, rel[0], rel[1], rel[2], rel[3], 0x90])
 }
 
 static FREEZE_LAST: std::sync::Mutex<Vec<(f32, f32)>> = std::sync::Mutex::new(Vec::new());

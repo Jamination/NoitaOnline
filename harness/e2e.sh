@@ -83,9 +83,11 @@ fi
 k=0
 for id in "${IDS[@]}"; do
   CPUSET=""
-  # --pin: client k gets physical core 2+k (both SMT threads); cores 0-1 stay free for the
-  # X server, wineservers and the game server.
-  if [[ "$PIN" == 1 && $k -lt 4 ]]; then CPUSET="$((2 + k)),$((8 + k))"; fi
+  # --pin: client k gets physical core PIN_BASE+k (both SMT threads; default base 2); cores
+  # 0-1 stay free for the X server, wineservers and the game server. Concurrent harness
+  # runs use different NOITA_PIN_BASE values so they never share cores.
+  BASE="${NOITA_PIN_BASE:-2}"
+  if [[ "$PIN" == 1 && $((BASE + k)) -lt 6 ]]; then CPUSET="$((BASE + k)),$((BASE + 6 + k))"; fi
   NOITA_CPUSET="$CPUSET" NOITA_ONLINE_NAME="p$id" setsid "$ROOT/harness/launch_noita.sh" "$id" -no_logo_splashes -gamemode 0 </dev/null >/dev/null 2>&1 &
   k=$((k + 1))
   sleep "${NOITA_STAGGER:-4}"

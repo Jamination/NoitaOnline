@@ -9,6 +9,8 @@ pub mod net;
 pub mod patches;
 pub mod perf;
 #[cfg(all(windows, target_arch = "x86"))]
+pub mod prof;
+#[cfg(all(windows, target_arch = "x86"))]
 pub mod world;
 
 use net::{ConnectParams, Shared, Status};
@@ -179,6 +181,8 @@ pub unsafe extern "C" fn no_wait_tick(frame: u32, timeout_ms: u32, out: *mut u8,
             drop(s);
             let waited = started.elapsed().as_micros() as u64;
             with_rt((), |rt| rt.timer.window_wait_us += waited);
+            #[cfg(all(windows, target_arch = "x86"))]
+            prof::WAIT_US.fetch_add(waited, std::sync::atomic::Ordering::Relaxed);
             let mut buf = Vec::with_capacity(64);
             buf.push(inputs.len().min(255) as u8);
             for (p, d) in inputs.iter().take(255) {
@@ -261,7 +265,10 @@ pub unsafe extern "C" fn no_report_state(
 ) -> i32 {
     let t0 = Instant::now();
     #[cfg(all(windows, target_arch = "x86"))]
-    let chunks = world::hash_loaded_chunks(|index| chunk_period == 0 || index % chunk_period == frame % chunk_period);
+    let chunks = match chunk_period {
+        0 => world::hash_loaded_chunks(0, 1),
+        p => world::hash_loaded_chunks((frame % p) as usize, p as usize),
+    };
     #[cfg(not(all(windows, target_arch = "x86")))]
     let chunks: Vec<protocol::ChunkHash> = {
         let _ = chunk_period;
@@ -419,7 +426,10 @@ pub extern "C" fn no_apply_patches() -> i32 {
     #[cfg(all(windows, target_arch = "x86"))]
     unsafe {
         match patches::apply_all() {
-            Ok(m) => m as i32,
+            Ok(m) => {
+                prof::install();
+                m as i32
+            }
             Err(e) => {
                 set_last_error(e.0);
                 -1
@@ -430,6 +440,16 @@ pub extern "C" fn no_apply_patches() -> i32 {
     {
         set_last_error("patches only exist inside 32-bit Windows noita.exe".into());
         -1
+    }
+}
+
+/// Diagnostics: install the frame-section profiler without the determinism patches (solo
+/// baseline); no-op unless `NOITA_ONLINE_PROF` is set.
+#[no_mangle]
+pub extern "C" fn no_prof_install() {
+    #[cfg(all(windows, target_arch = "x86"))]
+    unsafe {
+        prof::install()
     }
 }
 
