@@ -49,6 +49,12 @@ if not solo then
   if n == 1 then ModTextFileSetContent(radar, text) else log("radar.lua: camera test not found (" .. n .. ")") end
 end
 
+-- Vanilla scripts' player-scoped messages show only for this client's own player
+-- (local_prints.lua); the setting naming that player starts empty (every message shows).
+local LocalPrints = dofile_once(ROOT .. "local_prints.lua")
+LocalPrints.set_local(nil)
+if not solo then LocalPrints.install(log) end
+
 local function drain_events()
   for _, e in ipairs(NO.poll_events()) do log("net: " .. e) end
 end
@@ -243,7 +249,8 @@ function OnWorldPreUpdate()
     if ready then
       local s = local_input(f)
       Players.apply_tick(f, { [0] = Input.encode(s) })
-      if session.scenario == "bot" then Bot.world_events(f, Players.slots) end
+      if session.scenario == "bot" then Bot.world_events(f, Players.slots)
+      elseif session.scenario == "items" then Bot.items_events(f, Players.slots) end
     end
     return
   end
@@ -283,7 +290,8 @@ function OnWorldPreUpdate()
     end
     NO.lib.no_focus_freeze(centre_buf, #foci)
     NO.lib.no_local_view(own)
-    if session.scenario == "bot" then Bot.world_events(f, Players.slots) end
+    if session.scenario == "bot" then Bot.world_events(f, Players.slots)
+    elseif session.scenario == "items" then Bot.items_events(f, Players.slots) end
   end
 end
 

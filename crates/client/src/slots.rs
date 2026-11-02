@@ -153,6 +153,38 @@ const SOUND_LCG_WRITE: u32 = 0x0047_be82;
 const GLOBAL_LCG: u32 = 0x0120_741c;
 static SOUND_LCG: AtomicU32 = AtomicU32::new(0x2545_f491);
 
+/// Damage flash (the screen flashes red when the player is hurt). The camera object
+/// (`[GameGlobal+0x0c]`) holds the flash amount (+0x5c, drawn by the render `FUN_006f21d0`)
+/// and its fade rate (+0x60). The PlatformShooterPlayerSystem's damage handler
+/// (`FUN_00bf6660`, every slot on every client) raises it: `call FUN_006f2f10`
+/// (thiscall(camera, message)) @0x00bf66be, which draws the global LCG, on some paths only
+/// while the current amount is under a limit. The world update fades it: `call FUN_006f1d40`
+/// (ECX = camera, XMM1 = dt; also the screen shake) @0x006b32ae.
+const FLASH_HIT_CALL: u32 = 0x00bf_66be;
+const FLASH_HIT_FN: u32 = 0x006f_2f10;
+const FLASH_DECAY_CALL: u32 = 0x006b_32ae;
+const FLASH_DECAY_FN: u32 = 0x006f_1d40;
+const CAM_FLASH: u32 = 0x5c;
+const CAM_FLASH_RATE: u32 = 0x60;
+/// Game mode (`[0x01204bc0]`); +0x90 set: the flash fades [`FLASH_FAST_K`] times faster.
+const GAME_MODE_PTR: u32 = 0x0120_4bc0;
+const GAME_MODE_FAST_FADE: u32 = 0x90;
+const FLASH_FAST_K: u32 = 0x0115_2668;
+const FLASH_ONE: u32 = 0x0105_3780;
+const FLASH_EPS: u32 = 0x0105_3424;
+/// Engine constants of the fade (expected, then read where the engine reads them).
+const FLASH_CONSTANTS: [(u32, f32); 2] = [(FLASH_ONE, 1.0), (FLASH_EPS, 0.001)];
+static FLASH_ON: AtomicU8 = AtomicU8::new(0);
+/// This client's own flash amount and fade rate (f32 bits): its own player's hits only.
+static LOCAL_FLASH: AtomicU32 = AtomicU32::new(0);
+static LOCAL_FLASH_RATE: AtomicU32 = AtomicU32::new(0x3f80_0000);
+/// The shared flash, parked while the render shows the local one.
+static SHARED_FLASH: AtomicU32 = AtomicU32::new(0);
+static SHARED_FLASH_RATE: AtomicU32 = AtomicU32::new(0);
+static FLASH_PARKED: AtomicU8 = AtomicU8::new(0);
+/// The decay call's dt, kept by its stub.
+static FLASH_DT: AtomicU32 = AtomicU32::new(0);
+
 const MAX_SLOTS: usize = 32;
 #[allow(clippy::declare_interior_mutable_const)]
 const ZERO: AtomicU32 = AtomicU32::new(0);
@@ -470,7 +502,133 @@ pub(crate) unsafe fn patch_presentation(ex: &mut Exec) -> Result<(), PatchError>
         }
     }
     let dm: unsafe extern "thiscall" fn(u32, u32) -> u32 = damage_model_for_view;
-    redirect_call(LOW_HP_DAMAGE_MODEL_CALL, DAMAGE_MODEL_OF_FN, dm as usize as u32)
+    redirect_call(LOW_HP_DAMAGE_MODEL_CALL, DAMAGE_MODEL_OF_FN, dm as usize as u32)?;
+    patch_flash(ex)
+}
+
+/// The damage flash: our own player's hits on a local copy (`flash_hit`), its decay alongside
+/// the shared one (`flash_decay`), the copy shown by the render ([`flash_render_enter`]).
+unsafe fn patch_flash(ex: &mut Exec) -> Result<(), PatchError> {
+    expect_call(FLASH_HIT_CALL, FLASH_HIT_FN)?;
+    expect_call(FLASH_DECAY_CALL, FLASH_DECAY_FN)?;
+    for (addr, v) in FLASH_CONSTANTS {
+        expect(addr, &v.to_le_bytes())?;
+    }
+    // At the setter call (ECX = camera, [esp] = message, EBP = the handler's frame with the
+    // entity at [ebp+8]): push msg; push entity; push ecx; call flash_hit; add esp,12; ret 4
+    let hit: unsafe extern "C" fn(u32, u32, u32) = flash_hit;
+    let hit_stub = put_fixed(
+        ex,
+        &[
+            0xFF, 0x74, 0x24, 0x04, // push dword [esp+4]
+            0xFF, 0x75, 0x08, // push dword [ebp+8]
+            0x51, // push ecx
+            0xE8, 0, 0, 0, 0, // call flash_hit
+            0x83, 0xC4, 0x0C, // add esp,12
+            0xC2, 0x04, 0x00, // ret 4
+        ],
+        &[(9, hit as usize as u32)],
+    )?;
+    // At the decay call (ECX = camera, XMM1 = dt): keep dt, flash_decay(dt), then the
+    // original with ECX and XMM1 as they were.
+    let decay: unsafe extern "C" fn(u32) = flash_decay;
+    let dt = (FLASH_DT.as_ptr() as u32).to_le_bytes();
+    let decay_stub = put_fixed(
+        ex,
+        &[
+            0xF3, 0x0F, 0x11, 0x0D, dt[0], dt[1], dt[2], dt[3], // movss [dt],xmm1
+            0x60, // pushad
+            0xFF, 0x35, dt[0], dt[1], dt[2], dt[3], // push dword [dt]
+            0xE8, 0, 0, 0, 0, // call flash_decay
+            0x83, 0xC4, 0x04, // add esp,4
+            0x61, // popad
+            0xF3, 0x0F, 0x10, 0x0D, dt[0], dt[1], dt[2], dt[3], // movss xmm1,[dt]
+            0xE9, 0, 0, 0, 0, // jmp FUN_006f1d40
+        ],
+        &[(16, decay as usize as u32), (33, FLASH_DECAY_FN)],
+    )?;
+    redirect_call(FLASH_HIT_CALL, FLASH_HIT_FN, hit_stub)?;
+    redirect_call(FLASH_DECAY_CALL, FLASH_DECAY_FN, decay_stub)?;
+    FLASH_ON.store(1, Ordering::Relaxed);
+    Ok(())
+}
+
+/// A player was hurt (PlatformShooterPlayerSystem's damage handler, every slot on every
+/// client): the shared flash as before, which keeps the RNG draws identical everywhere; for
+/// our own player also the local flash, with the same draw (the LCG is put back).
+unsafe extern "C" fn flash_hit(cam: u32, e: u32, msg: u32) {
+    let set: unsafe extern "thiscall" fn(u32, u32) = std::mem::transmute(FLASH_HIT_FN as usize);
+    if is_local(e) {
+        let lcg = rd(GLOBAL_LCG);
+        let mut scratch = [0u32; (CAM_FLASH_RATE / 4 + 1) as usize];
+        scratch[(CAM_FLASH / 4) as usize] = LOCAL_FLASH.load(Ordering::Relaxed);
+        scratch[(CAM_FLASH_RATE / 4) as usize] = LOCAL_FLASH_RATE.load(Ordering::Relaxed);
+        set(scratch.as_mut_ptr() as u32, msg);
+        LOCAL_FLASH.store(scratch[(CAM_FLASH / 4) as usize], Ordering::Relaxed);
+        LOCAL_FLASH_RATE.store(scratch[(CAM_FLASH_RATE / 4) as usize], Ordering::Relaxed);
+        *(GLOBAL_LCG as *mut u32) = lcg;
+    }
+    set(cam, msg);
+}
+
+/// The world update's flash decay (`FUN_006f1d40`, @0x006f209a..0x006f20df), applied to the
+/// local flash with the same frame time: `flash -= rate * dt * k` (k = 5 with the game mode's
+/// fast-fade flag +0x90, else 1), not below 0; under 0.001 the rate goes back to 1.
+unsafe extern "C" fn flash_decay(dt: u32) {
+    let f = |a: u32| f32::from_bits(rd(a));
+    let gm = rd(GAME_MODE_PTR);
+    let k = if gm != 0 && *((gm + GAME_MODE_FAST_FADE) as *const u8) != 0 { f(FLASH_FAST_K) } else { f(FLASH_ONE) };
+    let rate = f32::from_bits(LOCAL_FLASH_RATE.load(Ordering::Relaxed));
+    let mut v = f32::from_bits(LOCAL_FLASH.load(Ordering::Relaxed)) - rate * f32::from_bits(dt) * k;
+    if !(v > 0.0) {
+        v = 0.0;
+    }
+    LOCAL_FLASH.store(v.to_bits(), Ordering::Relaxed);
+    if f(FLASH_EPS) > v {
+        LOCAL_FLASH_RATE.store(f(FLASH_ONE).to_bits(), Ordering::Relaxed);
+    }
+}
+
+unsafe fn camera() -> u32 {
+    let gg = rd(crate::patches::GAME_GLOBAL_PTR);
+    if gg == 0 {
+        0
+    } else {
+        rd(gg + 0x0c)
+    }
+}
+
+/// After the window, before the render: the camera shows this client's own damage flash; the
+/// shared one is parked until [`flash_render_leave`]. Game thread.
+///
+/// # Safety
+/// World initialised.
+pub unsafe fn flash_render_enter() {
+    let cam = camera();
+    if FLASH_ON.load(Ordering::Relaxed) == 0 || cam == 0 || FLASH_PARKED.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    let p = cam as *mut u32;
+    let (a, r) = ((CAM_FLASH / 4) as usize, (CAM_FLASH_RATE / 4) as usize);
+    SHARED_FLASH.store(*p.add(a), Ordering::Relaxed);
+    SHARED_FLASH_RATE.store(*p.add(r), Ordering::Relaxed);
+    *p.add(a) = LOCAL_FLASH.load(Ordering::Relaxed);
+    *p.add(r) = LOCAL_FLASH_RATE.load(Ordering::Relaxed);
+    FLASH_PARKED.store(1, Ordering::Relaxed);
+}
+
+/// Entering the next window: the shared damage flash back on the camera. Game thread.
+///
+/// # Safety
+/// World initialised.
+pub unsafe fn flash_render_leave() {
+    let cam = camera();
+    if FLASH_PARKED.swap(0, Ordering::Relaxed) == 0 || cam == 0 {
+        return;
+    }
+    let p = cam as *mut u32;
+    *p.add((CAM_FLASH / 4) as usize) = SHARED_FLASH.load(Ordering::Relaxed);
+    *p.add((CAM_FLASH_RATE / 4) as usize) = SHARED_FLASH_RATE.load(Ordering::Relaxed);
 }
 
 /// Patch `sound_rng`: sound events randomise pitch and volume with their own LCG instead of

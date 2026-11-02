@@ -1356,6 +1356,8 @@ pub unsafe fn sim_rng_enter() {
     join_render_tiles();
     // The render used this client's own screen shake (`screen_shake`): back to the shared one.
     crate::camreaders::shake_render_leave();
+    // ... and the shared damage flash (`local_presentation`).
+    crate::slots::flash_render_leave();
     // The previous step's state report is hashed in the background; no step may run first.
     crate::report::join();
     RENDER_BANK.with(|b| *b.borrow_mut() = Some(RngBank::capture()));
@@ -1414,6 +1416,8 @@ pub unsafe fn sim_rng_leave() {
         *((gg + GG_CAMERA_LOCK) as *mut u8) = 0;
         // The render camera (set next, by the mod) shakes with this client's own shake.
         crate::camreaders::shake_render_enter();
+        // The render shows this client's own player's damage flash (`local_presentation`).
+        crate::slots::flash_render_enter();
     }
 }
 

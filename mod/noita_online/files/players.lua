@@ -7,6 +7,7 @@
 -- this client's real keyboard/mouse/gamepad input, which we read and send to the server.
 local Input = dofile_once("mods/noita_online/files/input.lua")
 local NO = dofile_once("mods/noita_online/files/native.lua")
+local LocalPrints = dofile_once("mods/noita_online/files/local_prints.lua")
 
 local M = {}
 
@@ -51,7 +52,8 @@ local function make_proxy_inert(e)
 end
 
 -- Tell the client runtime (slots.rs) the slot entities, which it follows through polymorphs,
--- our own slot (none once we died: vanilla shows a dead player nothing more) and the proxy.
+-- our own slot (none once we died: vanilla shows a dead player nothing more) and the proxy;
+-- and the patched vanilla scripts (local_prints.lua) our own player's entity.
 local function register_slots()
   local ents, local_index = {}, -1
   for i, slot in ipairs(M.slots) do
@@ -59,6 +61,7 @@ local function register_slots()
     if slot.id == M.local_id and not slot.dead then local_index = i - 1 end
   end
   NO.slots_set(ents, local_index, M.proxy or 0)
+  LocalPrints.set_local(local_index >= 0 and ents[local_index + 1] or 0)
 end
 
 -- Called from OnPlayerSpawned (same frame on every client).
@@ -406,6 +409,7 @@ local function check_death(slot)
     make_spectator(slot.entity)
   end
   slot.dead = true
+  if M.log then M.log(string.format("slot %d died: entity %d frame %d", slot.id, slot.entity, GameGetFrameNum())) end
   if slot.id == M.local_id then
     GamePrint("You died - spectating")
     register_slots()
@@ -432,7 +436,10 @@ local function retarget(slot, e)
   local dm = EntityGetFirstComponentIncludingDisabled(e, "DamageModelComponent")
   if dm then ComponentSetValue2(dm, "wait_for_kill_flag_on_death", true) end
   if slot.dead then make_spectator(e) end
-  if slot.id == M.local_id then NO.lib.no_gui_set_local(e) end
+  if slot.id == M.local_id then
+    NO.lib.no_gui_set_local(e)
+    if not slot.dead then LocalPrints.set_local(e) end
+  end
 end
 
 local function follow_slots()
