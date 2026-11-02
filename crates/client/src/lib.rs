@@ -3,6 +3,7 @@
 //! All exported functions are `extern "C"`, called from the game thread only. Networking runs
 //! on a background thread (`net`), so packet handling never waits for the game's frames.
 
+pub mod clock;
 pub mod net;
 #[cfg(all(windows, target_arch = "x86"))]
 pub mod patches;
@@ -430,6 +431,12 @@ pub extern "C" fn no_apply_patches() -> i32 {
         set_last_error("patches only exist inside 32-bit Windows noita.exe".into());
         -1
     }
+}
+
+/// Session calendar: unix seconds at frame 0 (from the server's Start), 0 = real clock.
+#[no_mangle]
+pub extern "C" fn no_set_session_time(unix_secs: i64) {
+    clock::set_epoch(unix_secs);
 }
 
 /// Reseed every engine RNG from the session seed (call at world init and frame 1).

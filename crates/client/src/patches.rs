@@ -493,6 +493,7 @@ const PATCHES: &[(&str, PatchFn)] = &[
     ("fixed_dt", patch_fixed_dt),
     ("focus_freeze", patch_focus_freeze),
     ("cosmetic_particles", |_| unsafe { patch_cosmetic_particles() }),
+    ("clock", |_| unsafe { crate::clock::install(write_code) }),
     ("early_window", patch_early_window),
 ];
 

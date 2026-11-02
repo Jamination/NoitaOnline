@@ -324,7 +324,9 @@ fn run(args: Args) -> std::io::Result<()> {
                 let roster: Vec<(u8, String)> = ready.iter().map(|i| (*i, players[i].name.clone())).collect();
                 let max_rtt = ready.iter().filter_map(|i| server.connection(*i as u16)).map(|c| c.rtt_us()).max().unwrap_or(0);
                 let input_delay = args.input_delay.unwrap_or_else(|| auto_input_delay(max_rtt));
-                let params = format!("scenario={}", args.scenario).into_bytes();
+                // Shared calendar for date/time-dependent content (weather, holidays).
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                let params = format!("scenario={};time={}", args.scenario, now).into_bytes();
                 let start = ServerMsg::Start { seed, players: roster.clone(), input_delay, session_id, params };
                 let _ = server.broadcast(CH_RELIABLE, &start.encode());
                 logs.event(&format!(
