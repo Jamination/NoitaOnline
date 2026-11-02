@@ -143,6 +143,7 @@ local FOCUS_HW, FOCUS_HH = 400, 300
 local UNLOAD_MARGIN, UNLOAD_EVERY, UNLOAD_MAX = 512, 30, 2
 local ffi = require("ffi")
 local foci_buf = ffi.new("int32_t[128]")
+local centre_buf = ffi.new("float[64]")
 
 local function current_foci()
   local foci = {}
@@ -208,6 +209,11 @@ function OnWorldPreUpdate()
     set_sim_camera(foci)
     Players.apply_tick(f, tick)
     for _, r in ipairs(foci) do NO.lib.no_stream_focus(r[1], r[2], r[3], r[4]) end
+    for i, r in ipairs(foci) do
+      centre_buf[2 * (i - 1)] = r.x
+      centre_buf[2 * (i - 1) + 1] = r.y
+    end
+    NO.lib.no_focus_freeze(centre_buf, #foci)
     if session.scenario == "bot" then Bot.world_events(f, Players.slots) end
   end
 end
