@@ -35,9 +35,12 @@ explosives around the players at fixed frames.
 
 ```sh
 harness/e2e.sh --pin --players 4 --frames 36000 --out run/e2e/full          # 10 minutes
-harness/e2e.sh --pin --solo --players 4 --frames 36000 --out run/e2e/baseline
 harness/e2e.sh --pin --players 4 --frames 36000 --netsim loss=0.05,latency=100 --out run/e2e/netsim
-harness/evaluate.py --run run/e2e/full --baseline run/e2e/baseline --netsim-run run/e2e/netsim
+harness/e2e.sh --pin --players 1 --frames 3600 --seed 98765432 --out run/e2e/fps_mp1
+harness/e2e.sh --pin --solo --players 1 --frames 3600 --seed 98765432 --out run/e2e/fps_solo1
+harness/e2e.sh --pin --solo --players 4 --frames 36000 --out run/e2e/solo4   # informational
+harness/evaluate.py --run run/e2e/full --netsim-run run/e2e/netsim \
+  --fps-run run/e2e/fps_mp1 --baseline run/e2e/fps_solo1 --info-baseline run/e2e/solo4
 ```
 
 * `--pin` gives client *k* its own physical core (CPUs `B+k` and `B+6+k`, `B` =
@@ -51,8 +54,12 @@ harness/evaluate.py --run run/e2e/full --baseline run/e2e/baseline --netsim-run 
 
 `evaluate.py` checks: builds (Linux server, Windows server, Windows client DLL), the test
 suite, a complete 4-client session with no disconnects, zero chunk-hash and zero position
-mismatches at every 60-frame checkpoint, per-client FPS (average and 1 % low) within 5 % of
-the baseline, bandwidth below 100 KB/s per client, server CPU below one core, and the
+mismatches at every 60-frame checkpoint, the mod's FPS overhead (a 1-player session vs the
+vanilla single-player baseline, same scenario, seed and pinning; average and 1 % low within
+5 %), bandwidth below 100 KB/s per client, server CPU below one core, and the
+same session guarantees under the network conditions. Every lockstep client simulates every
+player, so an N-player session carries N players' workload; its FPS against N solo
+instances is printed for information only.
 same session guarantees under the network conditions.
 
 ### Profiling

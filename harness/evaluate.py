@@ -2,8 +2,15 @@
 """Evaluate Noita Online acceptance criteria from e2e run artifacts.
 
 Usage:
-  harness/evaluate.py --run run/e2e/full --baseline run/e2e/baseline --netsim-run run/e2e/netsim
+  harness/evaluate.py --run run/e2e/full --netsim-run run/e2e/netsim \
+                      --fps-run run/e2e/fps_mp1 --baseline run/e2e/fps_solo1 [--info-baseline run/e2e/solo4]
                       [--frames 36000] [--players 4] [--skip-build] [--skip-tests]
+
+FPS criterion (agreed with the user): every lockstep client simulates every player, so the
+4-player workload is inherently larger than single-player. The criterion therefore measures
+the mod's own overhead at equal workload: a 1-player session (patches, networking, lockstep)
+vs the vanilla single-player baseline, same scenario, seed and CPU pinning. The 4-player
+session's FPS against --info-baseline is reported for information only.
 
 Exit status 0 only if every criterion passes. Prints one PASS/FAIL line per criterion.
 """
@@ -88,7 +95,9 @@ def client_ids(run):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", required=True)
-    ap.add_argument("--baseline", required=True)
+    ap.add_argument("--baseline", required=True, help="vanilla solo run (--solo --players 1 --pin)")
+    ap.add_argument("--fps-run", required=True, help="1-player MP run (--players 1 --pin), same seed")
+    ap.add_argument("--info-baseline", help="solo run with as many instances as --run (informational)")
     ap.add_argument("--netsim-run", required=True)
     ap.add_argument("--frames", type=int, default=36000)
     ap.add_argument("--players", type=int, default=4)
@@ -120,23 +129,30 @@ def main():
     # 2-4. Main session.
     s = check_session("session", a.run, a.frames, a.players)
 
-    # 5. FPS vs single-player baseline (per client slot, same CPU pinning).
-    run_ids, base_ids = client_ids(a.run), client_ids(a.baseline)
-    worst = []
-    ok = len(run_ids) >= a.players and len(base_ids) >= a.players
-    for ri, bi in zip(run_ids, base_ids):
-        m = frame_stats(os.path.join(a.run, f"frames_{ri}.txt"), a.warmup)
-        b = frame_stats(os.path.join(a.baseline, f"frames_{bi}.txt"), a.warmup)
-        if not m or not b:
-            ok = False
-            continue
-        da = 1 - m["avg_fps"] / b["avg_fps"]
-        dl = 1 - m["low1_fps"] / b["low1_fps"]
-        worst.append(f"client{ri}: avg {m['avg_fps']:.1f} vs {b['avg_fps']:.1f} ({da*100:+.1f}% drop), "
-                     f"1%low {m['low1_fps']:.1f} vs {b['low1_fps']:.1f} ({dl*100:+.1f}% drop)")
-        if da > 0.05 or dl > 0.05:
-            ok = False
-    record("per-client FPS drop <= 5% vs single-player baseline (avg and 1% low)", ok, "; ".join(worst))
+    # 5. FPS: mod overhead at equal workload (1-player session vs vanilla solo).
+    def fps_compare(run, base, n):
+        run_ids, base_ids = client_ids(run), client_ids(base)
+        ok = len(run_ids) >= n and len(base_ids) >= n
+        lines = []
+        for ri, bi in zip(run_ids, base_ids):
+            m = frame_stats(os.path.join(run, f"frames_{ri}.txt"), a.warmup)
+            b = frame_stats(os.path.join(base, f"frames_{bi}.txt"), a.warmup)
+            if not m or not b:
+                ok = False
+                continue
+            da = 1 - m["avg_fps"] / b["avg_fps"]
+            dl = 1 - m["low1_fps"] / b["low1_fps"]
+            lines.append(f"client{ri}: avg {m['avg_fps']:.1f} vs {b['avg_fps']:.1f} ({da*100:+.1f}% drop), "
+                         f"1%low {m['low1_fps']:.1f} vs {b['low1_fps']:.1f} ({dl*100:+.1f}% drop)")
+            if da > 0.05 or dl > 0.05:
+                ok = False
+        return ok, "; ".join(lines)
+
+    ok, detail = fps_compare(a.fps_run, a.baseline, 1)
+    record("FPS overhead <= 5% vs single-player baseline at equal workload (avg and 1% low)", ok, detail)
+    if a.info_baseline:
+        _, detail = fps_compare(a.run, a.info_baseline, a.players)
+        print(f"INFO  {a.players}-player session vs {a.players} solo instances: {detail}")
 
     # 6. Bandwidth and server CPU.
     bw = [(c["player"], c["avg_out_Bps"], c["avg_in_Bps"], c["peak_out_Bps"], c["peak_in_Bps"]) for c in s["clients"]]
