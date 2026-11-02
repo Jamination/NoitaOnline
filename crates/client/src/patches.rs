@@ -692,7 +692,11 @@ extern "C" fn particle_trace(tag: u32, regs: *const u32) {
         } else {
             format!("n={}/{}", (rd(gp + 0x38).wrapping_sub(rd(gp + 0x34))) / 0x70, (rd(gp + 0x50).wrapping_sub(rd(gp + 0x4c))) / 0x70)
         };
-        let mut line = format!("{frame} t{} a{tag} {what} ret={:08x}", GetCurrentThreadId(), rd(esp));
+        // Floating-point control state of this thread (x87 control word, SSE MXCSR).
+        let mut cw: u16 = 0;
+        let mut csr: u32 = 0;
+        std::arch::asm!("fnstcw word ptr [{0}]", "stmxcsr dword ptr [{1}]", in(reg) &mut cw, in(reg) &mut csr);
+        let mut line = format!("{frame} t{} a{tag} {what} fpu={cw:04x}/{csr:04x} ret={:08x}", GetCurrentThreadId(), rd(esp));
         for _ in 0..8 {
             if ebp <= esp || ebp > esp + 0x10_0000 || ebp & 3 != 0 {
                 break;
