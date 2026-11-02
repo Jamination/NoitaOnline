@@ -1,0 +1,7 @@
+<Mod
+  name="Noita Online spike a"
+  description="Research harness: world/entity hashing, determinism experiments."
+  request_no_api_restrictions="1"
+  is_game_mode="0"
+>
+</Mod>

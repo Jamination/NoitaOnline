@@ -1,0 +1,13 @@
+[package]
+name = "noita_online_client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "noita_online"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rudp = { path = "../rudp" }
+protocol = { path = "../protocol" }

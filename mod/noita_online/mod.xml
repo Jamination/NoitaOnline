@@ -1,0 +1,7 @@
+<Mod
+  name="Noita Online"
+  description="Networked multiplayer (headless server, reliable UDP)."
+  request_no_api_restrictions="1"
+  is_game_mode="0"
+>
+</Mod>
