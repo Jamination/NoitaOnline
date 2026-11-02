@@ -41,22 +41,22 @@ function M.input(pi, f, px, py)
     if t % 20 < 12 then s.buttons = btn("Fire", "LeftClick") end
     if t > 300 and t < 360 then s.buttons.Right = dir > 0; s.buttons.Left = dir < 0 end
   elseif phase == 2 then
-    -- bomb wand (second slot): dig downwards with explosions
+    -- bomb wand (second slot), selected like the mouse wheel does: dig downwards with explosions
     if t == 0 then s.count_r = 1; s.buttons = btn("ChangeItemR") end
     s.ax, s.ay = 10 * dir, 80
     s.mx, s.my = px + s.ax, py + s.ay
     if t > 30 and t % 90 < 6 then s.buttons = btn("Fire", "LeftClick") end
     if t > 120 and t < 200 then s.buttons.Down = true end
   elseif phase == 3 then
-    -- potion (third slot): throw it, splashing liquid
-    if t == 0 then s.count_r = 1; s.buttons = btn("ChangeItemR") end
+    -- potion (first item slot), selected with number key 5: throw it, splashing liquid
+    if t == 0 then s.select = 5 end
     s.ax, s.ay = 70 * dir, -30
     s.mx, s.my = px + s.ax, py + s.ay
     if t == 60 or t == 61 then s.buttons = btn("Throw", "RightClick") end
     if t > 120 and t < 300 then s.buttons[dir > 0 and "Right" or "Left"] = true end
   elseif phase == 4 then
-    -- back to first wand; walk around, kick, pick up items
-    if t == 0 then s.count_r = 1; s.buttons = btn("ChangeItemR") end
+    -- back to the first wand (number key 1); walk around, kick, pick up items
+    if t == 0 then s.select = 1 end
     if t > 10 and t < 250 then s.buttons[dir > 0 and "Right" or "Left"] = true end
     if t % 45 == 0 then s.buttons.Kick = true end
     if t % 30 < 3 then s.buttons.Interact = true end

@@ -1186,7 +1186,8 @@ pub unsafe fn sim_rng_enter() {
 }
 
 /// Leaving the simulation window: save the sim stream, put the per-client states back,
-/// and arm the next frame's early entry with the current simulation camera.
+/// arm the next frame's early entry with the current simulation camera, and release the
+/// camera lock ([`GG_CAMERA_LOCK`]) so the render camera can be set.
 ///
 /// # Safety
 /// Game thread.
@@ -1207,6 +1208,15 @@ pub unsafe fn sim_rng_leave() {
         let cam = (*((gg + GG_CAMERA_REQUEST) as *const f32), *((gg + GG_CAMERA_REQUEST + 4) as *const f32));
         *ARMED_CAMERA.lock().unwrap_or_else(|p| p.into_inner()) = Some(cam);
     }
+    if gg != 0 {
+        // The engine clears the lock at the end of every frame (0x006b5b81); clearing it here
+        // instead lets the mod's render camera request (OnWorldPostUpdate, unforced
+        // GameSetCameraPos) through. It used to be ignored in every frame in which the forced
+        // simulation camera had moved the camera, so a client whose render camera is elsewhere
+        // showed the simulation camera (first player) every other frame while that player
+        // stood still, and every frame while it moved.
+        *((gg + GG_CAMERA_LOCK) as *mut u8) = 0;
+    }
 }
 
 /// DeathMatch::Update, right before the `OnWorldPreUpdate` dispatch loop over every mod's Lua
@@ -1216,6 +1226,11 @@ const PRE_UPDATE_DISPATCH: u32 = 0x006b_3201;
 const SET_CAMERA_POS_FN: u32 = 0x0063_6580;
 /// GameGlobal: last position requested through SetCameraPos (float x, y).
 const GG_CAMERA_REQUEST: u32 = 0xc8;
+/// GameGlobal: camera lock (byte). SetCameraPos returns at once for an unforced request
+/// while it is set. A request sets it if it is forced or moves the camera more than 256 px,
+/// but only when it actually changes the camera rect; the engine clears it at the end of
+/// every DeathMatch::Update (FUN_006b59d0, 0x006b5b81).
+const GG_CAMERA_LOCK: u32 = 0x3c;
 
 /// Camera update (FUN_006b3ff0, inside the simulation window): in free-camera mode it moves
 /// the camera itself, by keyboard and by easing toward its own target (DeathMatch+0xac/0xb0,
@@ -1270,8 +1285,12 @@ extern "C" fn early_window_entry() {
     }
 }
 
-/// GameGlobal::SetCameraPos with `force`: a non-forced request is ignored while the
-/// GameGlobal+0x3c camera-lock flag is set, which differs between clients.
+/// GameGlobal::SetCameraPos with `force`, then the camera lock ([`GG_CAMERA_LOCK`]) on, for
+/// the simulation camera inside the window. Forcing alone sets the lock only if the camera
+/// moved, i.e. if this client's render camera (outside the window) was elsewhere, so whether
+/// unforced requests inside the window took effect (the engine's camera update FUN_006b3ff0
+/// easing toward the players, any mod's GameSetCameraPos) differed between clients and
+/// alternated frame by frame. With the lock always on, they never move the simulation camera.
 ///
 /// # Safety
 /// Game thread, world initialised.
@@ -1282,6 +1301,7 @@ pub unsafe fn set_camera_pos(x: f32, y: f32) {
     }
     let set: extern "thiscall" fn(u32, *const f32, i32) = std::mem::transmute(SET_CAMERA_POS_FN as usize);
     set(gg, [x, y].as_ptr(), 1);
+    *((gg + GG_CAMERA_LOCK) as *mut u8) = 1;
 }
 
 /// Diagnostics: `NOITA_ONLINE_RNGLOG=from-to` appends the simulation RNG states at every
@@ -1329,7 +1349,7 @@ unsafe fn rng_log(tag: char) {
             let b2ms = if b2 != 0 { *((b2 + B2_STEP_MS) as *const f64) } else { 0.0 };
             let _ = writeln!(
                 f,
-                "C {frame} {tag} cam={},{},{},{} off={},{} req={},{} snap={sw}x{sh} view={},{},{},{} borders={},{},{},{} b2ms={b2ms:.3} pfc={},{} pfs={:x}",
+                "C {frame} {tag} cam={},{},{},{} off={},{} req={},{} lock={} snap={sw}x{sh} view={},{},{},{} borders={},{},{},{} b2ms={b2ms:.3} pfc={},{} pfs={:x}",
                 fl(0),
                 fl(4),
                 fl(8),
@@ -1338,6 +1358,7 @@ unsafe fn rng_log(tag: char) {
                 fl(0x54),
                 *((gg + GG_CAMERA_REQUEST) as *const f32),
                 *((gg + GG_CAMERA_REQUEST + 4) as *const f32),
+                *((gg + GG_CAMERA_LOCK) as *const u8),
                 gi(0x498),
                 gi(0x49c),
                 gi(0x4a0),

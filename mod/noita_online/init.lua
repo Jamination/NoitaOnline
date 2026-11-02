@@ -144,6 +144,11 @@ function OnPlayerSpawned(player)
   log("players ready at frame " .. GameGetFrameNum())
 end
 
+-- The mouse in world coordinates as this client sees it: the engine maps the mouse to the
+-- world inside the simulation window, i.e. through the simulation camera (first player),
+-- so it is mapped again through the render camera (OnWorldPostUpdate).
+local render_mouse = nil
+
 local function local_input(f)
   if not ready then return Input.NEUTRAL end
   if cfg.bot then
@@ -152,7 +157,7 @@ local function local_input(f)
     if slot and EntityGetIsAlive(slot.entity) then px, py = EntityGetTransform(slot.entity) end
     return Bot.input(session.player, f, px, py)
   end
-  return Players.capture_local()
+  return Players.capture_local(render_mouse)
 end
 
 local lockstep_alive = true
@@ -180,9 +185,11 @@ end
 -- because camera-dependent engine systems feed the simulation; rendering uses our own.
 local render_cam = nil
 local function set_sim_camera(foci)
-  -- Forced set: GameSetCameraPos is ignored while the engine's per-client camera lock is on.
+  -- Forced, and locked for the rest of the window: the engine ignores unforced camera
+  -- requests while its camera lock is on.
   if foci[1] then NO.lib.no_set_sim_camera(foci[1].x, foci[1].y) end
 end
+-- After the window (no_sim_leave released the camera lock), so the unforced request applies.
 local function set_render_camera()
   local slot = Players.local_slot()
   if not slot or not EntityGetIsAlive(slot.entity) then return end
@@ -307,6 +314,7 @@ function OnWorldPostUpdate()
     in_sim_window = false
     if ready then
       set_render_camera()
+      render_mouse = { DEBUG_GetMouseWorld() }
       local slot = Players.local_slot()
       Inventory.draw(slot and slot.entity)
     end

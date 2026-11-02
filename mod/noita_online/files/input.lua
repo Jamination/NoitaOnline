@@ -90,12 +90,16 @@ function M.decode_cmds(s)
 end
 
 -- Read what Noita's own input system wrote into an *enabled* ControlsComponent (used on the
--- local input-capture proxy). Returns a state table.
+-- local input-capture proxy) during the last world update. Returns a state table. A press
+-- shorter than a frame leaves mButtonDown* false but stamps mButtonFrame* with that update's
+-- frame number (GameGetFrameNum() now), so it counts as held for this frame.
 function M.capture_from(controls)
   local buttons = {}
+  local now = GameGetFrameNum()
   for i = 1, NB do
     local name = M.BUTTONS[i]
-    buttons[name] = ComponentGetValue2(controls, "mButtonDown" .. name) and true or false
+    buttons[name] = ComponentGetValue2(controls, "mButtonDown" .. name)
+      or ComponentGetValue2(controls, "mButtonFrame" .. name) == now
   end
   local mx, my = ComponentGetValue2(controls, "mMousePosition")
   local ax, ay = ComponentGetValue2(controls, "mAimingVector")
@@ -112,15 +116,23 @@ function M.capture_from(controls)
   }
 end
 
--- Drive a player's (disabled) ControlsComponent with `state` for simulation frame `frame`.
--- `prev` is the previously applied state for this player (for "frame pressed" stamps).
+-- The engine's systems run the world update that follows OnWorldPreUpdate(f) as frame f + 1:
+-- that is the number they compare mButtonFrame* stamps with to detect a press made this
+-- frame (item switching, throwing, kicking, interacting, ...).
+function M.press_frame(frame)
+  return frame + 1
+end
+
+-- Drive a player's (disabled) ControlsComponent with `state` for simulation frame `frame`
+-- (GameGetFrameNum() in OnWorldPreUpdate). `prev` is the previously applied state for this
+-- player (for "just pressed" stamps).
 function M.apply(controls, state, prev, frame)
   for i = 1, NB do
     local name = M.BUTTONS[i]
     local down = state.buttons[name] or false
     ComponentSetValue2(controls, "mButtonDown" .. name, down)
     if down and not (prev and prev.buttons[name]) then
-      ComponentSetValue2(controls, "mButtonFrame" .. name, frame)
+      ComponentSetValue2(controls, "mButtonFrame" .. name, M.press_frame(frame))
     end
   end
   ComponentSetValue2(controls, "mButtonCountChangeItemR", state.count_r or 0)

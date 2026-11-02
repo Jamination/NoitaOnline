@@ -71,12 +71,16 @@ function M.setup(proxy, ids, local_id)
     local slot = { id = id, entity = e, controls = controls, prev = Input.NEUTRAL }
     M.slots[#M.slots + 1] = slot
     M.by_id[id] = slot
-    -- Camera and HUD follow only this client's own slot (presentation only).
-    local is_local = id == local_id
+    -- The camera follows only this client's own slot (presentation only).
     local shooter = EntityGetFirstComponentIncludingDisabled(e, "PlatformShooterPlayerComponent")
-    if shooter then ComponentSetValue2(shooter, "center_camera_on_this_entity", is_local) end
+    if shooter then ComponentSetValue2(shooter, "center_camera_on_this_entity", id == local_id) end
+    -- Noita's HUD (InventoryGuiComponent) runs on no slot, not even our own: besides drawing,
+    -- its system edits the inventory from this client's raw input (number keys equip items
+    -- at once; its slot widgets also move and eat items) and assigns inventory slots to items,
+    -- so enabled on one client only it changes the simulation on that client alone. The mod
+    -- draws the HUD instead (files/inventory.lua) and assigns slots (normalize_inventory).
     local gui = EntityGetFirstComponentIncludingDisabled(e, "InventoryGuiComponent")
-    if gui then EntitySetComponentIsEnabled(e, gui, is_local) end
+    if gui then EntitySetComponentIsEnabled(e, gui, false) end
   end
 end
 
@@ -100,9 +104,13 @@ function M.local_slot()
 end
 
 -- Real input of this client, as captured by the engine into the proxy's ControlsComponent.
-function M.capture_local()
+-- `mouse` ({x, y}, optional): the pointer in world coordinates under this client's render
+-- camera. The proxy's mMousePosition is converted with the shared simulation camera, which
+-- is another player's view on every client but the first.
+function M.capture_local(mouse)
   if not M.proxy_controls then return Input.NEUTRAL end
   local s = Input.capture_from(M.proxy_controls)
+  if mouse then s.mx, s.my = mouse[1], mouse[2] end
   -- Aim is relative to our simulated player, not to the inert proxy.
   local slot = M.local_slot()
   if slot and EntityGetIsAlive(slot.entity) then
@@ -114,24 +122,98 @@ function M.capture_local()
   if s.buttons.Inventory and not M.inventory_key_down then Inventory.toggle() end
   M.inventory_key_down = s.buttons.Inventory
   s.buttons.Inventory = false
+  if Inventory.open then
+    -- Mouse buttons operate the editor while it is open (vanilla pauses the game there).
+    for _, b in ipairs({ "Fire", "Fire2", "LeftClick", "RightClick", "Throw" }) do s.buttons[b] = false end
+  end
   s.cmds = Inventory.take_pending()
   return s
 end
 
--- Quick-inventory items of `e` in slot order: { {slot=n, entity=item}, ... }.
+local function child_named(e, name)
+  for _, c in ipairs(EntityGetAllChildren(e) or {}) do
+    if EntityGetName(c) == name then return c end
+  end
+end
+
+-- Give every item of `items` ({ {e=, ic=}, ... } in child order) its own slot x in [0, cap):
+-- an item keeps a valid slot no earlier item holds, the rest take the lowest free slots in
+-- order (past `cap` only if the container is over-full).
+local function assign_slots(items, cap)
+  local used, todo = {}, {}
+  for _, it in ipairs(items) do
+    local x = ComponentGetValue2(it.ic, "inventory_slot")
+    if x >= 0 and x < cap and not used[x] then used[x] = true else todo[#todo + 1] = it end
+  end
+  local x = 0
+  for _, it in ipairs(todo) do
+    while used[x] do x = x + 1 end
+    used[x] = true
+    ComponentSetValue2(it.ic, "inventory_slot", x, 0)
+  end
+end
+
+local function items_of(container, keep)
+  local out = {}
+  for _, e in ipairs(EntityGetAllChildren(container) or {}) do
+    local ic = EntityGetFirstComponentIncludingDisabled(e, "ItemComponent")
+    if ic and keep(e, ic) then out[#out + 1] = { e = e, ic = ic } end
+  end
+  return out
+end
+
+local function is_wand(e) return EntityHasTag(e, "wand") end
+local function not_wand(e) return not EntityHasTag(e, "wand") end
+local function is_card(e, ic)
+  return EntityGetFirstComponentIncludingDisabled(e, "ItemActionComponent") ~= nil
+    and not ComponentGetValue2(ic, "permanently_attached")
+end
+
+-- Inventory slots of a player, assigned identically on every client (Noita's HUD, which
+-- assigns them in vanilla, runs on no slot). Quick inventory: wands and other items each
+-- own slots 0-3 (number keys 1-4 and 5-8); spell inventory: 16 slots; each wand: one slot
+-- per deck card (always-cast cards excluded). Only containers whose children changed are
+-- visited (`slot.inv_sig`), so this costs a few calls per player per frame.
+local function normalize_inventory(slot)
+  slot.inv_sig = slot.inv_sig or {}
+  local function changed(container)
+    local sig = table.concat(EntityGetAllChildren(container) or {}, ",")
+    if slot.inv_sig[container] == sig then return false end
+    slot.inv_sig[container] = sig
+    return true
+  end
+  local quick = child_named(slot.entity, "inventory_quick")
+  if quick then
+    if changed(quick) then
+      assign_slots(items_of(quick, is_wand), 4)
+      assign_slots(items_of(quick, not_wand), 4)
+    end
+    for _, wand in ipairs(EntityGetAllChildren(quick) or {}) do
+      if is_wand(wand) and changed(wand) then
+        local ability = EntityGetFirstComponentIncludingDisabled(wand, "AbilityComponent")
+        local cap = ability and ComponentObjectGetValue2(ability, "gun_config", "deck_capacity") or 0
+        assign_slots(items_of(wand, is_card), cap)
+      end
+    end
+  end
+  local full = child_named(slot.entity, "inventory_full")
+  if full and changed(full) then
+    local inv = EntityGetFirstComponentIncludingDisabled(slot.entity, "Inventory2Component")
+    local cap = inv and ComponentGetValue2(inv, "full_inventory_slots_x") * ComponentGetValue2(inv, "full_inventory_slots_y") or 16
+    assign_slots(items_of(full, function() return true end), cap)
+  end
+end
+
+-- Quick-inventory items of `e` in the engine's item-switching order (wands by slot, then
+-- other items by slot): { {slot=n, entity=item}, ... }, slot n = number key n + 1.
 local function quick_items(e)
   local out = {}
-  for _, child in ipairs(EntityGetAllChildren(e) or {}) do
-    if EntityGetName(child) == "inventory_quick" then
-      for _, item in ipairs(EntityGetAllChildren(child) or {}) do
-        local ic = EntityGetFirstComponentIncludingDisabled(item, "ItemComponent")
-        if ic then
-          local sx = ComponentGetValue2(ic, "inventory_slot")
-          local is_wand = EntityHasTag(item, "wand")
-          -- Wands occupy quick slots 1-4, other items 5-8.
-          out[#out + 1] = { slot = sx + (is_wand and 0 or 4), entity = item }
-        end
-      end
+  local quick = child_named(e, "inventory_quick")
+  for _, item in ipairs(quick and EntityGetAllChildren(quick) or {}) do
+    local ic = EntityGetFirstComponentIncludingDisabled(item, "ItemComponent")
+    if ic then
+      local sx = ComponentGetValue2(ic, "inventory_slot")
+      out[#out + 1] = { slot = sx + (is_wand(item) and 0 or 4), entity = item }
     end
   end
   table.sort(out, function(a, b) return a.slot < b.slot end)
@@ -140,7 +222,7 @@ end
 
 -- Number-key selection, expressed as the equivalent change-item step count so the
 -- engine's own item switching runs (identically on every client).
-local function select_quick_slot(slot, k)
+local function select_quick_slot(slot, k, frame)
   local inv = EntityGetFirstComponentIncludingDisabled(slot.entity, "Inventory2Component")
   if not inv then return end
   local items = quick_items(slot.entity)
@@ -153,7 +235,7 @@ local function select_quick_slot(slot, k)
   if not from or not to or from == to then return end
   local steps = (to - from) % #items
   ComponentSetValue2(slot.controls, "mButtonDownChangeItemR", true)
-  ComponentSetValue2(slot.controls, "mButtonFrameChangeItemR", GameGetFrameNum())
+  ComponentSetValue2(slot.controls, "mButtonFrameChangeItemR", Input.press_frame(frame))
   ComponentSetValue2(slot.controls, "mButtonCountChangeItemR", steps)
 end
 
@@ -187,9 +269,10 @@ function M.apply_tick(frame, tick)
         end
       end
     elseif EntityGetIsAlive(slot.entity) then
+      normalize_inventory(slot)
       local state = Input.decode(bytes)
       Input.apply(slot.controls, state, slot.prev, frame)
-      if state.select and state.select > 0 then select_quick_slot(slot, state.select) end
+      if state.select and state.select > 0 then select_quick_slot(slot, state.select, frame) end
       for _, cmd in ipairs(state.cmds or {}) do Inventory.apply(slot.entity, cmd) end
       slot.prev = state
     end

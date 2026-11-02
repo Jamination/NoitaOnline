@@ -545,9 +545,10 @@ pub extern "C" fn no_sim_leave() {
 }
 
 /// Set the simulation camera centre (inside the simulation window). Unlike Lua's
-/// GameSetCameraPos it forces the move: the engine otherwise ignores requests while its
-/// per-client camera-lock flag is set, which left the simulation camera on last frame's
-/// position on some clients and frames.
+/// GameSetCameraPos it forces the move (the engine ignores unforced requests while its
+/// camera lock is set, which left the simulation camera on last frame's position on some
+/// clients and frames), then keeps the lock on until `no_sim_leave`, so no unforced request
+/// moves the simulation camera on any client.
 #[no_mangle]
 pub extern "C" fn no_set_sim_camera(x: f32, y: f32) {
     #[cfg(all(windows, target_arch = "x86"))]

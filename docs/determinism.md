@@ -22,7 +22,9 @@ Inside the window:
   *simulation bank*. Outside it, a separate *render bank* is used, so per-client rendering
   can consume randomness freely.
 - **Camera:** the camera is the shared *simulation camera* (the first live player), set
-  with force. Outside the window, each client's render camera follows its own player.
+  with force, and the engine's camera lock is held until the window closes, so no
+  unforced camera request moves it. Outside the window, each client's render camera
+  follows its own player.
 - **Chunk loading and body freezing** follow every player (the *foci*) rather than the
   local camera.
 
@@ -53,6 +55,7 @@ Inside the window:
 | `pathfinding_refresh` | With `PATHFINDING_DISTANCE_FIELD_ENABLED` (on by default), the pathfinding job (`FUN_00861a50`) keeps refreshing the node clearance field of the 2×2 pathfinding chunks around the camera centre: one chunk every two frames, then a new cycle. The search reads this clearance as the room a mover has, and nothing else computes it. The job runs before the simulation window, so it used each client's render camera. Clients refreshed different chunks at different frames, and an enemy searching in between got a different path (seed 1404389217, f=1554: a rat's next path node). | Each refresh cycle centres on a player in turn (slot order), using the focus centres from the previous window. |
 | `ragdoll_stains` | When a creature dies, its ragdoll images are blended with the creature's stains (`FUN_00abb7d0` → `FUN_00be8240`). The overlay was the SpriteStains image at +0x20: a blurred copy that only the GPU texture upload writes (`FUN_00c21020`, from the render-side upload queue), and that upload is only queued while the sprite is on screen. So each client blended in its own last *drawn* stains, all zero for a creature it never saw. Small ragdoll parts get one box fixture per run of equal-colour pixels (`FUN_009817d0` → `FUN_00928250`), so the same part got different fixtures and mass on each client (seed 1786459272, f=5345: 3 fixtures vs 5). | The overlay is the stain colours the simulation keeps (SpriteStains+0x00, same size), without the one-pixel blur. |
 | `platform_frame` | The platform frame counter (PlatformDesktop+0x20, its vtable+0x60 getter) counts main-loop frames from before the world exists (62 of them in a `-gamemode 0` start), so it differs between clients by the time each spent before its session started, e.g. in menus. About 60 sites read it, simulation ones among them: the SpriteStains update runs for an entity when `(frame ^ entity_id) & 15 == 0` (a player: every 3rd frame) and draws the global LCG there; PathFindingComponent (`FUN_00bca030`) and animal AI (`FUN_00b750b0`) schedule work by it. | The counter is set to GameGlobal's frame + 2^20 by `no_fix_seeds` and at every window entry. The base is above any pre-session count, so the counter only jumps forward. |
+| camera lock (window code, no patch) | GameGlobal::SetCameraPos ignores unforced requests while the camera lock (GameGlobal+0x3c) is set. A forced request sets the lock only if it actually moves the camera, and the engine clears it only at the end of each frame. So the forced simulation camera locked the camera only when this client's render camera had been elsewhere. Inside the window, unforced requests (the engine's camera update `FUN_006b3ff0`, any mod's `GameSetCameraPos`) took effect on some clients and frames but not others. After the window, the render camera's request was ignored on every frame in which the lock was set. On a client whose player is not the first, the view alternated between the two players every frame while the first player stood still, and stayed on the first player while it moved. | `no_set_sim_camera` and the early window entry set the lock after the forced move, on every client; `no_sim_leave` clears it. |
 
 Seeds are set at world init and at frame 1 by `no_fix_seeds`:
 - the platform RNGs, the global LCG and PM, the particle RNG and the `rand` state;
@@ -71,6 +74,21 @@ All of them are derived from the session seed.
 - Pausing is not supported in a session. The vanilla inventory key is not transmitted;
   the lockstep wand editor replaces it.
 - All clients must run the same mods (mod hash) and game build; the server checks both.
+- Noita's HUD (`InventoryGuiComponent`) is disabled on every player slot. Its system reads
+  the local keyboard and mouse directly (number keys equip items at once) and assigns
+  inventory slots to items, so on the one client that enabled it for its own player it
+  changed the simulation alone (seed 1834914516: a number key switched the wand on one
+  client only, entity hashes differed from the next checkpoint). The mod draws the HUD
+  (`files/inventory.lua`), assigns quick-inventory, spell-inventory and wand-card slots
+  identically on every client each tick, and sends number keys as a `select` byte that
+  becomes an item-switch step count.
+- Press stamps: the world update after `OnWorldPreUpdate(f)` runs as frame `f + 1`, and
+  "just pressed" checks (item switching, throw, kick, interact) compare `mButtonFrame*`
+  with that number, so applied inputs are stamped `f + 1` (`Input.press_frame`).
+- The engine maps the mouse to world coordinates (`ControlsComponent.mMousePosition`)
+  inside the window, through the simulation camera. That is another player's view on every
+  client but the first. The mod maps the mouse again through the render camera
+  (`DEBUG_GetMouseWorld` after the render camera is set) and sends that position.
 
 ## Verification
 
@@ -83,9 +101,9 @@ Diagnostics used to find the root causes above, enabled by environment variables
 - `NOITA_ONLINE_DENSE=a-b`: per-frame entity dumps. With `NOITA_ONLINE_ENTLOG=id,...` it
   logs those entities' transforms each dense frame; `NOITA_ONLINE_ENTLOG_COMPS=1` adds every
   component's scalar members and the children.
-- `NOITA_ONLINE_RNGLOG`: RNG states and cameras at window entry and exit, plus the last
-  Box2D step's wall time (`b2ms`), the pathfinding clearance-refresh centre and state
-  (`pfc`, `pfs`) and the platform frame counter (`pf`).
+- `NOITA_ONLINE_RNGLOG`: RNG states and cameras at window entry and exit, plus the camera
+  lock (`lock`), the last Box2D step's wall time (`b2ms`), the pathfinding clearance-refresh
+  centre and state (`pfc`, `pfs`) and the platform frame counter (`pf`).
 - `NOITA_ONLINE_PTRACE`: call chains of particle creation; also every body→grid placement
   (body pose, velocity, vector key), particle construction (position, velocity), fixture
   creation, ragdoll loads (stain colour and overlay image hashes) and the images turned
