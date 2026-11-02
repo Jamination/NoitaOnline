@@ -36,7 +36,8 @@ Inside the window:
 | `threaded_chunkgen` | (performance) Chunk generation costs 17–36 ms per chunk. | Stays on worker threads through an unpatched copy of the async submit. Its only shared-RNG write (the cell constructor's LCG store) is removed. |
 | `threaded_grid` | (performance) | Falling-sand tiles run in parallel deterministically: each tile has its own RNG, and the checkerboard passes never let tiles race. They keep the pool. |
 | `threaded_render` | (performance) Grid rendering costs 7–10 ms per frame inline. | Renders on worker threads outside the window. It is joined before the RNG banks swap, so it never overlaps the simulation. |
-| `inline_group`, `inline_async` | Other pool jobs (particles, Box2D step, pathfinding, entity jobs) race on shared RNG state and overlap the next frame's simulation. | Run synchronously at submission. |
+| `threaded_pathfinding` | (performance) The pathfinding update's per-tile jobs (`FUN_00864590`, about 1.4 ms per frame inline). | They stay on worker threads. Each job recomputes the node flags of its own grid tile from that tile's cell summary only, with no RNG and no allocation, and `FUN_00864590` joins them all before anything else runs. |
+| `inline_group`, `inline_async` | Other pool jobs (particles, Box2D step, pathfinding search, entity jobs) race on shared RNG state and overlap the next frame's simulation. | Run synchronously at submission. |
 | `particle_init` | Particle structs keep uninitialised heap bits, which select the collision world. | Cleared fully. |
 | `camera_loads` | Chunks load around each client's camera and look-ahead. | Camera-driven loads are removed. The mod streams chunks around every player (`no_stream_focus`) and unloads far chunks deterministically (`no_unload_far`). |
 | `fixed_dt` | `DeathMatch::Update` feeds wall-clock `dt` into the simulation. | `dt = 1/60`. |
@@ -50,6 +51,8 @@ Inside the window:
 | `box2d_freeze` | With the magic number `BOX2D_FREEZE_STUCK_BODIES` (on by default), the body→grid update (`FUN_00718d50`) makes the most-stuck awake body static whenever the previous Box2D step took longer than `BOX2D_THREAD_MAX_WAIT_IN_MS` (12 ms) of wall-clock time (`b2World+0x19270`). Which frames cross 12 ms depends on machine load. | The time test is skipped, so the load-dependent freeze never runs. (Preventive: step times stayed under 11 ms in the runs measured so far.) |
 | `free_solids_order` | Bodies that lost cells in a frame (`mFreeSolids`, a `std::map<b2Body*, …>`) are rebuilt in `b2Body*` heap-address order (`FUN_0071d020`). Rebuilding removes the old body from the body vector and appends the new ones, so after an explosion broke several bodies the new bodies sat at client-specific vector positions. The next frame's body→grid pass places bodies in vector order, so displaced cells became particles in a different order (seed 1717171717, f=1382). | Rebuilt in body-vector order (the entry whose body has the lowest vector index goes first). |
 | `pathfinding_refresh` | With `PATHFINDING_DISTANCE_FIELD_ENABLED` (on by default), the pathfinding job (`FUN_00861a50`) keeps refreshing the node clearance field of the 2×2 pathfinding chunks around the camera centre: one chunk every two frames, then a new cycle. The search reads this clearance as the room a mover has, and nothing else computes it. The job runs before the simulation window, so it used each client's render camera. Clients refreshed different chunks at different frames, and an enemy searching in between got a different path (seed 1404389217, f=1554: a rat's next path node). | Each refresh cycle centres on a player in turn (slot order), using the focus centres from the previous window. |
+| `ragdoll_stains` | When a creature dies, its ragdoll images are blended with the creature's stains (`FUN_00abb7d0` → `FUN_00be8240`). The overlay was the SpriteStains image at +0x20: a blurred copy that only the GPU texture upload writes (`FUN_00c21020`, from the render-side upload queue), and that upload is only queued while the sprite is on screen. So each client blended in its own last *drawn* stains, all zero for a creature it never saw. Small ragdoll parts get one box fixture per run of equal-colour pixels (`FUN_009817d0` → `FUN_00928250`), so the same part got different fixtures and mass on each client (seed 1786459272, f=5345: 3 fixtures vs 5). | The overlay is the stain colours the simulation keeps (SpriteStains+0x00, same size), without the one-pixel blur. |
+| `platform_frame` | The platform frame counter (PlatformDesktop+0x20, its vtable+0x60 getter) counts main-loop frames from before the world exists (62 of them in a `-gamemode 0` start), so it differs between clients by the time each spent before its session started, e.g. in menus. About 60 sites read it, simulation ones among them: the SpriteStains update runs for an entity when `(frame ^ entity_id) & 15 == 0` (a player: every 3rd frame) and draws the global LCG there; PathFindingComponent (`FUN_00bca030`) and animal AI (`FUN_00b750b0`) schedule work by it. | The counter is set to GameGlobal's frame + 2^20 by `no_fix_seeds` and at every window entry. The base is above any pre-session count, so the counter only jumps forward. |
 
 Seeds are set at world init and at frame 1 by `no_fix_seeds`:
 - the platform RNGs, the global LCG and PM, the particle RNG and the `rand` state;
@@ -81,12 +84,17 @@ Diagnostics used to find the root causes above, enabled by environment variables
   logs those entities' transforms each dense frame; `NOITA_ONLINE_ENTLOG_COMPS=1` adds every
   component's scalar members and the children.
 - `NOITA_ONLINE_RNGLOG`: RNG states and cameras at window entry and exit, plus the last
-  Box2D step's wall time (`b2ms`) and the pathfinding clearance-refresh centre and state
-  (`pfc`, `pfs`).
+  Box2D step's wall time (`b2ms`), the pathfinding clearance-refresh centre and state
+  (`pfc`, `pfs`) and the platform frame counter (`pf`).
 - `NOITA_ONLINE_PTRACE`: call chains of particle creation; also every body→grid placement
-  (body pose, velocity, vector key) and particle construction (position, velocity).
+  (body pose, velocity, vector key), particle construction (position, velocity), fixture
+  creation, ragdoll loads (stain colour and overlay image hashes) and the images turned
+  into body shapes.
 - `NOITA_ONLINE_DUMP`: chunk and cell dumps. With `NOITA_ONLINE_DUMP_RECT` it adds
   particles, the GridParticles side lists, the render material snapshot hash and the
   physics bodies; `NOITA_ONLINE_DUMP_ENTRY=1` also dumps at window entry
   (`dump_<inst>_<frame>e.*`).
+- `NOITA_ONLINE_PF_SKEW=<instance>:<n>`: adds n to that instance's platform frame counter
+  once, at session start, as a stand-in for time spent in menus (`platform_frame` overrides
+  it).
 - `NOITA_ONLINE_PROF` / `NOITA_ONLINE_SAMPLE`: profilers.

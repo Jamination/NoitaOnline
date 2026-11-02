@@ -82,6 +82,7 @@ fi
 
 k=0
 for id in "${IDS[@]}"; do
+  # Without --pin, NOITA_CPUSET (if set) confines every client to those CPUs.
   CPUSET="${NOITA_CPUSET:-}"
   # --pin: client k gets physical core PIN_BASE+k (both SMT threads; default base 2); cores
   # 0-1 stay free for the X server, wineservers and the game server. Concurrent harness

@@ -43,7 +43,8 @@ sequenceDiagram
   `ChallengeResponse(token = client_salt ^ server_salt)` → `Accepted(token, id)`. Requests are
   padded so replies are never larger (no amplification). Data packets carry the token.
 * Packet header: kind, token, 16-bit sequence, ack, 32-bit ack history (every packet acks up
-  to 33 packets).
+  to 33 packets). A packet carrying messages is acked by the receiver's next packet, sent
+  at once if nothing else is due; message-less packets (acks, keepalives) are not acked.
 * Reliable-ordered channels: 16-bit message ids, windowed send buffer, resend after
   `max(rtt + 4·rttvar, 20 ms)` until a packet carrying the message is acked, in-order
   delivery, fragmentation of large messages into MTU-sized pieces reassembled on receipt.
@@ -70,6 +71,10 @@ sequenceDiagram
   client) instead of around each client's own camera; a deterministic unloader replaces
   the engine's wall-clock one.
 * Deaths do not end the run: a player at 0 HP becomes an invulnerable spectator.
+* **Off the game thread**: the network thread sleeps until the game queues data, a
+  datagram arrives (on Windows) or a transport timer is due. State-report chunk hashes are
+  computed on a worker thread while the client renders; cells only change inside the
+  window, and the next window entry waits for the worker.
 
 ## Server
 

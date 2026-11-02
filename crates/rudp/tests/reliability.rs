@@ -241,6 +241,24 @@ fn rtt_estimate_tracks_link_latency() {
 }
 
 #[test]
+fn idle_peers_do_not_ack_acks() {
+    let mut p = Pair::new(Config::default(), LinkConditions::new(0.0, 0), 13);
+    p.a.send(0, b"hello").unwrap();
+    // a: message; b: ack; then nothing until the 100 ms keepalives (one per peer per 6 ticks).
+    for _ in 0..3 {
+        p.step();
+    }
+    assert_eq!(p.drain_b().len(), 1);
+    assert_eq!(p.a.unacked_reliable(), 0);
+    let (a0, b0) = (p.a.stats.packets_sent, p.b.stats.packets_sent);
+    for _ in 0..60 {
+        p.step();
+    }
+    let (a1, b1) = (p.a.stats.packets_sent - a0, p.b.stats.packets_sent - b0);
+    assert!(a1 <= 11 && b1 <= 11, "idle packets over 1 s: a {a1}, b {b1}");
+}
+
+#[test]
 fn peer_silence_times_out() {
     let cfg = Config { timeout_us: 1_000_000, ..Config::default() };
     let mut p = Pair::new(cfg, LinkConditions::new(1.0, 0), 12);

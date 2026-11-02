@@ -6,10 +6,12 @@ import collections, glob, json, os, re, sys, urllib.request
 
 CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "run", "ghidra_funcs.json")
 cache = json.load(open(CACHE)) if os.path.exists(CACHE) else {}
+# 64 KiB region -> module file name (from the "M" lines of the samples files).
+mods = {}
 
 def func(a):
     if a < 0x401000 or a >= 0x0f00000:
-        return "ext@%04x" % (a >> 16)
+        return mods.get(a >> 16) or "ext@%04x" % (a >> 16)
     k = "%08x" % a
     if k not in cache:
         try:
@@ -39,7 +41,10 @@ for f in glob.glob(os.path.join(d, "samples_*.txt")):
             if win >= 1:
                 total += int(p[2])
             continue
-        if win < 1 or p[0] == "D":
+        if p[0] == "M":
+            mods[int(p[1], 16)] = p[3].split("\\")[-1]
+            continue
+        if win < 1 or p[0] not in ("E", "I"):
             continue
         a, c = int(p[1], 16), int(p[2])
         (ex if p[0] == "E" else inc)[a] += c

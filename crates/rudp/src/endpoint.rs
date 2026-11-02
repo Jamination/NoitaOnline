@@ -422,6 +422,29 @@ impl Client {
         self.clock.now_us()
     }
 
+    /// The UDP socket (non-blocking), e.g. to wait for incoming datagrams.
+    pub fn socket(&self) -> &UdpSocket {
+        &self.io.socket
+    }
+
+    /// Earliest time ([`Self::now_us`] clock) at which [`Self::update`] has timed work to do
+    /// without new input or datagrams (handshake resend, reliable resend, ack, keepalive,
+    /// timeout check). `None` while a link simulator holds datagrams for later: poll then.
+    pub fn next_deadline_us(&self) -> Option<u64> {
+        if self.io.in_sim.is_some() || self.io.out_sim.is_some() {
+            return None;
+        }
+        let now = self.now_us();
+        Some(match &self.state {
+            ClientState::Connecting => self
+                .last_handshake_send
+                .map_or(now, |t| t + HANDSHAKE_RESEND_US)
+                .min(self.started + self.cfg.timeout_us + 1),
+            ClientState::Connected { .. } => self.conn.as_ref().map_or(now, |c| c.next_deadline(now)),
+            ClientState::Disconnected(_) => u64::MAX,
+        })
+    }
+
     pub fn connection(&self) -> Option<&Connection> {
         self.conn.as_ref()
     }

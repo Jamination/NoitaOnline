@@ -210,6 +210,42 @@ impl Connection {
             .sum()
     }
 
+    /// Earliest time (µs) at which [`Self::generate_packets`] has something to send without new
+    /// input (`now` for queued messages and pending acks; else the next reliable resend or the
+    /// keepalive) or the connection times out. Lets an event-driven caller sleep until then.
+    pub fn next_deadline(&self, now: u64) -> u64 {
+        if self.ack_pending {
+            return now;
+        }
+        let resend = self.resend_interval();
+        let mut at = (self.last_send + self.cfg.keepalive_us).min(self.last_recv + self.cfg.timeout_us + 1);
+        for ch in &self.channels {
+            match ch {
+                Channel::Unreliable { outgoing } => {
+                    if !outgoing.is_empty() {
+                        return now;
+                    }
+                }
+                Channel::Reliable(r) => {
+                    let in_flight = r.next_send_id.wrapping_sub(r.oldest_unacked);
+                    if !r.backlog.is_empty() && in_flight < self.cfg.reliable_window {
+                        return now;
+                    }
+                    let mut id = r.oldest_unacked;
+                    while id != r.next_send_id {
+                        match r.send_buf.get(id).map(|m| m.last_sent) {
+                            Some(None) => return now,
+                            Some(Some(t)) => at = at.min(t + resend),
+                            None => {}
+                        }
+                        id = id.wrapping_add(1);
+                    }
+                }
+            }
+        }
+        at
+    }
+
     pub fn send(&mut self, channel: u8, data: &[u8]) -> Result<(), SendError> {
         let frag = self.fragment_size();
         let max_msg = self.cfg.max_message_size;
@@ -383,15 +419,18 @@ impl Connection {
         if kind == KIND_DATA {
             self.process_acks(ack, ack_bits, now);
         }
-
+        // Only packets carrying messages are acked (immediately, by the next generated
+        // packet). Acking pure acks and keepalives too made both peers bounce empty packets
+        // back and forth at their polling rate for the whole session (~1000 datagrams/s).
+        let carries_messages = !msgs.is_empty();
         if self.received_seqs.contains(seq) {
             self.stats.duplicate_packets += 1;
-            self.ack_pending = true;
+            self.ack_pending |= carries_messages;
             return Ok(());
         }
         self.received_seqs.insert(seq, ());
         self.record_received(seq);
-        self.ack_pending = true;
+        self.ack_pending |= carries_messages;
 
         let max_msg = self.cfg.max_message_size;
         let window = self.cfg.reliable_window;

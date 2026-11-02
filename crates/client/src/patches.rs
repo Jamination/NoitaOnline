@@ -425,10 +425,25 @@ unsafe fn patch_threaded_render(ex: &mut Exec) -> Result<(), PatchError> {
     Ok(())
 }
 
-/// Unpatched copy of the group submit for [`patch_threaded_render`] (taken once, before
-/// [`patch_inline_group`]). Pathfinding jobs (FUN_00864590, call 0x0086470c) were tried on
-/// it too and dropped after seed 1717171717 forked at f=1383; that fork turned out to be
-/// [`patch_free_solids_order`]'s, present without any threading. They stay inline (untested since).
+/// The pathfinding update FUN_00864590 (called at the end of the grid update, inside the
+/// window): its `call FUN_0084c240`, one job per updated grid tile.
+const PATHFINDING_SUBMIT_CALL: u32 = 0x0086_470c;
+
+/// The pathfinding update's per-tile jobs (FUN_00864790 -> FUN_00864060, ~1.4 ms per frame
+/// inline in a 1-player session) recompute each 4x4-pixel node's flags (node+0xf and its byte
+/// at +0x80000) from that block's cell summary only: the grid tiles' rects are disjoint, the
+/// jobs draw no RNG and allocate nothing, and FUN_00864590 waits for all of them before
+/// anything else runs (the tile jobs are joined before it starts). So they keep the worker
+/// threads. (Tried once before and dropped after seed 1717171717 forked at f=1383; that
+/// fork was [`patch_free_solids_order`]'s, present without any threading.) Must run before
+/// [`patch_inline_group`].
+unsafe fn patch_threaded_pathfinding(ex: &mut Exec) -> Result<(), PatchError> {
+    let copy = threaded_group_submit(ex)?;
+    redirect_call(PATHFINDING_SUBMIT_CALL, POOL_GROUP_FN, copy)
+}
+
+/// Unpatched copy of the group submit for [`patch_threaded_render`] and
+/// [`patch_threaded_pathfinding`] (taken once, before [`patch_inline_group`]).
 unsafe fn threaded_group_submit(ex: &mut Exec) -> Result<u32, PatchError> {
     static COPY: AtomicU32 = AtomicU32::new(0);
     if COPY.load(Ordering::Relaxed) == 0 {
@@ -667,11 +682,18 @@ unsafe fn install_particle_trace(ex: &mut Exec) -> Result<(), PatchError> {
         jmp.push(0x90);
         write_code(f, &jmp)?;
     }
-    // Body shapes (tags 6, 7): the cell-bitmap polygonizer FUN_0095bcf0 (ecx = bitmap
-    // {w, h, .., +0x18 Cell*[w*h]}, edx = shape vector, xmm2 = tolerance) and
-    // b2Body::CreateFixture FUN_009bc760 (ecx = body, [esp+4] = fixture def, def+0 = shape).
-    // XMM0-3 are saved around the callback (xmm2 is an argument).
-    for (tag, f, prologue) in [(6u8, POLYGONIZE_FN, &POLYGONIZE_PROLOGUE[..]), (7, CREATE_FIXTURE_FN, &CREATE_FIXTURE_PROLOGUE[..])] {
+    // Body shapes (tags 6-9): the cell-bitmap polygonizer FUN_0095bcf0 (ecx = bitmap
+    // {w, h, .., +0x18 Cell*[w*h]}, edx = shape vector, xmm2 = tolerance),
+    // b2Body::CreateFixture FUN_009bc760 (ecx = body, [esp+4] = fixture def, def+0 = shape),
+    // the ragdoll loader FUN_00be8240 ([esp+0x24] = stains overlay image, xmm3 = mirror) and
+    // the image -> shapes builder FUN_0095b610 (ecx = image {w, h, .., +0x18 u32[w*h]}).
+    // XMM0-3 are saved around the callback (xmm2/xmm3 are arguments).
+    for (tag, f, prologue) in [
+        (6u8, POLYGONIZE_FN, &POLYGONIZE_PROLOGUE[..]),
+        (7, CREATE_FIXTURE_FN, &CREATE_FIXTURE_PROLOGUE[..]),
+        (8, RAGDOLL_LOAD_FN, &RAGDOLL_LOAD_PROLOGUE[..]),
+        (9, IMAGE_SHAPES_FN, &POLYGONIZE_PROLOGUE[..]),
+    ] {
         expect(f, prologue)?;
         let stub_at = ex.base + ex.used;
         // sub esp,64; movups [esp+0/16/32/48],xmm0..3
@@ -697,6 +719,12 @@ const POLYGONIZE_PROLOGUE: [u8; 5] = [0x55, 0x8B, 0xEC, 0x6A, 0xFF];
 const CREATE_FIXTURE_FN: u32 = 0x009b_c760;
 /// push ebp; mov ebp,esp; sub esp,0x10
 const CREATE_FIXTURE_PROLOGUE: [u8; 6] = [0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x10];
+/// Ragdoll loader ("Ragdolls - Cached load"): fastcall, 9 stack arguments, the last one the
+/// stains overlay image (0 = none). `push ebp; mov ebp,esp; and esp,-16`.
+const RAGDOLL_LOAD_FN: u32 = 0x00be_8240;
+const RAGDOLL_LOAD_PROLOGUE: [u8; 6] = [0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0];
+/// Image -> Box2D shapes (FUN_009814f0 outline + decomposition, FUN_009817d0 box fallback).
+const IMAGE_SHAPES_FN: u32 = 0x0095_b610;
 
 const BODY_TO_GRID_FN: u32 = 0x0074_40a0;
 const PARTICLE_CREATE_FN: u32 = 0x0071_6ce0;
@@ -732,6 +760,18 @@ fn ptrace_write(line: &str) {
     }
 }
 
+/// Image struct {w, h, .., +0x18 u32 pixels[w*h]}: (w, h, FNV-1a over the pixels).
+unsafe fn image_hash(img: u32) -> (i32, i32, u32) {
+    let (w, h, data) = (rd(img) as i32, rd(img + 4) as i32, rd(img + 0x18));
+    let mut hash = 0x811c_9dc5u32;
+    if data != 0 && (0..1 << 20).contains(&(w * h)) {
+        for i in 0..(w * h) as u32 {
+            hash = (hash ^ rd(data + 4 * i)).wrapping_mul(0x0100_0193);
+        }
+    }
+    (w, h, hash)
+}
+
 extern "C" fn particle_trace(tag: u32, regs: *const u32) {
     unsafe {
         let Some(frame) = ptrace_frame() else { return };
@@ -743,7 +783,23 @@ extern "C" fn particle_trace(tag: u32, regs: *const u32) {
         let esp = *regs.add(3) + if tag >= 6 { 64 } else { 0 };
         let mut ebp = *regs.add(2);
         let gp = *regs.add(6);
-        let what = if tag == 6 {
+        let what = if tag == 8 {
+            // Stains overlay (SpriteStains+0x20, or +0x00 with `ragdoll_stains`): both images
+            let p = rd(esp + 0x24);
+            let base = if p == 0 || RAGDOLL_STAINS_ON.load(Ordering::Relaxed) { p } else { p - 0x20 };
+            let ((w, h, a), (_, _, b)) = if base != 0 { (image_hash(base), image_hash(base + 0x20)) } else { ((0, 0, 0), (0, 0, 0)) };
+            format!("ragdoll stains={w}x{h} colours={a:08x} blurred={b:08x} overlay={:08x}", if p == 0 { 0 } else { image_hash(p).2 })
+        } else if tag == 9 {
+            let (w, h, hash) = image_hash(gp);
+            let mut s = format!("image_shapes w={w} h={h} hash={hash:08x} px=");
+            let data = rd(gp + 0x18);
+            if data != 0 && (0..=256).contains(&(w * h)) {
+                for i in 0..(w * h) as u32 {
+                    s.push_str(&format!("{:08x},", rd(data + 4 * i)));
+                }
+            }
+            s
+        } else if tag == 6 {
             // ecx = bitmap {w, h, .., +0x18 Cell*[w*h]}: its set pixels
             let (w, h, data) = (rd(gp) as i32, rd(gp + 4) as i32, rd(gp + 0x18));
             let mut s = format!("polygonize w={w} h={h} px=");
@@ -848,6 +904,7 @@ const PATCHES: &[(&str, PatchFn)] = &[
     ("threaded_chunkgen", patch_threaded_chunkgen),
     ("threaded_grid", patch_threaded_grid),
     ("threaded_render", patch_threaded_render),
+    ("threaded_pathfinding", patch_threaded_pathfinding),
     ("inline_group", |_| unsafe { patch_inline_group() }),
     ("inline_async", |_| unsafe { patch_inline_async() }),
     ("particle_init", |_| unsafe { patch_particle_init() }),
@@ -863,6 +920,8 @@ const PATCHES: &[(&str, PatchFn)] = &[
     ("box2d_freeze", |_| unsafe { patch_box2d_freeze() }),
     ("free_solids_order", patch_free_solids_order),
     ("pathfinding_refresh", patch_pathfinding_refresh),
+    ("ragdoll_stains", |_| unsafe { patch_ragdoll_stains() }),
+    ("platform_frame", |_| unsafe { patch_platform_frame() }),
 ];
 
 /// Overwrite every time/pid-seeded engine RNG with values derived from the session seed.
@@ -880,8 +939,55 @@ pub unsafe fn fix_seeds(seed: u32) {
     if rs != 0 {
         *(rs as *mut u32) = seed.wrapping_mul(0x9e37_79b9) | 1;
     }
+    skew_platform_frame();
+    sync_platform_frame();
     // The simulation RNG bank starts from exactly these values.
     SIM_BANK.with(|b| *b.borrow_mut() = Some(RngBank::capture()));
+}
+
+/// PlatformDesktop frame counter (+0x20), returned by its vtable+0x60 getter.
+const PLATFORM_FRAME: u32 = PLATFORM + 0x20;
+/// The getter: `mov eax,[ecx+0x20]; ret`.
+const PLATFORM_FRAME_GETTER: u32 = 0x00db_8f00;
+/// Inside the window the counter is GameGlobal's frame plus this. It is above any count a
+/// client reaches before its session starts (4.8 hours of menus at 60 fps), so the counter
+/// only ever jumps forward.
+const PLATFORM_FRAME_BASE: u32 = 1 << 20;
+static PLATFORM_FRAME_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The platform frame counter counts main-loop frames from before the world exists (62 of
+/// them in a `-gamemode 0` start), so it differs between clients by the time each spent
+/// before its session started, e.g. in menus. The simulation reads it at ~60 sites:
+/// SpriteStainsSystem updates an entity when `(frame ^ entity_id) & 15 == 0` (or a player
+/// every 3rd frame) and draws the global LCG there; the PathFindingComponent update
+/// FUN_00bca030 and animal AI FUN_00b750b0 schedule work by it. It is now GameGlobal's frame
+/// plus [`PLATFORM_FRAME_BASE`], set by [`fix_seeds`] and at every window entry.
+unsafe fn patch_platform_frame() -> Result<(), PatchError> {
+    expect(PLATFORM_FRAME_GETTER, &[0x8B, 0x41, 0x20, 0xC3])?;
+    PLATFORM_FRAME_ON.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+unsafe fn sync_platform_frame() {
+    if !PLATFORM_FRAME_ON.load(Ordering::Relaxed) {
+        return;
+    }
+    let gg = rd(GAME_GLOBAL_PTR);
+    let frame = if gg != 0 { rd(gg) } else { 0 };
+    *(PLATFORM_FRAME as *mut u32) = PLATFORM_FRAME_BASE.wrapping_add(frame);
+}
+
+/// Diagnostics: `NOITA_ONLINE_PF_SKEW=<instance>:<n>` adds n to that instance's platform
+/// frame counter once, at the first [`fix_seeds`]: a stand-in for time spent in menus
+/// (overridden when `platform_frame` is on).
+unsafe fn skew_platform_frame() {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let Ok(v) = std::env::var("NOITA_ONLINE_PF_SKEW") else { return };
+    let inst = std::env::var("NOITA_ONLINE_INSTANCE").unwrap_or_default();
+    let Some(n) = v.split_once(':').filter(|(i, _)| *i == inst).and_then(|(_, n)| n.parse::<u32>().ok()) else { return };
+    if !DONE.swap(true, Ordering::Relaxed) {
+        *(PLATFORM_FRAME as *mut u32) = rd(PLATFORM_FRAME).wrapping_add(n);
+    }
 }
 
 // --- multi-focus streaming, particles, fixed timestep, simulation RNG bank ---------------
@@ -1051,7 +1157,8 @@ static IN_WINDOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 static ARMED_CAMERA: std::sync::Mutex<Option<(f32, f32)>> = std::sync::Mutex::new(None);
 static EARLY_WINDOW_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Entering the simulation window: stash the per-client RNG states, load the sim stream.
+/// Entering the simulation window: stash the per-client RNG states, load the sim stream,
+/// pin the platform frame counter ([`patch_platform_frame`]).
 /// Idempotent within a frame (the window may already have been entered early).
 ///
 /// # Safety
@@ -1061,12 +1168,15 @@ pub unsafe fn sim_rng_enter() {
         return;
     }
     join_render_tiles();
+    // The previous step's state report is hashed in the background; no step may run first.
+    crate::report::join();
     RENDER_BANK.with(|b| *b.borrow_mut() = Some(RngBank::capture()));
     SIM_BANK.with(|b| {
         if let Some(s) = *b.borrow() {
             s.restore();
         }
     });
+    sync_platform_frame();
     rng_log('<');
     let gg = rd(GAME_GLOBAL_PTR);
     if gg != 0 {
@@ -1199,14 +1309,15 @@ unsafe fn rng_log(tag: char) {
     if let Ok(mut f) = file.lock() {
         let _ = writeln!(
             f,
-            "{frame} {tag} lcg={:08x} plat={:08x}/{:08x} pm={:.0} part={:.0} rand={:08x} gw={gw_rng:08x} t={:08x}",
+            "{frame} {tag} lcg={:08x} plat={:08x}/{:08x} pm={:.0} part={:.0} rand={:08x} gw={gw_rng:08x} t={:08x} pf={}",
             s.lcg,
             s.plat_a0,
             s.plat_a4,
             s.pm,
             s.particle,
             s.rand,
-            if gg != 0 { rd(gg + 8) } else { 0 }
+            if gg != 0 { rd(gg + 8) } else { 0 },
+            rd(PLATFORM + 0x20)
         );
         if world_data != 0 && grid_world != 0 {
             let fl = |o: u32| *((world_data + o) as *const f32);
@@ -1635,6 +1746,32 @@ extern "C" fn pf_refresh_view() -> u32 {
 /// Publish this window's focus centres (slot order) for the clearance refresh.
 pub fn pathfinding_foci(foci: &[(f32, f32)]) {
     *PF_FOCI.lock().unwrap_or_else(|p| p.into_inner()) = foci.to_vec();
+}
+
+/// Ragdoll creation on death (FUN_00abb7d0): `mov eax,[eax+0x5c]; test eax,eax; jz +7;
+/// add eax,0x20; mov [esp+0x34],eax` picks the dying entity's stains overlay (eax =
+/// SpriteStainsComponent, +0x5c = SpriteStains) for both ragdoll loads (FUN_00be8240).
+const RAGDOLL_STAINS_SITE: u32 = 0x00ab_c082;
+const RAGDOLL_STAINS_ORIG: [u8; 14] = [0x8B, 0x40, 0x5C, 0x85, 0xC0, 0x74, 0x07, 0x83, 0xC0, 0x20, 0x89, 0x44, 0x24, 0x34];
+static RAGDOLL_STAINS_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// SpriteStains keeps the stain colours in an image at +0x00, which the simulation updates
+/// (SpriteStainsSystem FUN_00c22080, EntityAddRandomStains, cleaning). The image at +0x20, of
+/// the same size, is a horizontally blurred copy written only by the GPU texture upload
+/// (FUN_00c21020). That upload runs from the render-side queue FUN_0084e3f0 (at most 3 per
+/// frame), and FUN_00c20f80 queues it only while the sprite was drawn in the previous frame.
+/// So +0x20 held each client's last *drawn* stains, all zero for an entity it never saw.
+/// The ragdoll loader blends that overlay into the ragdoll images. Small ragdoll parts get
+/// box fixtures from FUN_009817d0, which merges neighbouring pixels of equal colour into
+/// one box (FUN_00928250). So the same 5-pixel part got 3 fixtures on one client and 5 on
+/// the other, with a different mass (seed 1786459272, f=5345). The overlay is now the stain
+/// colours at +0x00: the same colours, no longer blurred by one pixel.
+unsafe fn patch_ragdoll_stains() -> Result<(), PatchError> {
+    expect(RAGDOLL_STAINS_SITE, &RAGDOLL_STAINS_ORIG)?;
+    // add eax,0x20 -> nop x3
+    write_code(RAGDOLL_STAINS_SITE + 7, &[0x90; 3])?;
+    RAGDOLL_STAINS_ON.store(true, Ordering::Relaxed);
+    Ok(())
 }
 
 static FREEZE_LAST: std::sync::Mutex<Vec<(f32, f32)>> = std::sync::Mutex::new(Vec::new());

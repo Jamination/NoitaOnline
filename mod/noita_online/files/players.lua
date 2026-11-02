@@ -81,12 +81,15 @@ function M.setup(proxy, ids, local_id)
 end
 
 -- Solo baseline (no networking): the engine's own player is slot 0, driven by applied
--- inputs exactly like a lockstep slot.
+-- inputs exactly like a lockstep slot, and like a lockstep slot it never dies by itself
+-- (apply_tick turns it into a spectator), so the scenario's world events run as in a session.
 function M.setup_solo(player)
   M.local_id = 0
   local controls = EntityGetFirstComponentIncludingDisabled(player, "ControlsComponent")
   ComponentSetValue2(controls, "enabled", false)
   EntityAddTag(player, "noita_online_player")
+  local dm = EntityGetFirstComponentIncludingDisabled(player, "DamageModelComponent")
+  if dm then ComponentSetValue2(dm, "wait_for_kill_flag_on_death", true) end
   local slot = { id = 0, entity = player, controls = controls, prev = Input.NEUTRAL }
   M.slots = { slot }
   M.by_id = { [0] = slot }

@@ -6,7 +6,7 @@ use protocol::{ClientMsg, ServerMsg, CH_RELIABLE, CH_UNRELIABLE};
 use rudp::{Client, ClientState, LinkConditions};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,7 +50,7 @@ pub struct Shared {
     /// Signalled when ticks or status change (game thread waits on it).
     pub game_cond: Condvar,
     /// Signalled when the game queued something to send (net thread waits on it).
-    pub net_cond: Condvar,
+    pub net_wake: NetWake,
     pub stop: AtomicBool,
     pub rtt_us: AtomicU64,
     pub bytes_sent: AtomicU64,
@@ -62,7 +62,7 @@ impl Shared {
         Arc::new(Self {
             state: Mutex::new(State { status: Some(Status::Idle), ..Default::default() }),
             game_cond: Condvar::new(),
-            net_cond: Condvar::new(),
+            net_wake: NetWake::new(),
             stop: AtomicBool::new(false),
             rtt_us: AtomicU64::new(0),
             bytes_sent: AtomicU64::new(0),
@@ -72,7 +72,118 @@ impl Shared {
 
     pub fn send(&self, channel: u8, msg: &ClientMsg) {
         self.state.lock().unwrap().outgoing.push_back((channel, msg.encode()));
-        self.net_cond.notify_one();
+        self.net_wake.notify();
+    }
+}
+
+/// Wakes the network thread. On Windows the thread also wakes when a datagram arrives, so it
+/// sleeps until there is work instead of polling the socket every millisecond (each poll is a
+/// few syscalls under Wine, on the core the game runs on).
+pub struct NetWake {
+    cond: Condvar,
+    #[cfg(windows)]
+    event: Option<win::Event>,
+}
+
+impl NetWake {
+    fn new() -> Self {
+        Self {
+            cond: Condvar::new(),
+            #[cfg(windows)]
+            event: win::Event::new(),
+        }
+    }
+
+    pub fn notify(&self) {
+        #[cfg(windows)]
+        if let Some(e) = &self.event {
+            e.set();
+        }
+        self.cond.notify_all();
+    }
+
+    /// Release `state` and sleep until [`Self::notify`], a datagram on the socket that
+    /// `socket_event` watches, or `timeout`. Without both events, wakes at least every 1 ms.
+    fn wait(&self, state: MutexGuard<'_, State>, socket_event: Option<&SocketEvent>, timeout: Duration) {
+        #[cfg(windows)]
+        if let (Some(wake), Some(sock)) = (&self.event, socket_event) {
+            drop(state);
+            win::wait_any(&[wake, sock], timeout);
+            return;
+        }
+        let _ = socket_event;
+        let _ = self.cond.wait_timeout(state, timeout.min(Duration::from_millis(1))).unwrap();
+    }
+}
+
+#[cfg(windows)]
+type SocketEvent = win::Event;
+#[cfg(not(windows))]
+type SocketEvent = ();
+
+/// An event set whenever the client socket has datagrams to read (None: poll instead).
+fn socket_event(client: &Client) -> Option<SocketEvent> {
+    #[cfg(windows)]
+    {
+        let e = win::Event::new()?;
+        e.on_readable(client.socket()).then_some(e)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = client;
+        None
+    }
+}
+
+#[cfg(windows)]
+mod win {
+    use std::time::Duration;
+
+    type Handle = isize;
+    extern "system" {
+        fn CreateEventW(attrs: *mut u8, manual_reset: i32, initial_state: i32, name: *const u16) -> Handle;
+        fn SetEvent(event: Handle) -> i32;
+        fn CloseHandle(handle: Handle) -> i32;
+        fn WaitForMultipleObjects(count: u32, handles: *const Handle, wait_all: i32, ms: u32) -> u32;
+    }
+    #[link(name = "ws2_32")]
+    extern "system" {
+        fn WSAEventSelect(socket: usize, event: Handle, network_events: i32) -> i32;
+    }
+    const FD_READ: i32 = 1;
+
+    /// Auto-reset event.
+    pub struct Event(Handle);
+
+    impl Event {
+        pub fn new() -> Option<Self> {
+            let h = unsafe { CreateEventW(std::ptr::null_mut(), 0, 0, std::ptr::null()) };
+            (h != 0).then_some(Self(h))
+        }
+
+        pub fn set(&self) {
+            unsafe { SetEvent(self.0) };
+        }
+
+        /// Set this event whenever `socket` has datagrams to read (re-armed by every receive
+        /// that finds the socket empty).
+        pub fn on_readable(&self, socket: &std::net::UdpSocket) -> bool {
+            use std::os::windows::io::AsRawSocket;
+            unsafe { WSAEventSelect(socket.as_raw_socket() as usize, self.0, FD_READ) == 0 }
+        }
+    }
+
+    impl Drop for Event {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    /// Wait until any of `events` is set or `timeout` passes (rounded up to whole ms).
+    pub fn wait_any(events: &[&Event; 2], timeout: Duration) {
+        let handles = [events[0].0, events[1].0];
+        let ms = timeout.as_micros().div_ceil(1000).min(u32::MAX as u128 - 1) as u32;
+        unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, ms) };
     }
 }
 
@@ -86,6 +197,10 @@ pub struct ConnectParams {
 
 /// Repeat unacknowledged inputs at least this often.
 const STREAM_RESEND: Duration = Duration::from_millis(16);
+/// Round-trip probe interval.
+const PING_EVERY: Duration = Duration::from_secs(1);
+/// Upper bound on one sleep of the network thread (all timed work is computed exactly).
+const MAX_SLEEP: Duration = Duration::from_millis(250);
 
 pub fn spawn(shared: Arc<Shared>, p: ConnectParams) -> std::io::Result<std::thread::JoinHandle<()>> {
     let client = Client::connect(p.addr.as_str(), &p.name, protocol::transport_config(), p.netsim)?;
@@ -97,6 +212,7 @@ fn run(shared: Arc<Shared>, mut client: Client, p: ConnectParams) {
     let mut said_hello = false;
     let mut last_ping = Instant::now();
     let mut last_stream_send = Instant::now();
+    let sock_event = socket_event(&client);
     loop {
         if shared.stop.load(Ordering::Relaxed) {
             client.disconnect();
@@ -142,7 +258,7 @@ fn run(shared: Arc<Shared>, mut client: Client, p: ConnectParams) {
             }
             _ => {}
         }
-        if said_hello && last_ping.elapsed() >= Duration::from_secs(1) {
+        if said_hello && last_ping.elapsed() >= PING_EVERY {
             last_ping = Instant::now();
             let _ = client.send(CH_UNRELIABLE, &ClientMsg::Ping { t: client.now_us() }.encode());
         }
@@ -197,10 +313,23 @@ fn run(shared: Arc<Shared>, mut client: Client, p: ConnectParams) {
         if wake_game {
             shared.game_cond.notify_all();
         }
-        // Sleep until the game queues something or ~1 ms passes (keeps acks/resends prompt).
+        // Sleep until the game queues something, a datagram arrives, or timed work is due
+        // (input stream resend, ping, rudp ack/resend/keepalive).
         let s = shared.state.lock().unwrap();
         if s.outgoing.is_empty() && !s.input_dirty {
-            let _ = shared.net_cond.wait_timeout(s, Duration::from_millis(1)).unwrap();
+            let now = Instant::now();
+            let mut until = now + MAX_SLEEP;
+            if said_hello {
+                until = until.min(last_ping + PING_EVERY);
+            }
+            if s.stream.as_ref().is_some_and(|st| st.has_unacked_inputs()) {
+                until = until.min(last_stream_send + STREAM_RESEND);
+            }
+            until = until.min(match client.next_deadline_us() {
+                Some(at) => now + Duration::from_micros(at.saturating_sub(client.now_us())),
+                None => now + Duration::from_millis(1),
+            });
+            shared.net_wake.wait(s, sock_event.as_ref(), until.saturating_duration_since(now));
         }
     }
 }

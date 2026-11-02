@@ -111,21 +111,30 @@ pub unsafe fn for_each_chunk_strided(w: &WorldPtrs, first: usize, step: usize, m
     }
 }
 
-/// Hash the loaded chunks with table index `first`, `first + step`, ..., spread over a few
-/// threads (the game thread waits; nothing else touches the world meanwhile).
+/// The loaded chunks with table index `first`, `first + step`, ... in ascending order, as
+/// (chunk table index, `Cell*` array address), and the material table base for
+/// [`hash_chunks`]. Empty while the world does not exist.
 ///
 /// # Safety
-/// See [`world_ptrs`]. Must be called on the game thread between simulation steps.
-pub unsafe fn hash_loaded_chunks(first: usize, step: usize) -> Vec<protocol::ChunkHash> {
-    let Some(w) = world_ptrs() else { return Vec::new() };
+/// See [`world_ptrs`].
+pub unsafe fn loaded_chunks(first: usize, step: usize) -> (Vec<(u32, usize)>, usize) {
+    let Some(w) = world_ptrs() else { return (Vec::new(), 0) };
     let mut chunks: Vec<(u32, usize)> = Vec::with_capacity(32);
     for_each_chunk_strided(&w, first, step, |index, cells| chunks.push((index, cells as usize)));
+    (chunks, w.materials_begin)
+}
+
+/// Hash chunks listed by [`loaded_chunks`], spread over a few threads.
+///
+/// # Safety
+/// The chunks must still be loaded and their cells unchanged since they were listed, i.e.
+/// no simulation step may run until this returns.
+pub unsafe fn hash_chunks(chunks: &[(u32, usize)], materials_begin: usize) -> Vec<protocol::ChunkHash> {
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 4);
-    let begin = w.materials_begin;
     let mut out: Vec<protocol::ChunkHash> = Vec::with_capacity(chunks.len());
     if threads == 1 || chunks.len() < 2 {
-        for (index, cells) in chunks {
-            out.push(protocol::ChunkHash { index, hash: hash_cells(cells as *const usize, begin) });
+        for &(index, cells) in chunks {
+            out.push(protocol::ChunkHash { index, hash: hash_cells(cells as *const usize, materials_begin) });
         }
         return out;
     }
@@ -136,7 +145,7 @@ pub unsafe fn hash_loaded_chunks(first: usize, step: usize) -> Vec<protocol::Chu
             .map(|part| {
                 s.spawn(move || {
                     part.iter()
-                        .map(|&(index, cells)| protocol::ChunkHash { index, hash: hash_cells(cells as *const usize, begin) })
+                        .map(|&(index, cells)| protocol::ChunkHash { index, hash: hash_cells(cells as *const usize, materials_begin) })
                         .collect::<Vec<_>>()
                 })
             })

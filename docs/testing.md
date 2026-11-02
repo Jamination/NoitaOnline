@@ -46,9 +46,12 @@ harness/evaluate.py --run run/e2e/full --netsim-run run/e2e/netsim \
 * `--pin` gives client *k* its own physical core (CPUs `B+k` and `B+6+k`, `B` =
   `NOITA_PIN_BASE`, default 2), so concurrent clients on one machine behave like separate
   machines; the baseline uses the same pinning. Concurrent harness runs must use disjoint
-  bases (e.g. 2 and 4 with two clients each).
+  bases (e.g. 2 and 4 with two clients each). Without `--pin`, `NOITA_CPUSET` (e.g.
+  `0,1,6,7`) confines every client of the run to those CPUs instead.
 * `--solo` is the single-player baseline: the same scripted scenario without networking
-  or engine patches, one player per instance.
+  or engine patches, one player per instance. As in a session, the player becomes a
+  spectator at 0 HP instead of dying, so the scenario's world events keep running (a
+  vanilla death stopped them and made the baseline's second half much lighter).
 * `--netsim` applies 5 % loss and 100 ms latency to every datagram the server sends *and*
   receives (i.e. on both directions of every client link).
 

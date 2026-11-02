@@ -11,6 +11,8 @@ pub mod perf;
 #[cfg(all(windows, target_arch = "x86"))]
 pub mod prof;
 #[cfg(all(windows, target_arch = "x86"))]
+pub mod report;
+#[cfg(all(windows, target_arch = "x86"))]
 pub mod world;
 
 use net::{ConnectParams, Shared, Status};
@@ -156,7 +158,7 @@ pub unsafe extern "C" fn no_send_input(frame: u32, data: *const u8, len: u32) ->
         stream.push_input(frame, bytes);
         s.input_dirty = true;
         drop(s);
-        rt.shared.net_cond.notify_one();
+        rt.shared.net_wake.notify();
         0
     })
 }
@@ -265,10 +267,12 @@ pub(crate) unsafe fn dump_window_entry(frame: u32) {
 /// only loaded chunks with `index % chunk_period == frame % chunk_period` are hashed, so
 /// every chunk is hashed and compared once per period without a per-period frame-time
 /// spike (0 = hash every loaded chunk now). `has_entities` attaches the entity digest and
-/// tracked positions (entity checkpoints). Returns the time spent hashing in µs.
+/// tracked positions (entity checkpoints). The chunks are hashed and the report is sent in
+/// the background (see `report`); returns the duration of the last completed chunk hash in µs.
 ///
 /// # Safety
-/// `positions` must point at `n` readable `EntityPosC`; must run on Noita's game thread.
+/// `positions` must point at `n` readable `EntityPosC`; must run on Noita's game thread at
+/// the end of the simulation window.
 #[no_mangle]
 pub unsafe extern "C" fn no_report_state(
     frame: u32,
@@ -278,34 +282,35 @@ pub unsafe extern "C" fn no_report_state(
     positions: *const EntityPosC,
     n: u32,
 ) -> i32 {
-    let t0 = Instant::now();
-    #[cfg(all(windows, target_arch = "x86"))]
-    let chunks = match chunk_period {
-        0 => world::hash_loaded_chunks(0, 1),
-        p => world::hash_loaded_chunks((frame % p) as usize, p as usize),
-    };
-    #[cfg(not(all(windows, target_arch = "x86")))]
-    let chunks: Vec<protocol::ChunkHash> = {
-        let _ = chunk_period;
-        Vec::new()
-    };
-    let elapsed = t0.elapsed().as_micros() as i32;
-    #[cfg(all(windows, target_arch = "x86"))]
-    if let Some(path) = dump_path(frame) {
-        let _ = world::dump_chunks(&path);
-        if let Some([x0, y0, x1, y1]) = dump_rect() {
-            let _ = world::dump_cells(&path.with_extension("cells.txt"), x0, y0, x1, y1);
-            let _ = world::dump_particles(&path.with_extension("parts.txt"));
-        }
-    }
+    let Some(shared) = with_rt(None, |rt| Some(rt.shared.clone())) else { return 0 };
     let pos = if n == 0 { &[][..] } else { std::slice::from_raw_parts(positions, n as usize) };
     let positions: Vec<EntityPos> = pos
         .iter()
         .map(|p| EntityPos { id: p.id, kind: p.kind as u8, x_bits: p.x.to_bits(), y_bits: p.y.to_bits() })
         .collect();
     let entities = (has_entities != 0).then_some(entity_hash);
-    with_rt((), |rt| rt.shared.send(CH_RELIABLE, &ClientMsg::StateHash { frame, entities, chunks, positions }));
-    elapsed
+    #[cfg(all(windows, target_arch = "x86"))]
+    {
+        let (chunks, materials_begin) = match chunk_period {
+            0 => world::loaded_chunks(0, 1),
+            p => world::loaded_chunks((frame % p) as usize, p as usize),
+        };
+        if let Some(path) = dump_path(frame) {
+            let _ = world::dump_chunks(&path);
+            if let Some([x0, y0, x1, y1]) = dump_rect() {
+                let _ = world::dump_cells(&path.with_extension("cells.txt"), x0, y0, x1, y1);
+                let _ = world::dump_particles(&path.with_extension("parts.txt"));
+            }
+        }
+        report::submit(report::Job { shared, frame, chunks, materials_begin, entities, positions });
+        report::last_hash_us() as i32
+    }
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    {
+        let _ = chunk_period;
+        shared.send(CH_RELIABLE, &ClientMsg::StateHash { frame, entities, chunks: Vec::new(), positions });
+        0
+    }
 }
 
 /// Diagnostics: process working set in MiB and number of loaded chunks.
@@ -663,13 +668,15 @@ pub extern "C" fn no_rtt_us() -> u64 {
     with_rt(0, |rt| rt.shared.rtt_us.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// Disconnect and stop the network thread.
+/// Disconnect and stop the network thread (after the pending state report was queued).
 #[no_mangle]
 pub extern "C" fn no_shutdown() {
+    #[cfg(all(windows, target_arch = "x86"))]
+    report::join();
     let handle = with_rt(None, |rt| {
         rt.shared.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         rt.shared.game_cond.notify_all();
-        rt.shared.net_cond.notify_all();
+        rt.shared.net_wake.notify();
         rt.net.take()
     });
     if let Some(h) = handle {
