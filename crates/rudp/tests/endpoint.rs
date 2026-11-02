@@ -176,8 +176,14 @@ fn handshake_and_ordered_stream_survive_loss_and_latency_on_both_ends() {
         }
     }
     assert_eq!(next, [n; 4]);
-    for c in &clients {
-        let rtt = c.connection().unwrap().rtt_us();
+    // Clients only send acks/keepalives here, so their RTT samples arrive slowly: wait for
+    // them. Both ends add 100 ms each way, so the RTT must be ~400 ms (one end only: ~200).
+    let rtts = |cs: &[Client]| cs.iter().map(|c| c.connection().unwrap().rtt_us()).collect::<Vec<_>>();
+    let end = Instant::now() + Duration::from_secs(10);
+    while rtts(&clients).iter().any(|&r| r < 380_000) && Instant::now() < end {
+        pump(&mut server, &mut clients, Duration::from_millis(5));
+    }
+    for rtt in rtts(&clients) {
         assert!(rtt >= 380_000, "both ends add 100ms each way: rtt {rtt}");
     }
 }
