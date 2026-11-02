@@ -326,6 +326,20 @@ if MFDET then
   else
     log(string.format("mfdet: particle ctor bytes unexpected %02x %02x", U8(0x0071213e), U8(0x00712144)))
   end
+  -- P14: cosmetic particles (+0x6a bit1, set from the create flag in FUN_007168c0 @0x00716a0f and FUN_00716af0
+  -- @0x00716c51: ADD AL,AL; XOR AL,[ESI+0x6a]; AND AL,2; XOR [ESI+0x6a],AL) collide against the render-camera
+  -- material snapshot (GridParticles+0x24, built from the render camera, indexed with GridWorld+0x498) and turn into
+  -- real cells when they land -> camera-dependent world. AND AL,2 -> AND AL,0 keeps bit1 = 0 (P4 clears it in the
+  -- ctor), so they collide against the real grid like normal particles.
+  if os.getenv("SPIKE_B_NOP14") ~= "1" then
+    if U8(0x00716a0f) == 0x24 and U8(0x00716a10) == 0x02 and U8(0x00716c51) == 0x24 and U8(0x00716c52) == 0x02 then
+      patch_bytes(0x00716a10, { 0x00 })
+      patch_bytes(0x00716c52, { 0x00 })
+      log("mfdet: P14 cosmetic-particle snapshot collision disabled")
+    else
+      log("mfdet: P14 bytes unexpected, skipped")
+    end
+  end
   if os.getenv("SPIKE_B_FIXDT") == "1" then
     -- DeathMatch::Update (FUN_006b26f0, thiscall(this, float dt)): force dt = 1/60 at entry.
     -- prologue 55 8B EC 83 E4 F0 -> JMP stub; stub: mov dword [esp+4],0x3C888889; prologue; jmp 006b26f6
@@ -551,10 +565,18 @@ local probe_cb
 local function install_probes()
   probe_cb = ffi.cast("void(__cdecl*)(int)", function(i)
     probe_vals[i] = string.format("%08x/%08x", U32(0x0120741c), U32(RAND_STATE))
-    if i == 7 and os.getenv("SPIKE_B_PROBE") == "3" then
+    if os.getenv("SPIKE_B_PROBE") == "3" then
       local gw = gridworld()
-      probe_vals.q7 = string.format("new=%d pend=%d bud=%d", (U32(gw + 0x5a8) - U32(gw + 0x5a4)) / 4,
-        (U32(gw + 0x5b4) - U32(gw + 0x5b0)) / 4, I32(gw + 0x5bc))
+      probe_vals[i] = probe_vals[i] .. string.format("/n%d", (U32(gw + 0x5a8) - U32(gw + 0x5a4)) / 4)
+      if i == 5 then
+        local g = ffi.cast("float*", gg() + 0x180)
+        probe_vals.q7 = nil
+        probe_vals.gb5 = string.format("%g,%g,%g,%g/%d,%d", g[0], g[1], g[2], g[3], I32(gw + 0x498), I32(gw + 0x49c))
+      end
+      if i == 7 then
+        probe_vals.q7 = string.format("new=%d pend=%d bud=%d", (U32(gw + 0x5a8) - U32(gw + 0x5a4)) / 4,
+          (U32(gw + 0x5b4) - U32(gw + 0x5b0)) / 4, I32(gw + 0x5bc))
+      end
     end
   end)
   local cb = tonumber(ffi.cast("uint32_t", probe_cb))
@@ -588,6 +610,48 @@ end
 -- GridWorld+0x5a4 (new items) / +0x5b0 (pending) with phase (1 = inside Pre..Post, 2 = outside), frame,
 -- return address, caller chain (EBP walk), cell, material, cell x/y. Source: run/re_camleak/qtrace.s
 local QT = nil
+-- hex template -> byte list, replacing placeholder dwords 0xAAAA00nn by subst[nn]
+function QT_assemble(hex, subst)
+  local code = {}
+  for i = 1, #hex, 2 do code[#code + 1] = tonumber(hex:sub(i, i + 1), 16) end
+  local i = 1
+  while i <= #code - 3 do
+    if code[i + 2] == 0xaa and code[i + 3] == 0xaa and code[i + 1] == 0 and subst[code[i]] then
+      local v = le32(subst[code[i]])
+      code[i], code[i + 1], code[i + 2], code[i + 3] = v[1], v[2], v[3], v[4]
+      i = i + 4
+    else
+      i = i + 1
+    end
+  end
+  return code
+end
+-- Generic entry trace into the same ring (run/re_camleak/ftrace.s): records tag, phase, frame, return address,
+-- ECX, arg0, 4 dwords at arg0+off, EBP caller chain. stolen = original prologue bytes (no rel. addressing).
+local FT_NAMES = {}
+local ft_slot = 0
+local function install_ftrace(addr, stolen, tag, off, name)
+  for k, b in ipairs(stolen) do
+    if U8(addr + k - 1) ~= b then log(string.format("ftrace: %s prologue mismatch", name)) return end
+  end
+  local hex = "609c8b150300aaaa81e2ff030000c1e20681c20400aaaaa10500aaaa8902a10600aaaa8942048b442424894208894a0cc7423c" ..
+      "0700aaaa8b44242889421085c0741c050800aaaa8b08894a148b4804894a188b4808894a1c8b480c894a3889e8bb060000008d7a20" ..
+      "89c129e181f900001000730d8b4804890f83c7048b004b75e7ff050300aaaa9d61"
+  local code = QT_assemble(hex, { [3] = QT.idx, [4] = QT.buf, [5] = QT.phase, [6] = QT.frame, [7] = tag, [8] = off })
+  for _, b in ipairs(stolen) do code[#code + 1] = b end
+  code[#code + 1] = 0x68
+  for _, b in ipairs(le32(addr + #stolen)) do code[#code + 1] = b end
+  code[#code + 1] = 0xC3
+  local s = 0x400 + ft_slot * 0x100
+  ft_slot = ft_slot + 1
+  for k, b in ipairs(code) do QT.page[s + k - 1] = b end
+  local rel = le32(QT.base + s - (addr + 5))
+  local p = { 0xE9, rel[1], rel[2], rel[3], rel[4] }
+  for k = 6, #stolen do p[k] = 0x90 end
+  patch_bytes(addr, p)
+  FT_NAMES[tag] = name
+  log(string.format("ftrace: %s @%08x tag=%d", name, addr, tag))
+end
 local function install_qtrace()
   if U8(0x0089d7a0) ~= 0x55 or U8(0x0089d7a3) ~= 0x56 or U8(0x0089d7a5) ~= 0xF1 then
     log("qtrace: push_back prologue unexpected") return
@@ -599,19 +663,7 @@ local function install_qtrace()
   local hex = "3b0d0100aaaa74143b0d0200aaaa740c5589e55689ce68a6d78900c3609c8b150300aaaa81e2ff030000c1e20681c20400aaaa" ..
       "a10500aaaa8902a10600aaaa8942048b442424894208894a0c8b4424288b0089421085c074128b4814894a148b4818894a188b481c" ..
       "894a1c89e8bb060000008d7a2089c129e181f900001000730d8b4804890f83c7048b004b75e7ff050300aaaa9d61e975ffffff"
-  local code = {}
-  for i = 1, #hex, 2 do code[#code + 1] = tonumber(hex:sub(i, i + 1), 16) end
-  local subst = { QT.vnew, QT.vpend, QT.idx, QT.buf, QT.phase, QT.frame }
-  local i = 1
-  while i <= #code - 3 do
-    if code[i + 2] == 0xaa and code[i + 3] == 0xaa and code[i + 1] == 0 and code[i] >= 1 and code[i] <= 6 then
-      local v = le32(subst[code[i]])
-      code[i], code[i + 1], code[i + 2], code[i + 3] = v[1], v[2], v[3], v[4]
-      i = i + 4
-    else
-      i = i + 1
-    end
-  end
+  local code = QT_assemble(hex, { QT.vnew, QT.vpend, QT.idx, QT.buf, QT.phase, QT.frame })
   for k, b in ipairs(code) do page[k - 1] = b end
   local gw = gridworld()
   ffi.cast("uint32_t*", QT.vnew)[0] = gw + 0x5a4
@@ -635,21 +687,193 @@ local function qtrace_dump()
     local e = ffi.cast("uint32_t*", QT.buf + bit.band(QT.rd, 0x3ff) * 64)
     local ch = {}
     for k = 8, 13 do ch[#ch + 1] = string.format("%08x", e[k]) e[k] = 0 end
-    local mat = (e[5] ~= 0 and e[5] >= mb) and math.floor((e[5] - mb) / 0x290) or -1
-    log(string.format("Q ph=%d f=%d ret=%08x %s cell=%08x mat=%d xy=%d,%d chain=%s", e[0], e[1], e[2],
-      (e[3] == gw + 0x5a4) and "NEW" or "PEND", e[4], mat, tonumber(ffi.cast("int32_t", e[6])),
-      tonumber(ffi.cast("int32_t", e[7])), table.concat(ch, ",")))
+    local tag = e[15]
+    e[15] = 0
+    if tag ~= 0 then
+      local u = ffi.new("uint32_t[4]", e[5], e[6], e[7], e[14])
+      local d = ffi.cast("double*", u)
+      log(string.format("T %s ph=%d f=%d ret=%08x ecx=%08x a0=%08x w=%08x,%08x,%08x,%08x d=%.3f,%.3f chain=%s",
+        FT_NAMES[tag] or tostring(tag), e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7], e[14], d[0], d[1],
+        table.concat(ch, ",")))
+    else
+      local mat = (e[5] ~= 0 and e[5] >= mb) and math.floor((e[5] - mb) / 0x290) or -1
+      log(string.format("Q ph=%d f=%d ret=%08x %s cell=%08x mat=%d xy=%d,%d chain=%s", e[0], e[1], e[2],
+        (e[3] == gw + 0x5a4) and "NEW" or "PEND", e[4], mat, tonumber(ffi.cast("int32_t", e[6])),
+        tonumber(ffi.cast("int32_t", e[7])), table.concat(ch, ",")))
+    end
     QT.rd = QT.rd + 1
+  end
+end
+-- Box2D body dump (SPIKE_B_BODIES=<last frame>): b2World = *(GridWorld+0x530), body list head +0x1922c,
+-- next = body+0xb8; per body hash of the numeric fields +0x08..+0xaf (type, flags, xf, sweep, vel, force).
+local BODIES_TO = tonumber(os.getenv("SPIKE_B_BODIES") or "0") or 0
+local BODIES_FROM = tonumber(os.getenv("SPIKE_B_BODIES_FROM") or "1") or 1
+local BRAW = os.getenv("SPIKE_B_BRAW") == "1"
+local function body_dump(tag, f)
+  local w = U32(gridworld() + 0x530)
+  if w == 0 then return end
+  local b = U32(w + 0x1922c)
+  local parts, H, n = {}, 0x811c9dc5, 0
+  while b ~= 0 and n < 5000 do
+    local p = ffi.cast("uint32_t*", b)
+    local h = 0x811c9dc5
+    -- skip padding: high half of +0x0c (after uint16 m_flags) and +0x14 (before the double m_xf)
+    h = fnv(fnv(fnv(h, p[2]), bit.band(p[3], 0xffff)), p[4])
+    for k = 6, 43 do h = fnv(h, p[k]) end
+    H = fnv(H, h)
+    n = n + 1
+    local d = ffi.cast("double*", b)
+    parts[#parts + 1] = string.format("%d,%d,%d:%08x", math.floor(d[3]), math.floor(d[4]), bit.band(p[3], 0xffff),
+      h % 0x100000000)
+    if BRAW and tag == "post" then
+      local w = {}
+      for k = 0, 59 do w[#w + 1] = string.format("%08x", p[k]) end
+      log(string.format("BR f=%d %d %s", f, n, table.concat(w, " ")))
+    end
+    b = p[46]
+  end
+  log(string.format("BD f=%d %s n=%d h=%08x %s", f, tag, n, H % 0x100000000, table.concat(parts, " ")))
+end
+-- Per-frame chunk hash (SPIKE_B_CHASH=<last frame>, chunks SPIKE_B_CHUNKS="cx,cy;cx,cy") at pre and post, and a
+-- full cell dump (index:material) of those chunks at frame SPIKE_B_CDUMP to run/re_camleak/cdump_<inst>_<f>_<tag>.txt
+local CHASH_TO = tonumber(os.getenv("SPIKE_B_CHASH") or "0") or 0
+local CDUMP_F = tonumber(os.getenv("SPIKE_B_CDUMP") or "-1") or -1
+local CH_LIST = {}
+for cx, cy in (os.getenv("SPIKE_B_CHUNKS") or "0,-1;2,1"):gmatch("(-?%d+),(-?%d+)") do
+  CH_LIST[#CH_LIST + 1] = { tonumber(cx), tonumber(cy) }
+end
+local function chunk_trace(tag, f)
+  local mb = mat_begin()
+  local parts = {}
+  local df = (f == CDUMP_F) and io.open(string.format("%s/run/re_camleak/cdump_%d_%d_%s.txt", root, inst, f, tag), "w")
+  for _, c in ipairs(CH_LIST) do
+    local ch = chunk_ptr(c[1] * 512, c[2] * 512)
+    if ch == 0 then
+      parts[#parts + 1] = c[1] .. "," .. c[2] .. "=unloaded"
+    else
+      local cells = ffi.cast("uint32_t*", U32(ch))
+      local h, n = 0x811c9dc5, 0
+      local rows = {}
+      for i = 0, 0x40000 - 1 do
+        local cc = cells[i]
+        if cc ~= 0 then
+          local m = ffi.cast("uint32_t*", cc)[5] - mb
+          h = fnv(fnv(h, i), m)
+          n = n + 1
+          if df then rows[#rows + 1] = string.format("%d %d %d", c[1] * 512 + i % 512, c[2] * 512 + math.floor(i / 512), m / 0x290) end
+        end
+      end
+      if df then df:write(table.concat(rows, "\n"), "\n") end
+      parts[#parts + 1] = string.format("%d,%d=%08x/%d", c[1], c[2], h % 0x100000000, n)
+    end
+  end
+  if df then df:close() end
+  log(string.format("CH f=%d %s %s", f, tag, table.concat(parts, " ")))
+end
+-- GridParticles dump (SPIKE_B_PARTS=<last frame>): GridParticles = *(GridWorld+0x540); particle vectors at +0x34/+0x40/
+-- +0x4c (0x70-byte particles). Hash = dwords +0x00..+0x4f and +0x54..+0x6b plus low byte of +0x6c (skips the +0x50
+-- pointer and padding). Also counts particles with +0x6a bit1 (snapshot-collision particles).
+local PARTS_TO = tonumber(os.getenv("SPIKE_B_PARTS") or "0") or 0
+local function parts_dump(tag, f)
+  local gp = U32(gridworld() + 0x540)
+  if gp == 0 then return end
+  local out = {}
+  for _, off in ipairs({ 0x34, 0x40, 0x4c, 0x88 }) do
+    local b, e = U32(gp + off), U32(gp + off + 4)
+    if off == 0x88 then
+      out[#out + 1] = string.format("L88:%d", (e - b) / 4)
+    else
+      local n = (e - b) / 0x70
+      local h, s1 = 0x811c9dc5, 0
+      for i = 0, n - 1 do
+        local p = ffi.cast("uint32_t*", b + i * 0x70)
+        for k = 0, 19 do h = fnv(h, p[k]) end
+        for k = 21, 26 do h = fnv(h, p[k]) end
+        h = fnv(h, bit.band(p[27], 0xff))
+        if bit.band(ffi.cast("uint8_t*", p)[0x6a], 2) ~= 0 then s1 = s1 + 1 end
+      end
+      out[#out + 1] = string.format("L%x:%d:%d:%08x", off, n, s1, h % 0x100000000)
+    end
+  end
+  out[#out + 1] = string.format("prng=%.17g", ffi.cast("double*", 0x01222388)[0])
+  local g = ffi.cast("float*", gg() + 0x180)
+  local gw = gridworld()
+  out[#out + 1] = string.format("gb=%g,%g,%g,%g r498=%d,%d,%d,%d", g[0], g[1], g[2], g[3], I32(gw + 0x498),
+    I32(gw + 0x49c), I32(gw + 0x4a0), I32(gw + 0x4a4))
+  log(string.format("PD f=%d %s %s", f, tag, table.concat(out, " ")))
+  if f == (tonumber(os.getenv("SPIKE_B_PRAW") or "-1") or -1) then
+    local b, e = U32(gp + 0x4c), U32(gp + 0x50)
+    for i = 0, math.min((e - b) / 0x70, 64) - 1 do
+      local p = ffi.cast("uint32_t*", b + i * 0x70)
+      local w = {}
+      for k = 0, 27 do w[#w + 1] = string.format("%08x", p[k]) end
+      log(string.format("PRAW f=%d %s %d %s", f, tag, i, table.concat(w, " ")))
+    end
+  end
+end
+-- P13: camera-driven far-body freeze. Camera::SetRect FUN_006f2d20 -> GridWorld::OnCameraRectChanged FUN_00720130
+-- -> (camera centre moved > 512 px since GridWorld+0x4b8) FUN_007212b0 -> FUN_00721050: freezes dynamic bodies
+-- with PhysicsBody flag +0x29 that are >= 350 px (asleep) / 750 px (awake) from the camera centre into grid cells
+-- (FUN_00720960) and culls terrain collision bodies away from dynamic bodies (FUN_007202c0 -> FUN_0072b5e0 ->
+-- b2World::DestroyBody). Render-camera moves therefore changed Box2D state. Patch: (a) drop the call at 0x007202a7,
+-- (b) replace the camera-centre distance (0x00721177, 26 bytes) by min distance over the sim foci, (c) trigger
+-- FUN_00721050 inside the sim window when any focus moved > 512 px since the last trigger.
+local P13 = nil
+local function install_p13()
+  if U8(0x007202a7) ~= 0xE8 or I32(0x007202a8) ~= 0x1004 or U8(0x00721177) ~= 0x0F or U8(0x00721178) ~= 0x28 or
+      U8(0x0072118d) ~= 0xF3 or U8(0x00721190) ~= 0xD0 then
+    log("p13: unexpected bytes, skipped") return
+  end
+  local s = 0x880 -- det_exec: code 0x880.., N 0x900, save 0x910, scratch 0x920, foci 0x940.. (max 16)
+  local E = tonumber(ffi.cast("uint32_t", det_exec))
+  local code = QT_assemble("50510f112d0300aaaa8b0d0100aaaab80200aaaac7050400aaaaffff7f7ff30f10150400aaaa85c97433f30f" ..
+    "1028f30f5ce8f30f59edf30f112d0400aaaaf30f106804f30f5ce9f30f59edf30f582d0400aaaaf30f5dd583c00849ebc90f102d0300aaaa5958c3",
+    { E + 0x900, E + 0x940, E + 0x910, E + 0x920 })
+  for k, b in ipairs(code) do det_exec[s + k - 1] = b end
+  P13 = { n = ffi.cast("int32_t*", E + 0x900), foci = ffi.cast("float*", E + 0x940), last = {},
+    freeze = ffi.cast("void(__fastcall*)(uint32_t, uint32_t, int32_t*)", 0x00721050), rect = ffi.new("int32_t[4]"),
+    calls = 0 }
+  P13.n[0] = 0
+  patch_bytes(0x007202a7, { 0x83, 0xC4, 0x04, 0x90, 0x90 })
+  local rel = le32(E + s - (0x00721177 + 5))
+  local p = { 0xE8, rel[1], rel[2], rel[3], rel[4] }
+  for k = 6, 26 do p[k] = 0x90 end
+  patch_bytes(0x00721177, p)
+  log(string.format("p13: installed (stub %08x)", E + s))
+end
+-- inside the sim window: foci = list of {x, y, ...} centres in fixed order
+local function p13_step(f, foci)
+  if not P13 then return end
+  local trig = false
+  for i, q in ipairs(foci) do
+    P13.foci[2 * (i - 1)] = q[1]
+    P13.foci[2 * (i - 1) + 1] = q[2]
+    local l = P13.last[i]
+    if not l or (q[1] - l[1]) ^ 2 + (q[2] - l[2]) ^ 2 > 262144 then trig = true end
+  end
+  P13.n[0] = #foci
+  if trig then
+    for i, q in ipairs(foci) do P13.last[i] = { q[1], q[2] } end
+    local q = foci[1]
+    P13.rect[0], P13.rect[1], P13.rect[2], P13.rect[3] = q[1] - 213, q[2] - 120, 427, 240 -- centre unused (patched)
+    P13.freeze(gridworld(), 0, P13.rect)
+    P13.calls = P13.calls + 1
+    log(string.format("p13: freeze pass f=%d n=%d calls=%d", f, #foci, P13.calls))
   end
 end
 function mfsplit_step(f)
   if f == 1 then
     fix_seeds("frame1")
+    if os.getenv("SPIKE_B_NOP13") ~= "1" then install_p13() end
     make_unload_thunk()
     if (os.getenv("SPIKE_B_PROBE") or "") ~= "" then install_probes() end
     rng_sim = rng_save()
     log(string.format("mfsplit: rng=%s simcam=%s", tostring(SPLIT_RNG), tostring(SPLIT_CAM)))
     if os.getenv("SPIKE_B_QTRACE") == "1" then install_qtrace() end
+    if QT and os.getenv("SPIKE_B_FTRACE") == "1" then
+      install_ftrace(0x009bf120, { 0x55, 0x8b, 0xec, 0x51, 0x56 }, 1, 8, "CreateBody")
+      install_ftrace(0x009bf200, { 0x55, 0x8b, 0xec, 0x83, 0xe4, 0xf8 }, 2, 0x18, "DestroyBody")
+    end
   end
   if QT then
     qtrace_dump()
@@ -657,11 +881,15 @@ function mfsplit_step(f)
     ffi.cast("uint32_t*", QT.frame)[0] = f
     qtrace_sizes("pre", f)
   end
+  if f <= BODIES_TO and f >= BODIES_FROM then body_dump("pre", f) end
+  if f <= CHASH_TO or f == CDUMP_F then chunk_trace("pre", f) end
   -- enter sim window
   if SPLIT_RNG then rng_render = rng_save(); rng_load(rng_sim) end
+  if f <= PARTS_TO then parts_dump("pre", f) end
   if f == 2 then GameSetCameraFree(true) end
   if SPLIT_CAM and f >= 2 then GameSetCameraPos(P[1], P[2]) end  -- identical sim camera (player 0)
   for _, q in ipairs(split_foci(f)) do native_focus(q[1], q[2], q[3], q[4]) end
+  p13_step(f, split_foci(f))
   probe_vals[0] = string.format("%08x/%08x", U32(0x0120741c), U32(RAND_STATE))
   local sites = {}
   for i, q in ipairs(split_foci(f)) do sites[i] = { "S" .. i, q[1], q[2] } end
@@ -690,11 +918,29 @@ function mfsplit_step(f)
 end
 function mfsplit_post(f)
   if QT then qtrace_dump() qtrace_sizes("post", f) end
+  if f <= BODIES_TO and f >= BODIES_FROM then body_dump("post", f) end
+  if f <= CHASH_TO or f == CDUMP_F then chunk_trace("post", f) end
+  if f <= PARTS_TO then parts_dump("post", f) end
   if probe_cb then
     local parts = { "0:" .. tostring(probe_vals[0]) }
     for i = 1, #PROBE_SITES do parts[#parts + 1] = i .. ":" .. tostring(probe_vals[i]) end
     parts[#parts + 1] = string.format("99:%08x/%08x", U32(0x0120741c), U32(RAND_STATE))
     if probe_vals.q7 then parts[#parts + 1] = "q7:" .. probe_vals.q7 end
+    if probe_vals.gb5 then parts[#parts + 1] = "gb5:" .. probe_vals.gb5 end
+    local gp = U32(gridworld() + 0x540)
+    if gp ~= 0 and U32(gp + 0x2c) ~= 0 then parts[#parts + 1] = string.format("qs:%g", F32(U32(gp + 0x2c) + 0xa8)) end
+    local w = U32(gridworld() + 0x530)
+    if w ~= 0 then  -- cheap Box2D hash: type, flags, xf, sweep c/a, velocities (+0x08,+0x0c lo16,+0x18..+0x97)
+      local b, H, n = U32(w + 0x1922c), 0x811c9dc5, 0
+      while b ~= 0 and n < 20000 do
+        local p = ffi.cast("uint32_t*", b)
+        H = fnv(fnv(H, p[2]), bit.band(p[3], 0xffff))
+        for k = 6, 37 do H = fnv(H, p[k]) end
+        n = n + 1
+        b = p[46]
+      end
+      parts[#parts + 1] = string.format("bh:%08x/%d", H % 0x100000000, n)
+    end
     log("PR f=" .. f .. " " .. table.concat(parts, " "))
   end
   own_unloader(f)                       -- still inside the sim window

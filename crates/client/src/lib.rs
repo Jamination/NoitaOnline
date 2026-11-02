@@ -414,6 +414,51 @@ pub extern "C" fn no_sim_leave() {
     };
 }
 
+/// Publish the focus centres (n × {x, y} floats, slot order) for physics-body freezing and
+/// trigger the freeze pass when a focus moved far (call inside the simulation window).
+///
+/// # Safety
+/// `xy` must point at `2 * n` readable f32.
+#[no_mangle]
+pub unsafe extern "C" fn no_focus_freeze(xy: *const f32, n: u32) {
+    #[cfg(all(windows, target_arch = "x86"))]
+    {
+        let foci: Vec<(f32, f32)> = (0..n as usize).map(|i| (*xy.add(2 * i), *xy.add(2 * i + 1))).collect();
+        patches::focus_freeze_step(&foci);
+    }
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    let _ = (xy, n);
+}
+
+/// Start-of-frame wait for chunk-generation jobs due for integration this frame (call in
+/// OnWorldPreUpdate, before the simulation). Returns milliseconds waited.
+#[no_mangle]
+pub extern "C" fn no_chunk_prewait() -> u32 {
+    #[cfg(all(windows, target_arch = "x86"))]
+    unsafe {
+        patches::chunk_prewait()
+    }
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    0
+}
+
+/// Chunk-gate statistics: [frames that waited, total wait ms, in-lock fallback waits].
+///
+/// # Safety
+/// `out` must point at 3 writable u32.
+#[no_mangle]
+pub unsafe extern "C" fn no_chunk_stats(out: *mut u32) {
+    #[cfg(all(windows, target_arch = "x86"))]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        *out = patches::CHUNK_WAITS.load(Relaxed);
+        *out.add(1) = patches::CHUNK_WAIT_MS.load(Relaxed);
+        *out.add(2) = patches::CHUNK_GATE_FALLBACKS.load(Relaxed);
+    }
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    std::ptr::write_bytes(out, 0, 3);
+}
+
 static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
 
 fn set_last_error(s: String) {

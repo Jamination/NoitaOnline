@@ -144,53 +144,142 @@ unsafe fn rd(a: u32) -> u32 {
     *(a as *const u32)
 }
 
-/// Number of chunk-generation jobs not yet finished (walks the MSVC std::map red-black tree).
-unsafe fn chunk_jobs_pending() -> u32 {
+/// Every chunk-generation job in the engine's pending map (walks the MSVC std::map
+/// red-black tree): (node key = chunk coordinates, job = node+0x24). Keys, not job
+/// pointers, identify jobs: heap addresses differ between clients.
+unsafe fn chunk_jobs() -> Vec<([u32; 3], u32)> {
     let head = rd(CHUNK_JOB_MAP);
+    let mut jobs = Vec::new();
     if head == 0 {
-        return 0;
+        return jobs;
     }
-    let mut pending = 0;
     let mut stack = vec![rd(head + 4)];
     while let Some(n) = stack.pop() {
         if n == 0 || n == head || *((n + 0xd) as *const u8) != 0 {
             continue;
         }
         let job = rd(n + 0x24);
-        if job != 0 && *((job + 0xc8) as *const i32) != 1 {
-            pending += 1;
+        if job != 0 {
+            jobs.push(([rd(n + 0x10), rd(n + 0x14), rd(n + 0x18)], job));
         }
         stack.push(rd(n));
         stack.push(rd(n + 8));
     }
-    pending
+    jobs
 }
 
-/// Called right before the engine integrates finished chunk jobs: wait until all pending
-/// jobs are finished, so chunks always appear in the frame they were requested.
-extern "C" fn chunk_wait_barrier() {
-    unsafe {
-        if chunk_jobs_pending() == 0 {
-            return;
+unsafe fn job_done(job: u32) -> bool {
+    std::ptr::read_volatile((job + 0xc8) as *const i32) == 1
+}
+
+/// A chunk requested in frame f is integrated exactly in frame f + CHUNK_DELAY_FRAMES, so
+/// generation (on worker threads) overlaps with that many frames of play instead of
+/// stalling the frame that requested it. Integration frames are a function of request
+/// frames only, hence identical on every client.
+const CHUNK_DELAY_FRAMES: u32 = 8;
+
+struct ChunkGate {
+    /// job key -> frame it was first seen in the pending map
+    first_seen: std::collections::HashMap<[u32; 3], u32>,
+    /// finished-but-too-young jobs hidden from this frame's integration
+    hidden: Vec<u32>,
+}
+
+static CHUNK_GATE: std::sync::Mutex<Option<ChunkGate>> = std::sync::Mutex::new(None);
+
+/// Wait (outside any engine lock: call at the start of the frame) until every chunk job
+/// that will be integrated this frame has finished. Waiting inside the grid update could
+/// deadlock against a generation worker that needs a lock the main thread holds there.
+/// Returns the milliseconds spent waiting.
+///
+/// # Safety
+/// Game thread, before the world update of the frame.
+pub unsafe fn chunk_prewait() -> u32 {
+    let gg = rd(GAME_GLOBAL_PTR);
+    if gg == 0 {
+        return 0;
+    }
+    let frame = rd(gg);
+    let jobs = chunk_jobs();
+    let g = CHUNK_GATE.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(gate) = g.as_ref() else { return 0 };
+    let due: Vec<u32> = jobs
+        .iter()
+        .filter(|(k, _)| gate.first_seen.get(k).is_some_and(|&s| frame.wrapping_sub(s) >= CHUNK_DELAY_FRAMES))
+        .map(|&(_, j)| j)
+        .collect();
+    drop(g);
+    let t0 = std::time::Instant::now();
+    let mut waited = false;
+    for job in due {
+        while !job_done(job) && t0.elapsed().as_secs() < 60 {
+            waited = true;
+            Sleep(1);
         }
-        let t0 = std::time::Instant::now();
-        while chunk_jobs_pending() > 0 && t0.elapsed().as_secs() < 30 {
-            Sleep(0);
-        }
+    }
+    let ms = t0.elapsed().as_millis() as u32;
+    if waited {
         CHUNK_WAITS.fetch_add(1, Ordering::Relaxed);
-        CHUNK_WAIT_MS.fetch_add(t0.elapsed().as_millis() as u32, Ordering::Relaxed);
+        CHUNK_WAIT_MS.fetch_add(ms, Ordering::Relaxed);
+    }
+    ms
+}
+
+/// Before the engine integrates finished chunk jobs: jobs old enough are finished (see
+/// [`chunk_prewait`]); finished jobs that are still too young are hidden for this frame.
+extern "C" fn chunk_gate_pre() {
+    unsafe {
+        let gg = rd(GAME_GLOBAL_PTR);
+        let frame = if gg != 0 { rd(gg) } else { 0 };
+        let jobs = chunk_jobs();
+        let mut g = CHUNK_GATE.lock().unwrap_or_else(|p| p.into_inner());
+        let gate = g.get_or_insert_with(|| ChunkGate { first_seen: Default::default(), hidden: Vec::new() });
+        gate.first_seen.retain(|k, _| jobs.iter().any(|(jk, _)| jk == k));
+        for &(key, job) in &jobs {
+            let seen = *gate.first_seen.entry(key).or_insert(frame);
+            if frame.wrapping_sub(seen) >= CHUNK_DELAY_FRAMES {
+                if !job_done(job) {
+                    // Not pre-waited (first frames before the mod's frame hook runs):
+                    // fall back to a bounded wait here.
+                    let t0 = std::time::Instant::now();
+                    while !job_done(job) && t0.elapsed().as_secs() < 5 {
+                        Sleep(1);
+                    }
+                    CHUNK_GATE_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                }
+            } else if job_done(job) {
+                *((job + 0xc8) as *mut i32) = 0;
+                gate.hidden.push(job);
+            }
+        }
+    }
+}
+
+pub static CHUNK_GATE_FALLBACKS: AtomicU32 = AtomicU32::new(0);
+
+/// After integration: un-hide the young finished jobs for later frames.
+extern "C" fn chunk_gate_post() {
+    unsafe {
+        let mut g = CHUNK_GATE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(gate) = g.as_mut() {
+            for job in gate.hidden.drain(..) {
+                *((job + 0xc8) as *mut i32) = 1;
+            }
+        }
     }
 }
 
 unsafe fn patch_chunk_wait(ex: &mut Exec) -> Result<(), PatchError> {
     let orig_rel = rel32(CHUNK_INTEGRATE_CALL + 5, CHUNK_INTEGRATE_FN);
     expect(CHUNK_INTEGRATE_CALL, &[0xE8, orig_rel[0], orig_rel[1], orig_rel[2], orig_rel[3]])?;
-    let cb = (chunk_wait_barrier as extern "C" fn()) as u32;
-    let c = cb.to_le_bytes();
+    let pre = ((chunk_gate_pre as extern "C" fn()) as u32).to_le_bytes();
+    let post = ((chunk_gate_post as extern "C" fn()) as u32).to_le_bytes();
     let stub_at = ex.base + ex.used;
-    // push ecx; mov eax,cb; call eax; pop ecx; jmp FUN_0073d6a0
-    let mut stub = vec![0x51, 0xB8, c[0], c[1], c[2], c[3], 0xFF, 0xD0, 0x59, 0xE9];
+    // push ecx; mov eax,pre; call eax; pop ecx; call FUN_0073d6a0 (fastcall ecx);
+    // mov eax,post; call eax; ret
+    let mut stub = vec![0x51, 0xB8, pre[0], pre[1], pre[2], pre[3], 0xFF, 0xD0, 0x59, 0xE8];
     stub.extend_from_slice(&rel32(stub_at + 14, CHUNK_INTEGRATE_FN));
+    stub.extend_from_slice(&[0xB8, post[0], post[1], post[2], post[3], 0xFF, 0xD0, 0xC3]);
     let at = ex.put(&stub);
     debug_assert_eq!(at, stub_at);
     let mut call = vec![0xE8];
@@ -213,6 +302,45 @@ unsafe fn patch_inline_jobs() -> Result<(), PatchError> {
     write_code(POOL_ASYNC_SITE, &code)
 }
 
+/// Async job submit (FUN_0084c1a0): 0xa0 bytes, rel32 calls at +0x2f and +0x5e.
+const POOL_ASYNC_FN: u32 = 0x0084_c1a0;
+const POOL_ASYNC_LEN: usize = 0xa0;
+const POOL_ASYNC_RELCALLS: [usize; 2] = [0x2f, 0x5e];
+/// The chunk-generation dispatch's call to the async submit (inside FUN_0073c220).
+const CHUNKGEN_SUBMIT_CALL: u32 = 0x0073_c3f1;
+/// Cell constructor's `mov [GLOBAL_LCG],eax`: advances the global RNG for burning
+/// materials, but its result is dead (the burning flag is set either way). Generation
+/// runs it on worker threads, racing the main thread on the global RNG.
+const CELL_CTOR_LCG_STORE: u32 = 0x0070_f4cc;
+
+/// Keep world generation on the engine's worker threads (it is expensive: 17-36 ms per
+/// chunk) while everything else runs inline: chunk jobs get an unpatched copy of the
+/// async submit, and their only shared-RNG write is removed. Integration stays
+/// frame-deterministic through the chunk-wait barrier. Must run before
+/// [`patch_inline_jobs`] (it copies the original submit routine).
+unsafe fn patch_threaded_chunkgen(ex: &mut Exec) -> Result<(), PatchError> {
+    expect(CELL_CTOR_LCG_STORE, &[0xA3, 0x1C, 0x74, 0x20, 0x01])?;
+    let orig_rel = rel32(CHUNKGEN_SUBMIT_CALL + 5, POOL_ASYNC_FN);
+    expect(CHUNKGEN_SUBMIT_CALL, &[0xE8, orig_rel[0], orig_rel[1], orig_rel[2], orig_rel[3]])?;
+    expect(POOL_ASYNC_FN, &[0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x18])?;
+    let mut body = std::slice::from_raw_parts(POOL_ASYNC_FN as *const u8, POOL_ASYNC_LEN).to_vec();
+    let copy_at = ex.base + ex.used;
+    for off in POOL_ASYNC_RELCALLS {
+        if body[off] != 0xE8 {
+            return Err(PatchError(format!("async submit layout changed at +{off:#x}")));
+        }
+        let old_rel = i32::from_le_bytes(body[off + 1..off + 5].try_into().unwrap());
+        let target = (POOL_ASYNC_FN + off as u32 + 5).wrapping_add(old_rel as u32);
+        body[off + 1..off + 5].copy_from_slice(&rel32(copy_at + off as u32 + 5, target));
+    }
+    let at = ex.put(&body);
+    debug_assert_eq!(at, copy_at);
+    let mut call = vec![0xE8];
+    call.extend_from_slice(&rel32(CHUNKGEN_SUBMIT_CALL + 5, at));
+    write_code(CHUNKGEN_SUBMIT_CALL, &call)?;
+    write_code(CELL_CTOR_LCG_STORE, &[0x90; 5])
+}
+
 static APPLIED: AtomicU32 = AtomicU32::new(0);
 
 /// Install all determinism patches (idempotent). Returns the applied-set bitmask.
@@ -227,11 +355,14 @@ pub unsafe fn apply_all() -> Result<u32, PatchError> {
     patch_rand(&mut ex)?;
     patch_stream_clock(&mut ex)?;
     patch_chunk_wait(&mut ex)?;
+    patch_threaded_chunkgen(&mut ex)?;
     patch_inline_jobs()?;
     patch_particle_init()?;
     patch_camera_loads()?;
     patch_fixed_dt(&mut ex)?;
-    let mask = 0b111_1111;
+    patch_focus_freeze(&mut ex)?;
+    patch_cosmetic_particles()?;
+    let mask = 0b11_1111_1111;
     APPLIED.store(mask, Ordering::Relaxed);
     Ok(mask)
 }
@@ -428,4 +559,117 @@ pub unsafe fn sim_rng_leave() {
             r.restore();
         }
     });
+}
+
+/// GridWorld::OnCameraRectChanged's call that freezes/destroys physics bodies far from the
+/// (render!) camera once it moved > 512 px (FUN_007212b0 -> FUN_00721050).
+const CAMERA_FREEZE_CALL: u32 = 0x0072_02a7;
+/// Inside FUN_00721050: 26 bytes computing dist^2(body, camera centre) into XMM2.
+const FREEZE_DIST_SITE: u32 = 0x0072_1177;
+const FREEZE_DIST_ORIG: [u8; 26] = [
+    0x0F, 0x28, 0xD3, 0xF3, 0x0F, 0x5C, 0xD0, 0x0F, 0x28, 0xC4, 0xF3, 0x0F, 0x5C, 0xC1, 0xF3, 0x0F, 0x59, 0xD2,
+    0xF3, 0x0F, 0x59, 0xC0, 0xF3, 0x0F, 0x58, 0xD0,
+];
+/// FUN_00721050(this = GridWorld, rect): far-body freeze pass (thiscall, RET 4).
+const FREEZE_PASS_FN: u32 = 0x0072_1050;
+/// Cosmetic-particle flag computation (`and al,2` imm8) choosing the camera snapshot grid.
+const COSMETIC_PARTICLE_FLAG_IMMS: [u32; 2] = [0x0071_6a10, 0x0071_6c52];
+const MAX_FOCI: usize = 16;
+
+static FREEZE_FOCI_N: AtomicU32 = AtomicU32::new(0);
+static FREEZE_FOCI_ARR: AtomicU32 = AtomicU32::new(0);
+
+/// Body freezing follows the players (foci) instead of each client's render camera: the
+/// camera-triggered pass is removed, the distance test uses the nearest focus, and the
+/// pass is triggered deterministically by [`focus_freeze_step`].
+unsafe fn patch_focus_freeze(ex: &mut Exec) -> Result<(), PatchError> {
+    expect(CAMERA_FREEZE_CALL, &[0xE8, 0x04, 0x10, 0x00, 0x00])?;
+    expect(FREEZE_DIST_SITE, &FREEZE_DIST_ORIG)?;
+    let n = ex.alloc_data(4);
+    let foci = ex.alloc_data((MAX_FOCI * 8) as u32);
+    let save = ex.alloc_data(16);
+    let scratch = ex.alloc_data(4);
+    let (n_, f_, s_, t_) = (n.to_le_bytes(), foci.to_le_bytes(), save.to_le_bytes(), scratch.to_le_bytes());
+    // In: XMM0 = body x, XMM1 = body y. Out: XMM2 = min over foci of dist^2.
+    let mut stub = vec![0x50, 0x51, 0x0F, 0x11, 0x2D];
+    stub.extend_from_slice(&s_); // movups [save], xmm5
+    stub.extend_from_slice(&[0x8B, 0x0D]);
+    stub.extend_from_slice(&n_); // mov ecx, [n]
+    stub.push(0xB8);
+    stub.extend_from_slice(&f_); // mov eax, foci
+    stub.extend_from_slice(&[0xC7, 0x05]);
+    stub.extend_from_slice(&t_);
+    stub.extend_from_slice(&[0xFF, 0xFF, 0x7F, 0x7F]); // mov [scratch], FLT_MAX
+    stub.extend_from_slice(&[0xF3, 0x0F, 0x10, 0x15]);
+    stub.extend_from_slice(&t_); // movss xmm2, [scratch]
+    stub.extend_from_slice(&[0x85, 0xC9, 0x74, 0x33]); // lp: test ecx,ecx; jz done
+    stub.extend_from_slice(&[0xF3, 0x0F, 0x10, 0x28, 0xF3, 0x0F, 0x5C, 0xE8, 0xF3, 0x0F, 0x59, 0xED, 0xF3, 0x0F, 0x11, 0x2D]);
+    stub.extend_from_slice(&t_);
+    stub.extend_from_slice(&[0xF3, 0x0F, 0x10, 0x68, 0x04, 0xF3, 0x0F, 0x5C, 0xE9, 0xF3, 0x0F, 0x59, 0xED, 0xF3, 0x0F, 0x58, 0x2D]);
+    stub.extend_from_slice(&t_);
+    stub.extend_from_slice(&[0xF3, 0x0F, 0x5D, 0xD5, 0x83, 0xC0, 0x08, 0x49, 0xEB, 0xC9, 0x0F, 0x10, 0x2D]);
+    stub.extend_from_slice(&s_); // done: movups xmm5, [save]
+    stub.extend_from_slice(&[0x59, 0x58, 0xC3]);
+    let at = ex.put(&stub);
+    write_code(CAMERA_FREEZE_CALL, &[0x83, 0xC4, 0x04, 0x90, 0x90])?;
+    let mut site = vec![0xE8];
+    site.extend_from_slice(&rel32(FREEZE_DIST_SITE + 5, at));
+    site.extend_from_slice(&[0x90; 21]);
+    write_code(FREEZE_DIST_SITE, &site)?;
+    FREEZE_FOCI_N.store(n, Ordering::Relaxed);
+    FREEZE_FOCI_ARR.store(foci, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Cosmetic particles collide against the real grid instead of a snapshot of the area
+/// around each client's render camera (they become real cells when they land).
+unsafe fn patch_cosmetic_particles() -> Result<(), PatchError> {
+    for imm in COSMETIC_PARTICLE_FLAG_IMMS {
+        expect(imm - 4, &[0x32, 0x46, 0x6A, 0x24, 0x02])?;
+    }
+    for imm in COSMETIC_PARTICLE_FLAG_IMMS {
+        write_code(imm, &[0x00])?;
+    }
+    Ok(())
+}
+
+static FREEZE_LAST: std::sync::Mutex<Vec<(f32, f32)>> = std::sync::Mutex::new(Vec::new());
+
+/// Publish this frame's focus centres (slot order) for the far-body freeze test, and run
+/// the freeze pass whenever a focus moved more than 512 px since the last pass.
+///
+/// # Safety
+/// Game thread, inside the simulation window, world initialised.
+pub unsafe fn focus_freeze_step(foci: &[(f32, f32)]) {
+    let arr = FREEZE_FOCI_ARR.load(Ordering::Relaxed);
+    let n_at = FREEZE_FOCI_N.load(Ordering::Relaxed);
+    if arr == 0 || n_at == 0 {
+        return;
+    }
+    let foci = &foci[..foci.len().min(MAX_FOCI)];
+    for (i, &(x, y)) in foci.iter().enumerate() {
+        *((arr + 8 * i as u32) as *mut f32) = x;
+        *((arr + 8 * i as u32 + 4) as *mut f32) = y;
+    }
+    *(n_at as *mut u32) = foci.len() as u32;
+    let mut last = FREEZE_LAST.lock().unwrap_or_else(|p| p.into_inner());
+    let moved = last.len() != foci.len()
+        || foci.iter().zip(last.iter()).any(|(a, b)| {
+            let (dx, dy) = (a.0 - b.0, a.1 - b.1);
+            dx * dx + dy * dy > 262_144.0
+        });
+    if !moved || foci.is_empty() {
+        return;
+    }
+    *last = foci.to_vec();
+    let gg = rd(GAME_GLOBAL_PTR);
+    let world_data = if gg != 0 { rd(gg + 0x0c) } else { 0 };
+    let grid_world = if world_data != 0 { rd(world_data + 0x44) } else { 0 };
+    if grid_world == 0 {
+        return;
+    }
+    let (x, y) = foci[0];
+    let rect = [x as i32 - 213, y as i32 - 120, 427, 240];
+    let pass: extern "fastcall" fn(u32, u32, *const i32) = std::mem::transmute(FREEZE_PASS_FN as usize);
+    pass(grid_world, 0, rect.as_ptr());
 }

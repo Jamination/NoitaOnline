@@ -201,6 +201,8 @@ function OnWorldPreUpdate()
   NO.lib.no_sim_enter()
   in_sim_window = true
   if f == 1 then NO.lib.no_fix_seeds(session.seed) end
+  local waited = NO.lib.no_chunk_prewait()
+  if waited > 200 then log(string.format("chunk generation wait %d ms at frame %d", waited, f)) end
   if ready then
     local foci = current_foci()
     set_sim_camera(foci)
@@ -224,7 +226,11 @@ function OnWorldPostUpdate()
     if ready and f % 60 == 0 then
       local h, positions = State.collect(Players.proxy)
       local us = NO.report_state(f, h, positions)
-      if f % 600 == 0 or us > 8000 then log(string.format("state report f=%d chunk-hash %.2f ms", f, us / 1000)) end
+      if f % 600 == 0 or us > 8000 then
+        local st = ffi.new("uint32_t[3]")
+        NO.lib.no_chunk_stats(st)
+        log(string.format("state report f=%d chunk-hash %.2f ms; chunk waits %d (%d ms), in-lock fallbacks %d", f, us / 1000, st[0], st[1], st[2]))
+      end
     end
     NO.lib.no_sim_leave()
     in_sim_window = false

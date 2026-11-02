@@ -13,6 +13,8 @@ for n in (os.getenv("SPIKE_DUMP") or ""):gmatch("%d+") do DUMPS[tonumber(n)] = t
 local SLEEP = tonumber(os.getenv("SPIKE_SLEEP") or "150")
 local SLEEP_FRAMES = tonumber(os.getenv("SPIKE_SLEEP_FRAMES") or "300")
 local PERF = os.getenv("SPIKE_PERF") == "1"
+local PROBE = tonumber(os.getenv("SPIKE_PROBE") or "0")
+local TPROBE = os.getenv("SPIKE_TPROBE") == "1" and dofile("mods/spike_a/files/threadprobe.lua") or nil
 local HASH_EVERY_UNTIL = tonumber(os.getenv("SPIKE_EVERY") or "120")
 local HASH_FROM = tonumber(os.getenv("SPIKE_FROM") or "1")
 local PD_FROM, PD_TO = (os.getenv("SPIKE_PDUMP") or ""):match("(%d+)-(%d+)")
@@ -284,6 +286,8 @@ function OnPlayerSpawned(player)
   local controls = EntityGetFirstComponentIncludingDisabled(player, "ControlsComponent")
   if controls then ComponentSetValue2(controls, "enabled", false) end
   log("spawned frame=" .. GameGetFrameNum() .. " player=" .. player .. " " .. globals_str())
+  log(string.format("magic BOX2D_THREAD_MAX_WAIT_IN_MS@01153288=%f FREEZE_STUCK@011532f4=%d tickscale@01207138=%.9g",
+    ffi.cast("float*", 0x01153288)[0], ffi.cast("uint8_t*", 0x011532f4)[0], ffi.cast("double*", 0x01207138)[0]))
 end
 
 -- SPIKE_STRESS=1: deterministic heavy activity (liquids/powders across tile borders, enemies, bombs, explosive props)
@@ -445,6 +449,42 @@ function OnWorldPostUpdate()
     end
   end
   local f = GameGetFrameNum()
+  if TPROBE then
+    if f == 30 or f % 300 == 0 then TPROBE.refresh() end
+    if f >= 30 then TPROBE.sample() end
+    if f % 600 == 0 or f == DONE_AT then TPROBE.report(log) log("TPEND " .. f) end
+  end
+  if PROBE > 0 then
+    -- cheap per-frame probes (first diverging frame + subsystem); PROBE>=2 adds the exact entity hash
+    local ne = #EntityGetInRadius(0, 0, 100000000)
+    local ex = 0
+    if PROBE >= 2 then ex = entity_hash_exact() end
+    local gw = grid_world()
+    local gp = gw and rdp(gw + 0x540) or 0
+    local n1, n3, n4 = 0, 0, 0
+    if gp ~= 0 then
+      n1 = (rd32(gp + 0x38) - rd32(gp + 0x34)) / 0x70
+      n3 = (rd32(gp + 0x50) - rd32(gp + 0x4c)) / 0x70
+      n4 = (rd32(gp + 0xa0) - rd32(gp + 0x9c)) / 0x18
+    end
+    local pr = ffi.cast("uint32_t*", 0x01222388)
+    -- physics bridge P=[GridWorld+0x530]: node list at P+0x1922c (next +0xb8); step wall time (ms, double) P+0x19270
+    local pn, ph, pms = 0, 0x811c9dc5, -1
+    local pb = gw and rdp(gw + 0x530) or 0
+    if pb ~= 0 then
+      pms = ffi.cast("double*", pb + 0x19270)[0]
+      local nd = rd32(pb + 0x1922c)
+      while nd ~= 0 and pn < 100000 do
+        local q = ffi.cast("uint32_t*", nd)
+        ph = fnv(fnv(fnv(ph, q[0]), bit.band(q[1], 0xff)), q[2] ~= 0 and 1 or 0)
+        pn = pn + 1
+        nd = q[0x2e]
+      end
+    end
+    log(string.format("P %d %d g=%08x p=%08x%08x r=%08x/%d ne=%d np=%d/%d/%d ex=%08x pl=%d:%08x t_phys=%.2f", f, lf,
+      rd32(GLOBAL_LCG), pr[1], pr[0], rd32(RAND_STATE), rd32(RAND_COUNT), ne, n1, n3, n4, ex, pn, bit.tobit(ph) % 0x100000000,
+      pms))
+  end
   if f % 60 == 0 and f <= POST_UNTIL then
     local nc, wh, parts = world_hash(nil)
     local ne, eh = entity_hash()
@@ -453,6 +493,7 @@ function OnWorldPostUpdate()
       wh % 0x100000000, ne, eh % 0x100000000, nu, uh, lf, globals_str()))
     log("  " .. table.concat(parts, " "))
     log("  U " .. us)
+    log(string.format("T %d %.0f", f, tpost))
     if f == DONE_AT then log("DONE") end
   end
 end
