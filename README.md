@@ -81,11 +81,16 @@ harness/evaluate.py --run run/e2e/full --baseline run/e2e/baseline --netsim-run 
 - Lockstep: a session starts with all players present; players cannot join mid-session.
   A player who leaves or dies becomes a frozen spectator. Starting a new game ends that
   client's session (restart Noita to join another).
-- The vanilla inventory screen pauses the game and is not synchronised; the mod's own
-  wand editor (inventory key) edits wands and spells through lockstep commands.
+- Noita's own inventory GUI (HUD, quick bar, inventory screen, pickup prompts) runs for
+  each player on their own client; its edits travel through lockstep, so they take effect
+  after the input delay. The inventory screen and the full-inventory "replace which item"
+  screen do not pause the world for the other players (your character stands still while
+  one is open).
 - Pausing (escape menu) stalls every client: lockstep advances only with all inputs.
-- Cosmetic material sparkles (over magic liquids, acid, lava) are not drawn, and the
-  free camera does not move on its own; see [determinism](docs/determinism.md).
+- The free camera does not move on its own; see [determinism](docs/determinism.md).
+- Camera-relative engine behaviour (on-screen particles, rain, CameraBound enemies) is
+  evaluated around every player's view, modelled from the player's position plus a
+  64 px margin for the vanilla camera's look-ahead.
 - Every client simulates every player, so a client's CPU load grows with the player count.
 - Only the Noita build of 2025-01-25 (PE timestamp `0x6794ee3c`) is supported; the
   runtime verifies every patched instruction and refuses to run on another build.

@@ -43,7 +43,16 @@ void no_sim_leave(void);
 uint32_t no_chunk_prewait(void);
 void no_chunk_stats(uint32_t* out);
 void no_focus_freeze(const float* xy, uint32_t n);
+void no_local_view(int32_t i);
 void no_set_sim_camera(float x, float y);
+void no_gui_set_local(uint32_t entity_id);
+int32_t no_gui_update(void);
+int32_t no_gui_swap_update(void);
+int32_t no_gui_take_ops(uint8_t* out, uint32_t cap);
+int32_t no_gui_apply(uint32_t owner_id, const uint8_t* data, uint32_t len);
+void no_slots_set(const uint32_t* ids, uint32_t n, int32_t local, uint32_t proxy_id);
+uint32_t no_slots_get(uint32_t* out, uint32_t cap);
+int32_t no_slots_install(void);
 ]])
 
 local M = {}
@@ -114,6 +123,33 @@ end
 
 function M.send_input(frame, s)
   return lib.no_send_input(frame, s, #s)
+end
+
+local ops_buf = ffi.new("uint8_t[4096]")
+-- Noita's inventory GUI: the simulation changes it made since the last call, as op bytes
+-- (dropped, with "" returned, in the impossible case that they exceed the buffer).
+function M.gui_take_ops()
+  local n = lib.no_gui_take_ops(ops_buf, 4096)
+  if n <= 0 then return "" end
+  return ffi.string(ops_buf, n)
+end
+
+local slot_buf = ffi.new("uint32_t[32]")
+-- Player slots (see crates/client/src/slots.rs): register the slot entities (slot order),
+-- this client's slot index (0-based, -1: none) and its input proxy (0: none).
+function M.slots_set(ids, local_index, proxy)
+  local n = math.min(#ids, 32)
+  for i = 1, n do slot_buf[i - 1] = ids[i] end
+  lib.no_slots_set(slot_buf, n, local_index, proxy or 0)
+end
+
+-- Current entity id of every slot, in slot order (they change when a player is polymorphed
+-- and back).
+function M.slots_get()
+  local n = lib.no_slots_get(slot_buf, 32)
+  local out = {}
+  for i = 1, n do out[i] = slot_buf[i - 1] end
+  return out
 end
 
 local pos_buf = ffi.new("no_entity_pos_t[4096]")

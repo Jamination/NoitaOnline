@@ -296,10 +296,12 @@ fn run(shared: Arc<Shared>, mut client: Client, p: ConnectParams) {
                     }
                 }
                 ServerMsg::PlayerLeft { player } => s.events.push_back(format!("left: {player}")),
-                ServerMsg::Pong { t } => {
+                // t = 0: the server's round-trip probe in the lobby, not an answer to our ping.
+                ServerMsg::Pong { t } if t != 0 => {
                     let rtt = client.now_us().saturating_sub(t);
                     shared.rtt_us.store(rtt, Ordering::Relaxed);
                 }
+                ServerMsg::Pong { .. } => {}
                 ServerMsg::Kick { reason } => {
                     s.events.push_back(format!("kicked: {reason}"));
                     s.disconnect_reason = Some(reason);

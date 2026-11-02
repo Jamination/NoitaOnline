@@ -188,6 +188,9 @@ fn run(args: Args) -> std::io::Result<()> {
     let mut ticks_sent: u64 = 0;
     let mut had_session = false;
     let mut expected_mods: Option<u64> = None;
+    // Lobby round-trip measurement before a start: (since, each ready client's sample count then).
+    let mut rtt_settle: Option<(Instant, BTreeMap<u8, u32>)> = None;
+    let mut last_rtt_probe = Instant::now();
 
     loop {
         server.update();
@@ -314,27 +317,58 @@ fn run(args: Args) -> std::io::Result<()> {
             }
         }
 
-        // Lobby -> running once enough players said hello.
+        // Lobby -> running once enough players said hello and their round trips are measured.
         if matches!(phase, Phase::Lobby) {
             let ready: Vec<u8> = players.iter().filter(|(_, p)| p.hello).map(|(i, _)| *i).collect();
-            if ready.len() >= args.players as usize {
-                // Noita parses WORLD_SEED as a signed 32-bit int: keep it in 1..=i32::MAX.
-                let seed = args.seed.unwrap_or_else(|| (rudp_random() % i32::MAX as u64) as u32 + 1);
-                let session_id = rudp_random();
-                let roster: Vec<(u8, String)> = ready.iter().map(|i| (*i, players[i].name.clone())).collect();
-                let max_rtt = ready.iter().filter_map(|i| server.connection(*i as u16)).map(|c| c.rtt_us()).max().unwrap_or(0);
-                let input_delay = args.input_delay.unwrap_or_else(|| auto_input_delay(max_rtt));
-                // Shared calendar for date/time-dependent content (weather, holidays).
-                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-                let params = format!("scenario={};time={}", args.scenario, now).into_bytes();
-                let start = ServerMsg::Start { seed, players: roster.clone(), input_delay, session_id, params };
-                let _ = server.broadcast(CH_RELIABLE, &start.encode());
-                logs.event(&format!(
-                    "session {session_id:016x} started: seed={seed} input_delay={input_delay} (max rtt {} ms) players={roster:?}",
-                    max_rtt / 1000
-                ));
-                phase = Phase::Running { relay: lockstep::Relay::new(ready, input_delay as u32), started: Instant::now(), session_id, seed };
-                had_session = true;
+            if ready.len() < args.players as usize {
+                rtt_settle = None;
+            } else {
+                // The auto input delay needs each link's round trip. Samples taken while a
+                // client was still loading the game carry its scheduling delays, so the
+                // server probes every ready client a few times (Pong{t: 0}, acked like any
+                // message) and uses each link's fastest sample.
+                let now = Instant::now();
+                let (since, base) = rtt_settle.get_or_insert_with(|| {
+                    let base = ready.iter().map(|i| (*i, server.connection(*i as u16).map_or(0, |c| c.rtt_samples()))).collect();
+                    (now, base)
+                });
+                let measured = args.input_delay.is_some()
+                    || ready.iter().all(|i| {
+                        server.connection(*i as u16).is_none_or(|c| c.rtt_samples() >= base.get(i).copied().unwrap_or(0) + RTT_PROBES)
+                    });
+                if !measured && now.duration_since(*since) < RTT_SETTLE_MAX {
+                    if now.duration_since(last_rtt_probe) >= RTT_PROBE_EVERY {
+                        for i in &ready {
+                            let _ = server.send(*i as u16, CH_UNRELIABLE, &ServerMsg::Pong { t: 0 }.encode());
+                        }
+                        server.flush();
+                        last_rtt_probe = now;
+                    }
+                } else {
+                    rtt_settle = None;
+                    // Noita parses WORLD_SEED as a signed 32-bit int: keep it in 1..=i32::MAX.
+                    let seed = args.seed.unwrap_or_else(|| (rudp_random() % i32::MAX as u64) as u32 + 1);
+                    let session_id = rudp_random();
+                    let roster: Vec<(u8, String)> = ready.iter().map(|i| (*i, players[i].name.clone())).collect();
+                    let max_rtt = ready
+                        .iter()
+                        .filter_map(|i| server.connection(*i as u16))
+                        .map(|c| if c.rtt_samples() > 0 { c.rtt_min_us() } else { c.rtt_us() })
+                        .max()
+                        .unwrap_or(0);
+                    let input_delay = args.input_delay.unwrap_or_else(|| auto_input_delay(max_rtt));
+                    // Shared calendar for date/time-dependent content (weather, holidays).
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                    let params = format!("scenario={};time={}", args.scenario, now).into_bytes();
+                    let start = ServerMsg::Start { seed, players: roster.clone(), input_delay, session_id, params };
+                    let _ = server.broadcast(CH_RELIABLE, &start.encode());
+                    logs.event(&format!(
+                        "session {session_id:016x} started: seed={seed} input_delay={input_delay} (max rtt {} us) players={roster:?}",
+                        max_rtt
+                    ));
+                    phase = Phase::Running { relay: lockstep::Relay::new(ready, input_delay as u32), started: Instant::now(), session_id, seed };
+                    had_session = true;
+                }
             }
         }
 
@@ -487,9 +521,17 @@ fn rudp_random() -> u64 {
     h.finish()
 }
 
+/// Lobby round-trip measurement: probes per ready client, their interval, and the longest
+/// the start waits for them.
+const RTT_PROBES: u32 = 8;
+const RTT_PROBE_EVERY: Duration = Duration::from_millis(25);
+const RTT_SETTLE_MAX: Duration = Duration::from_secs(2);
+
 /// Frames of input delay that hide a full input round trip (client -> server -> clients)
-/// at `rtt_us`, plus headroom for jitter and one lost stream datagram.
+/// at `rtt_us` (a link's fastest round trip), plus one frame for the clients' frame phases
+/// differing and one for a lost stream datagram or jitter (the next datagram, one frame
+/// later, repeats it). On localhost or a LAN that is 3 frames.
 fn auto_input_delay(rtt_us: u64) -> u16 {
     const FRAME_US: u64 = 16_667;
-    (rtt_us.div_ceil(FRAME_US) + 3).clamp(2, 60) as u16
+    (rtt_us.div_ceil(FRAME_US) + 2).clamp(2, 60) as u16
 }

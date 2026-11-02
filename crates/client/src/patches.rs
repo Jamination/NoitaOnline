@@ -45,7 +45,7 @@ const POOL_SLOT_RUNNER: u32 = 0x0084_c430;
 #[derive(Debug)]
 pub struct PatchError(pub String);
 
-unsafe fn write_code(addr: u32, bytes: &[u8]) -> Result<(), PatchError> {
+pub(crate) unsafe fn write_code(addr: u32, bytes: &[u8]) -> Result<(), PatchError> {
     let p = addr as *mut u8;
     let mut old = 0u32;
     if VirtualProtect(p, bytes.len(), PAGE_EXECUTE_READWRITE, &mut old) == 0 {
@@ -57,7 +57,7 @@ unsafe fn write_code(addr: u32, bytes: &[u8]) -> Result<(), PatchError> {
     Ok(())
 }
 
-unsafe fn expect(addr: u32, bytes: &[u8]) -> Result<(), PatchError> {
+pub(crate) unsafe fn expect(addr: u32, bytes: &[u8]) -> Result<(), PatchError> {
     let have = std::slice::from_raw_parts(addr as *const u8, bytes.len());
     if have != bytes {
         return Err(PatchError(format!("unexpected bytes at {addr:08x}: {have:02x?} (want {bytes:02x?}); unsupported Noita build?")));
@@ -65,32 +65,36 @@ unsafe fn expect(addr: u32, bytes: &[u8]) -> Result<(), PatchError> {
     Ok(())
 }
 
-fn rel32(from_end: u32, to: u32) -> [u8; 4] {
+pub(crate) fn rel32(from_end: u32, to: u32) -> [u8; 4] {
     to.wrapping_sub(from_end).to_le_bytes()
 }
 
-/// Executable scratch page holding our stubs and their data.
-struct Exec {
+const EXEC_SIZE: usize = 0x10000;
+
+/// Executable scratch area holding our stubs and their data.
+pub(crate) struct Exec {
     base: u32,
     used: u32,
 }
 
 impl Exec {
-    unsafe fn new() -> Result<Self, PatchError> {
-        let p = VirtualAlloc(std::ptr::null_mut(), 4096, MEM_COMMIT_RESERVE, PAGE_EXECUTE_READWRITE);
+    pub(crate) unsafe fn new() -> Result<Self, PatchError> {
+        let p = VirtualAlloc(std::ptr::null_mut(), EXEC_SIZE, MEM_COMMIT_RESERVE, PAGE_EXECUTE_READWRITE);
         if p.is_null() {
             return Err(PatchError("VirtualAlloc failed".into()));
         }
         Ok(Self { base: p as u32, used: 0 })
     }
-    unsafe fn put(&mut self, bytes: &[u8]) -> u32 {
+    pub(crate) unsafe fn put(&mut self, bytes: &[u8]) -> u32 {
         let at = self.base + self.used;
+        assert!(self.used as usize + bytes.len() <= EXEC_SIZE, "patch stub area full");
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len());
         self.used = (self.used + bytes.len() as u32 + 15) & !15;
         at
     }
-    unsafe fn alloc_data(&mut self, size: u32) -> u32 {
+    pub(crate) unsafe fn alloc_data(&mut self, size: u32) -> u32 {
         let at = self.base + self.used;
+        assert!(self.used as usize + size as usize <= EXEC_SIZE, "patch stub area full");
         std::ptr::write_bytes(at as *mut u8, 0, size as usize);
         self.used = (self.used + size + 15) & !15;
         at
@@ -141,7 +145,7 @@ unsafe fn patch_stream_clock(ex: &mut Exec) -> Result<(), PatchError> {
     Ok(())
 }
 
-unsafe fn rd(a: u32) -> u32 {
+pub(crate) unsafe fn rd(a: u32) -> u32 {
     *(a as *const u32)
 }
 
@@ -372,15 +376,144 @@ unsafe fn redirect_call(site: u32, orig: u32, new_target: u32) -> Result<(), Pat
 
 /// Keep world generation on the engine's worker threads (it is expensive: 17-36 ms per
 /// chunk) while everything else runs inline: chunk jobs get an unpatched copy of the
-/// async submit, and their only shared-RNG write is removed. Integration stays
-/// frame-deterministic through the chunk-wait barrier. Must run before
-/// [`patch_inline_jobs`] (it copies the original submit routine).
+/// async submit, and their only global-LCG write is removed. Integration stays
+/// frame-deterministic through the chunk-wait barrier. Each job runs through
+/// [`chunk_job_stub`], which gives it its own cell RNG stream ([`patch_chunk_rng`]). Must run
+/// before [`patch_inline_jobs`] (it copies the original submit routine).
 unsafe fn patch_threaded_chunkgen(ex: &mut Exec) -> Result<(), PatchError> {
     expect(CELL_CTOR_LCG_STORE, &[0xA3, 0x1C, 0x74, 0x20, 0x01])?;
     expect(POOL_ASYNC_FN, &[0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x18])?;
+    let job_jmp = rel32(CHUNK_JOB_JMP + 5, CHUNK_JOB_FN);
+    expect(CHUNK_JOB_JMP, &[0xE9, job_jmp[0], job_jmp[1], job_jmp[2], job_jmp[3]])?;
     let copy = copy_function(ex, POOL_ASYNC_FN, POOL_ASYNC_LEN, &POOL_ASYNC_RELCALLS)?;
     redirect_call(CHUNKGEN_SUBMIT_CALL, POOL_ASYNC_FN, copy)?;
-    write_code(CELL_CTOR_LCG_STORE, &[0x90; 5])
+    write_code(CELL_CTOR_LCG_STORE, &[0x90; 5])?;
+    let stub = chunk_job_stub(ex);
+    let mut jmp = vec![0xE9];
+    jmp.extend_from_slice(&rel32(CHUNK_JOB_JMP + 5, stub));
+    write_code(CHUNK_JOB_JMP, &jmp)
+}
+
+/// The chunk job (lambda call `FUN_009a4f50`: `mov ecx,[ecx+4]; jmp FUN_0073b040`) generates
+/// a chunk, or loads it from the save, into the job's buffer (`FUN_0073b040`, ECX = job;
+/// job+0x58/+0x5c = chunk x, y; job+0x74 = the world it builds cells with).
+const CHUNK_JOB_JMP: u32 = 0x009a_4f53;
+const CHUNK_JOB_FN: u32 = 0x0073_b040;
+
+thread_local! {
+    /// The cell RNG state of the chunk job running on this thread, if any ([`patch_chunk_rng`]).
+    static CHUNK_JOB_RNG: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Session seed (set by [`fix_seeds`]): salt of the chunk jobs' cell RNG streams.
+static SESSION_SEED: AtomicU32 = AtomicU32::new(0);
+
+/// Job entry (ECX = job): `push ecx; push ecx; call chunk_job_begin; add esp,4; pop ecx;
+/// call FUN_0073b040; call chunk_job_end; ret`.
+unsafe fn chunk_job_stub(ex: &mut Exec) -> u32 {
+    let begin = ((chunk_job_begin as extern "C" fn(u32)) as u32).to_le_bytes();
+    let end = ((chunk_job_end as extern "C" fn()) as u32).to_le_bytes();
+    let job = CHUNK_JOB_FN.to_le_bytes();
+    ex.put(&[
+        0x51, 0x51, 0xB8, begin[0], begin[1], begin[2], begin[3], 0xFF, 0xD0, 0x83, 0xC4, 0x04, 0x59, // begin(job)
+        0xB8, job[0], job[1], job[2], job[3], 0xFF, 0xD0, // FUN_0073b040(job)
+        0xB8, end[0], end[1], end[2], end[3], 0xFF, 0xD0, 0xC3, // end()
+    ])
+}
+
+/// A chunk job starts on this thread: its cell RNG stream starts from the session seed and
+/// the chunk's coordinates, the same on every client and every time the chunk is built.
+extern "C" fn chunk_job_begin(job: u32) {
+    let (cx, cy) = unsafe { (rd(job + 0x58), rd(job + 0x5c)) };
+    let seed = SESSION_SEED.load(Ordering::Relaxed) ^ cx.wrapping_mul(0x9e37_79b1) ^ cy.wrapping_mul(0x85eb_ca77);
+    let _ = CHUNK_JOB_RNG.try_with(|r| r.set(Some(seed)));
+    chunk_job_delay();
+}
+
+extern "C" fn chunk_job_end() {
+    let _ = CHUNK_JOB_RNG.try_with(|r| r.set(None));
+}
+
+/// Diagnostics: `NOITA_ONLINE_CHUNKJOB_DELAY=<instance>:<ms>` delays the start of every chunk
+/// job on that instance by ms, as a stand-in for a slower or busier machine (the chunk-wait
+/// barrier keeps their integration on the same frame).
+fn chunk_job_delay() {
+    static MS: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        let v = std::env::var("NOITA_ONLINE_CHUNKJOB_DELAY").unwrap_or_default();
+        let inst = std::env::var("NOITA_ONLINE_INSTANCE").unwrap_or_default();
+        v.split_once(':').filter(|(i, _)| *i == inst).and_then(|(_, ms)| ms.parse().ok()).unwrap_or(0)
+    });
+    if *MS > 0 {
+        unsafe { Sleep(*MS) };
+    }
+}
+
+/// Cell constructors' draws on the RNG of the world they are given (`imul eax,[reg+4],0x343fd;
+/// add eax,0x269ec3; mov [reg+4],eax`, reg = the world): (site, ModRM of `[reg+4]`, whether
+/// `mov ecx,esi; neg ecx; sub esi,ecx; inc esi` sits between the imul and the add).
+const CELL_RNG_SITES: [(u32, u8, bool); 4] = [
+    (0x0070_a4ee, 0x43, false), // CGasCell (FUN_0070a4a0): rising flag, EBX = world
+    (0x0070_a538, 0x43, true),  // CGasCell: lifetime jitter
+    (0x0070_9f50, 0x41, false), // CFireCell (FUN_00709ef0): lifetime, ECX = world
+    (0x0070_aed7, 0x43, true),  // CLiquidCell (FUN_0070ae10): lifetime jitter
+];
+const CELL_RNG_BETWEEN: [u8; 7] = [0x8B, 0xCE, 0xF7, 0xD9, 0x2B, 0xF1, 0x46];
+
+/// Chunk jobs build cells with the real GridWorld (job+0x74), so the gas, fire and
+/// lifetime-liquid constructors drew the GridWorld RNG (+4) on a worker thread while the
+/// simulation drew it on the game thread (cells created by particles, explosions, reactions).
+/// Which draws each side got depended on thread timing: loaded and generated gas, fire and
+/// liquid cells got client-specific flags and lifetimes (invisible to the material hash until
+/// they moved or expired differently), and the simulation's own cells got client-specific
+/// values. Now a constructor running inside a chunk job draws that job's own stream
+/// ([`chunk_job_begin`]); everywhere else (game thread, grid tiles with their own RNG) it
+/// draws the world it is given, as before.
+unsafe fn patch_chunk_rng(ex: &mut Exec) -> Result<(), PatchError> {
+    let original = |modrm: u8, between: bool| {
+        let mut b = vec![0x69, modrm, 0x04, 0xFD, 0x43, 0x03, 0x00];
+        if between {
+            b.extend_from_slice(&CELL_RNG_BETWEEN);
+        }
+        b.extend_from_slice(&[0x05, 0xC3, 0x9E, 0x26, 0x00, 0x89, modrm, 0x04]);
+        b
+    };
+    for (site, modrm, between) in CELL_RNG_SITES {
+        expect(site, &original(modrm, between))?;
+    }
+    // EAX = &state -> EAX = the new state; ECX/EDX preserved: push ecx; push edx; push eax;
+    // call cell_rng_draw; add esp,4; pop edx; pop ecx; ret
+    let f = ((cell_rng_draw as extern "C" fn(*mut u32) -> u32) as u32).to_le_bytes();
+    let stub = ex.put(&[0x51, 0x52, 0x50, 0xB8, f[0], f[1], f[2], f[3], 0xFF, 0xD0, 0x83, 0xC4, 0x04, 0x5A, 0x59, 0xC3]);
+    for (site, modrm, between) in CELL_RNG_SITES {
+        // lea eax,[reg+4]; call stub; (the moved instructions); nop padding
+        let mut code = vec![0x8D, modrm, 0x04, 0xE8];
+        code.extend_from_slice(&rel32(site + 8, stub));
+        if between {
+            code.extend_from_slice(&CELL_RNG_BETWEEN);
+        }
+        code.resize(original(modrm, between).len(), 0x90);
+        write_code(site, &code)?;
+    }
+    Ok(())
+}
+
+/// One step of the world RNG at `state`, or of this thread's chunk-job stream while a chunk
+/// job runs on it.
+extern "C" fn cell_rng_draw(state: *mut u32) -> u32 {
+    let step = |s: u32| s.wrapping_mul(0x343fd).wrapping_add(0x269ec3);
+    let job = CHUNK_JOB_RNG.try_with(|r| {
+        let n = step(r.get()?);
+        r.set(Some(n));
+        Some(n)
+    });
+    if let Ok(Some(n)) = job {
+        return n;
+    }
+    unsafe {
+        let n = step(*state);
+        *state = n;
+        n
+    }
 }
 
 /// Group job submit (FUN_0084c240): 0xd4 bytes, rel32 calls at +0x64 and +0x92.
@@ -469,28 +602,30 @@ unsafe fn join_render_tiles() {
     }
 }
 
+/// Number of installed patches + 1 (0 = not installed yet).
 static APPLIED: AtomicU32 = AtomicU32::new(0);
 
-/// Install all determinism patches (idempotent). Returns the applied-set bitmask (bit i =
-/// patch i of [`PATCHES`]). For experiments, `NOITA_ONLINE_PATCH_OFF=name,name` skips
-/// patches by name (never set in normal play: every patch is needed for determinism).
+/// Install all determinism patches (idempotent). Returns the number of [`PATCHES`] rows
+/// installed. For experiments, `NOITA_ONLINE_PATCH_OFF=name,name` skips patches by name
+/// (never set in normal play: every patch is needed for determinism).
 ///
 /// # Safety
 /// Must run inside noita.exe build 0x6794ee3c, on the game thread, before the world exists.
 pub unsafe fn apply_all() -> Result<u32, PatchError> {
-    if APPLIED.load(Ordering::Relaxed) != 0 {
-        return Ok(APPLIED.load(Ordering::Relaxed) & !(1 << 31));
+    let done = APPLIED.load(Ordering::Relaxed);
+    if done != 0 {
+        return Ok(done - 1);
     }
     let off = std::env::var("NOITA_ONLINE_PATCH_OFF").unwrap_or_default();
     let skip = |name: &str| off.split(',').any(|s| s.trim() == name);
     let mut ex = Exec::new()?;
-    let mut mask = 0u32;
-    for (i, (name, patch)) in PATCHES.iter().enumerate() {
+    let mut count = 0u32;
+    for (name, patch) in PATCHES {
         if skip(name) {
             continue;
         }
         patch(&mut ex).map_err(|e| PatchError(format!("{name}: {}", e.0)))?;
-        mask |= 1 << i;
+        count += 1;
     }
     if std::env::var_os("NOITA_ONLINE_PTRACE").is_some() {
         install_particle_trace(&mut ex)?;
@@ -498,8 +633,8 @@ pub unsafe fn apply_all() -> Result<u32, PatchError> {
     if std::env::var_os("NOITA_ONLINE_PROF").is_some() {
         install_job_profiler(&mut ex)?;
     }
-    APPLIED.store(mask | 1 << 31, Ordering::Relaxed);
-    Ok(mask)
+    APPLIED.store(count + 1, Ordering::Relaxed);
+    Ok(count)
 }
 
 /// Job-pool submit routines profiled by [`install_job_profiler`]: (entry, 6-byte prologue,
@@ -784,9 +919,10 @@ extern "C" fn particle_trace(tag: u32, regs: *const u32) {
         let mut ebp = *regs.add(2);
         let gp = *regs.add(6);
         let what = if tag == 8 {
-            // Stains overlay (SpriteStains+0x20, or +0x00 with `ragdoll_stains`): both images
+            // Stains overlay (SpriteStains+0x20 in vanilla, the blur scratch with
+            // `ragdoll_stains`): the stain colours and the render's blurred copy
             let p = rd(esp + 0x24);
-            let base = if p == 0 || RAGDOLL_STAINS_ON.load(Ordering::Relaxed) { p } else { p - 0x20 };
+            let base = if p == 0 { 0 } else { crate::ragdoll::stains_of(p).unwrap_or(p - 0x20) };
             let ((w, h, a), (_, _, b)) = if base != 0 { (image_hash(base), image_hash(base + 0x20)) } else { ((0, 0, 0), (0, 0, 0)) };
             format!("ragdoll stains={w}x{h} colours={a:08x} blurred={b:08x} overlay={:08x}", if p == 0 { 0 } else { image_hash(p).2 })
         } else if tag == 9 {
@@ -902,6 +1038,7 @@ const PATCHES: &[(&str, PatchFn)] = &[
     ("streamclock", patch_stream_clock),
     ("chunkwait", patch_chunk_wait),
     ("threaded_chunkgen", patch_threaded_chunkgen),
+    ("chunk_rng", patch_chunk_rng),
     ("threaded_grid", patch_threaded_grid),
     ("threaded_render", patch_threaded_render),
     ("threaded_pathfinding", patch_threaded_pathfinding),
@@ -911,17 +1048,38 @@ const PATCHES: &[(&str, PatchFn)] = &[
     ("camera_loads", |_| unsafe { patch_camera_loads() }),
     ("fixed_dt", patch_fixed_dt),
     ("focus_freeze", patch_focus_freeze),
-    ("cosmetic_particles", |_| unsafe { patch_cosmetic_particles() }),
+    ("particle_views", |ex| unsafe { crate::cosmetic::patch_particle_views(ex) }),
+    ("camera_bound", |ex| unsafe { crate::cambound::patch_camera_bound(ex) }),
     ("clock", |_| unsafe { crate::clock::install(write_code) }),
     ("early_window", patch_early_window),
     ("freecam_static", |_| unsafe { patch_freecam_static() }),
     ("cell_flash", patch_cell_flash),
-    ("cell_emitters", |_| unsafe { patch_cell_emitters() }),
-    ("box2d_freeze", |_| unsafe { patch_box2d_freeze() }),
+    ("cell_emitters", |ex| unsafe { crate::cosmetic::patch_cell_emitters(ex) }),
+    ("rain_views", |ex| unsafe { crate::cosmetic::patch_rain(ex) }),
+    ("box2d_freeze", patch_box2d_freeze),
     ("free_solids_order", patch_free_solids_order),
     ("pathfinding_refresh", patch_pathfinding_refresh),
-    ("ragdoll_stains", |_| unsafe { patch_ragdoll_stains() }),
+    ("ragdoll_stains", |ex| unsafe { crate::ragdoll::patch_ragdoll_stains_blur(ex) }),
     ("platform_frame", |_| unsafe { patch_platform_frame() }),
+    ("inventory_gui", |ex| unsafe { crate::invgui::install(ex) }),
+    ("analog_fly_rng", |_| unsafe { patch_analog_fly_rng() }),
+    ("grid_cap", |ex| unsafe { crate::gridcap::patch_grid_cap(ex) }),
+    ("sprite_events", |ex| unsafe { crate::camreaders::patch_sprite_events(ex) }),
+    ("ai_camera", |ex| unsafe { crate::camreaders::patch_animal_ai(ex) }),
+    ("pf_jump", |ex| unsafe { crate::camreaders::patch_pathfinding_jump(ex) }),
+    ("char_effects", |ex| unsafe { crate::camreaders::patch_character_effects(ex) }),
+    ("worm_bursts", |ex| unsafe { crate::camreaders::patch_worm_bursts(ex) }),
+    ("camera_edge", |ex| unsafe { crate::camreaders::patch_camera_edge(ex) }),
+    ("verlet_cull", |ex| unsafe { crate::camreaders::patch_verlet_cull(ex) }),
+    ("emitter_views", |ex| unsafe { crate::camreaders::patch_emitter_views(ex) }),
+    ("pixel_scenes", |ex| unsafe { crate::camreaders::patch_pixel_scenes(ex) }),
+    ("telepathy", |ex| unsafe { crate::camreaders::patch_telepathy(ex) }),
+    ("screen_shake", |ex| unsafe { crate::camreaders::patch_screen_shake(ex) }),
+    ("fog_of_war", |ex| unsafe { crate::camreaders::patch_fog_of_war(ex) }),
+    ("lua_camera_bounds", |ex| unsafe { crate::camreaders::patch_lua_camera_bounds(ex) }),
+    ("polymorph_slots", |ex| unsafe { crate::slots::patch_polymorph(ex) }),
+    ("sound_rng", |ex| unsafe { crate::slots::patch_sound_rng(ex) }),
+    ("local_presentation", |ex| unsafe { crate::slots::patch_presentation(ex) }),
 ];
 
 /// Overwrite every time/pid-seeded engine RNG with values derived from the session seed.
@@ -935,6 +1093,7 @@ pub unsafe fn fix_seeds(seed: u32) {
     *(GLOBAL_LCG as *mut u32) = seed ^ 0xc;
     *(GLOBAL_PM as *mut f64) = seed as f64;
     *(PARTICLE_RNG as *mut f64) = seed as f64;
+    SESSION_SEED.store(seed, Ordering::Relaxed);
     let rs = RAND_STATE_ADDR.load(Ordering::Relaxed);
     if rs != 0 {
         *(rs as *mut u32) = seed.wrapping_mul(0x9e37_79b9) | 1;
@@ -1012,6 +1171,26 @@ unsafe fn patch_particle_init() -> Result<(), PatchError> {
     expect(PARTICLE_CTOR_AND_6C, &[0xFC])?;
     write_code(PARTICLE_CTOR_AND_6A, &[0x00])?;
     write_code(PARTICLE_CTOR_AND_6C, &[0x00])
+}
+
+/// ControlsSystem (FUN_00a8d7f0), gamepad branch, option `gamepad_analog_flying` (config
+/// +0xe4c): the fly button is dithered from the analog trigger with one step of the global
+/// LCG per frame: `imul eax,[GLOBAL_LCG],0x343fd` @0x00a8e8c1, `mov [GLOBAL_LCG],eax`
+/// @0x00a8e8d0. It runs only for an enabled ControlsComponent, i.e. the local input proxy,
+/// inside the window, and only on a client playing with a gamepad: that client's simulation
+/// LCG ran ahead of the others'.
+const ANALOG_FLY_LCG_READ: u32 = 0x00a8_e8c1;
+const ANALOG_FLY_LCG_WRITE: u32 = 0x00a8_e8d0;
+/// The dither's own LCG state (per client; the dithered Fly bit is captured and sent as input).
+static ANALOG_FLY_LCG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x075b_cd15);
+
+unsafe fn patch_analog_fly_rng() -> Result<(), PatchError> {
+    let lcg = GLOBAL_LCG.to_le_bytes();
+    expect(ANALOG_FLY_LCG_READ, &[0x69, 0x05, lcg[0], lcg[1], lcg[2], lcg[3], 0xFD, 0x43, 0x03, 0x00])?;
+    expect(ANALOG_FLY_LCG_WRITE, &[0xA3, lcg[0], lcg[1], lcg[2], lcg[3]])?;
+    let own = (ANALOG_FLY_LCG.as_ptr() as u32).to_le_bytes();
+    write_code(ANALOG_FLY_LCG_READ + 2, &own)?;
+    write_code(ANALOG_FLY_LCG_WRITE + 1, &own)
 }
 
 /// Chunks are loaded around every player (identically on all clients) instead of around
@@ -1152,6 +1331,13 @@ thread_local! {
 }
 
 static IN_WINDOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the simulation window is open (game thread; pool workers run inside the window
+/// that submitted their job).
+pub(crate) fn in_window() -> bool {
+    IN_WINDOW.load(Ordering::Relaxed)
+}
+
 /// Simulation camera position at the last window exit; consumed by the early window entry
 /// of the next frame ([`early_window_entry`]). Only armed when [`patch_early_window`] is on.
 static ARMED_CAMERA: std::sync::Mutex<Option<(f32, f32)>> = std::sync::Mutex::new(None);
@@ -1168,6 +1354,8 @@ pub unsafe fn sim_rng_enter() {
         return;
     }
     join_render_tiles();
+    // The render used this client's own screen shake (`screen_shake`): back to the shared one.
+    crate::camreaders::shake_render_leave();
     // The previous step's state report is hashed in the background; no step may run first.
     crate::report::join();
     RENDER_BANK.with(|b| *b.borrow_mut() = Some(RngBank::capture()));
@@ -1183,6 +1371,8 @@ pub unsafe fn sim_rng_enter() {
         crate::dump_window_entry(rd(gg));
     }
     prof_window(true);
+    // What vanilla's grid render queued at the end of the last frame (`cell_emitters`).
+    crate::cosmetic::emit_cell_particles();
 }
 
 /// Leaving the simulation window: save the sim stream, put the per-client states back,
@@ -1197,6 +1387,12 @@ pub unsafe fn sim_rng_leave() {
     }
     rng_log('>');
     prof_window(false);
+    // Box2D safety net (`box2d_freeze`): a slow step goes out with the next input; this
+    // frame's freeze request is used up.
+    if box2d_step_slow() {
+        crate::BOX2D_STEP_SLOW.store(true, Ordering::Relaxed);
+    }
+    set_box2d_freeze(false);
     SIM_BANK.with(|b| *b.borrow_mut() = Some(RngBank::capture()));
     RENDER_BANK.with(|b| {
         if let Some(r) = *b.borrow() {
@@ -1216,6 +1412,8 @@ pub unsafe fn sim_rng_leave() {
         // showed the simulation camera (first player) every other frame while that player
         // stood still, and every frame while it moved.
         *((gg + GG_CAMERA_LOCK) as *mut u8) = 0;
+        // The render camera (set next, by the mod) shakes with this client's own shake.
+        crate::camreaders::shake_render_enter();
     }
 }
 
@@ -1285,12 +1483,16 @@ extern "C" fn early_window_entry() {
     }
 }
 
-/// GameGlobal::SetCameraPos with `force`, then the camera lock ([`GG_CAMERA_LOCK`]) on, for
-/// the simulation camera inside the window. Forcing alone sets the lock only if the camera
-/// moved, i.e. if this client's render camera (outside the window) was elsewhere, so whether
-/// unforced requests inside the window took effect (the engine's camera update FUN_006b3ff0
-/// easing toward the players, any mod's GameSetCameraPos) differed between clients and
-/// alternated frame by frame. With the lock always on, they never move the simulation camera.
+/// GameGlobal::SetCameraPos with `force`, then the camera lock ([`GG_CAMERA_LOCK`]) off, for
+/// the simulation camera inside the window. Forcing sets the lock only if the camera moved,
+/// i.e. if this client's render camera (outside the window) was elsewhere, so the lock state
+/// in the window differed between clients. Cleared, it is what vanilla has at this point of
+/// a frame (the engine clears it at the end of the previous one), identically everywhere:
+/// unforced requests inside the window (only game scripts' GameSetCameraPos, identical on
+/// every client; the free camera's update makes none) apply everywhere, a forced one (a
+/// teleporting player) locks it for the rest of the frame as in vanilla, and the
+/// PlatformShooterPlayerSystem updates the camera target of its player (mDesiredCameraPos,
+/// which the render camera follows) only while the lock is clear (FUN_00bf2040 @0x00bf4caf).
 ///
 /// # Safety
 /// Game thread, world initialised.
@@ -1301,7 +1503,7 @@ pub unsafe fn set_camera_pos(x: f32, y: f32) {
     }
     let set: extern "thiscall" fn(u32, *const f32, i32) = std::mem::transmute(SET_CAMERA_POS_FN as usize);
     set(gg, [x, y].as_ptr(), 1);
-    *((gg + GG_CAMERA_LOCK) as *mut u8) = 1;
+    *((gg + GG_CAMERA_LOCK) as *mut u8) = 0;
 }
 
 /// Diagnostics: `NOITA_ONLINE_RNGLOG=from-to` appends the simulation RNG states at every
@@ -1371,6 +1573,7 @@ unsafe fn rng_log(tag: char) {
                 rd(PF_REFRESH_STATE + 8) as i32,
                 rd(PF_REFRESH_STATE + 0x18)
             );
+            let _ = writeln!(f, "V {frame} {tag} {}", crate::camreaders::debug_line());
             let _ = f.write_all(body_hash_lines(frame, tag, grid_world).as_bytes());
         }
         if tag == '<' && std::env::var_os("NOITA_ONLINE_RNGLOG_TILES").is_some() {
@@ -1479,8 +1682,6 @@ const FREEZE_DIST_ORIG: [u8; 26] = [
 ];
 /// FUN_00721050(this = GridWorld, rect): far-body freeze pass (thiscall, RET 4).
 const FREEZE_PASS_FN: u32 = 0x0072_1050;
-/// Cosmetic-particle flag computation (`and al,2` imm8) choosing the camera snapshot grid.
-const COSMETIC_PARTICLE_FLAG_IMMS: [u32; 2] = [0x0071_6a10, 0x0071_6c52];
 const MAX_FOCI: usize = 16;
 
 static FREEZE_FOCI_N: AtomicU32 = AtomicU32::new(0);
@@ -1525,18 +1726,6 @@ unsafe fn patch_focus_freeze(ex: &mut Exec) -> Result<(), PatchError> {
     write_code(FREEZE_DIST_SITE, &site)?;
     FREEZE_FOCI_N.store(n, Ordering::Relaxed);
     FREEZE_FOCI_ARR.store(foci, Ordering::Relaxed);
-    Ok(())
-}
-
-/// Cosmetic particles collide against the real grid instead of a snapshot of the area
-/// around each client's render camera (they become real cells when they land).
-unsafe fn patch_cosmetic_particles() -> Result<(), PatchError> {
-    for imm in COSMETIC_PARTICLE_FLAG_IMMS {
-        expect(imm - 4, &[0x32, 0x46, 0x6A, 0x24, 0x02])?;
-    }
-    for imm in COSMETIC_PARTICLE_FLAG_IMMS {
-        write_code(imm, &[0x00])?;
-    }
     Ok(())
 }
 
@@ -1601,26 +1790,6 @@ unsafe fn patch_cell_flash(ex: &mut Exec) -> Result<(), PatchError> {
     Ok(())
 }
 
-/// Grid render job: `jz 0x00724afc` skipping a cell whose material has no particle effect
-/// (`cmp dword [material+0x28c],0`); otherwise the cell is queued as a particle emitter.
-const RENDER_EMITTER_JZ: u32 = 0x0072_4977;
-
-/// Material particle effects (`<ParticleEffect render_on_grid="1">`: sparkles over magic
-/// liquids, acid, lava, ...) are emitted from the surface cells the grid *render* job finds
-/// in this client's view: it queues them (DAT_012080d8, in job/row order of the view), and
-/// FUN_00724480 creates the particles after the render, outside the simulation window. The
-/// particles then live in the shared GridParticles lists, whose in-window update draws from
-/// the simulation particle RNG (bounces, 0x01222388). Different views (or just a different
-/// view origin, which permutes the queue) forked the particle RNG (seed 2046634918, f=1385).
-/// The render no longer queues emitters, so these purely cosmetic effects are not drawn.
-unsafe fn patch_cell_emitters() -> Result<(), PatchError> {
-    expect(RENDER_EMITTER_JZ - 14, &[0x83, 0xB8, 0x8C, 0x02, 0x00, 0x00, 0x00])?;
-    expect(RENDER_EMITTER_JZ, &[0x0F, 0x84, 0x7F, 0x01, 0x00, 0x00])?;
-    // jz rel32 -> jmp rel32; nop
-    let rel = rel32(RENDER_EMITTER_JZ + 5, RENDER_EMITTER_JZ + 6 + 0x17f);
-    write_code(RENDER_EMITTER_JZ, &[0xE9, rel[0], rel[1], rel[2], rel[3], 0x90])
-}
-
 /// GridWorld: the b2World (GridWorld+0x530); b2World+0x19270: wall-clock duration of the last
 /// Box2D step in ms (QueryPerformanceCounter, written at the end of b2World::Step FUN_009c0d00).
 const GW_B2WORLD: u32 = 0x530;
@@ -1629,19 +1798,70 @@ const B2_STEP_MS: u32 = 0x19270;
 /// push edi; mov edi,ecx; mov [esp+0x38],edi; jz 0x00718d91` (skips the freeze test).
 const FREEZE_STUCK_TEST: u32 = 0x0071_8d5c;
 const FREEZE_STUCK_TEST_ORIG: [u8; 17] = [0x80, 0x3D, 0xF4, 0x32, 0x15, 0x01, 0x00, 0x56, 0x57, 0x8B, 0xF9, 0x89, 0x7C, 0x24, 0x38, 0x74, 0x24];
+/// The freeze test right after: `movss xmm1,[BOX2D_THREAD_MAX_WAIT_IN_MS]; mov eax,[edi+0x530];
+/// cvtps2pd xmm1,xmm1; movsd xmm0,[eax+0x19270]; comisd xmm0,xmm1; jbe 0x00718d91`, then
+/// `call FUN_00717aa0` (0x00718d8c) freezes the most stuck body.
+const FREEZE_STUCK_TIME_TEST: u32 = 0x0071_8d6d;
+const FREEZE_STUCK_TIME_TEST_ORIG: [u8; 31] = [
+    0xF3, 0x0F, 0x10, 0x0D, 0x88, 0x32, 0x15, 0x01, 0x8B, 0x87, 0x30, 0x05, 0x00, 0x00, 0x0F, 0x5A, 0xC9, 0xF2, 0x0F, 0x10,
+    0x80, 0x70, 0x92, 0x01, 0x00, 0x66, 0x0F, 0x2F, 0xC1, 0x76, 0x05,
+];
+const FREEZE_STUCK_SKIP: u32 = 0x0071_8d91;
+/// Magic numbers BOX2D_FREEZE_STUCK_BODIES (bool, default 1) and BOX2D_THREAD_MAX_WAIT_IN_MS
+/// (float, default 12).
+const MAGIC_FREEZE_STUCK_BODIES: u32 = 0x0115_32f4;
+const MAGIC_THREAD_MAX_WAIT_MS: u32 = 0x0115_3288;
+/// Address of the byte the patched test reads: freeze the most stuck body in this frame's
+/// body->grid update (0 = patch not installed).
+static FREEZE_STUCK_NOW: AtomicU32 = AtomicU32::new(0);
 
 /// At the start of the body->grid update (inside the window), with the magic number
-/// BOX2D_FREEZE_STUCK_BODIES (on by default), the engine puts the awake body with the largest
-/// stuck counter to sleep (FUN_00717aa0: zero velocity, counter reset) whenever the *previous
-/// Box2D step took longer than BOX2D_THREAD_MAX_WAIT_IN_MS (12 ms) of wall-clock time*
-/// (b2World+0x19270). Physics-heavy moments (an explosion's debris) sit near that threshold,
-/// so clients froze a body at different frames: seed 1717171717 forked at f=1382 in most
-/// runs, but not when diagnostics shifted the timing. The time test is skipped, i.e. the
-/// load-dependent freeze never runs (a deterministic stand-in would need a cost model).
-unsafe fn patch_box2d_freeze() -> Result<(), PatchError> {
+/// BOX2D_FREEZE_STUCK_BODIES (on by default), the engine freezes the awake body with the
+/// largest stuck counter (FUN_00717aa0) whenever the *previous Box2D step took longer than
+/// BOX2D_THREAD_MAX_WAIT_IN_MS (12 ms) of wall-clock time* (b2World+0x19270): a safety net
+/// for physics too heavy for the machine. Physics-heavy moments (an explosion's debris) sit
+/// near that threshold, so clients froze a body at different frames (seed 1717171717,
+/// f=1382, in most runs). The test now reads a flag that every client sets from the tick:
+/// each client measures its own step at window exit and reports a slow step with its next
+/// input ([`box2d_step_slow`]); the frame whose tick carries such a report freezes the most
+/// stuck body on every client. So the safety net still fires when the slowest machine's
+/// physics falls behind, one input delay later than on that machine alone.
+unsafe fn patch_box2d_freeze(ex: &mut Exec) -> Result<(), PatchError> {
     expect(FREEZE_STUCK_TEST, &FREEZE_STUCK_TEST_ORIG)?;
-    // jz -> jmp
-    write_code(FREEZE_STUCK_TEST + 15, &[0xEB])
+    expect(FREEZE_STUCK_TIME_TEST, &FREEZE_STUCK_TIME_TEST_ORIG)?;
+    let flag = ex.alloc_data(4);
+    // cmp byte [flag],0; jz skip; nop... (falls through to the freeze call)
+    let mut c = vec![0x80, 0x3D];
+    c.extend_from_slice(&flag.to_le_bytes());
+    c.extend_from_slice(&[0x00, 0x0F, 0x84]);
+    let end = FREEZE_STUCK_TIME_TEST + c.len() as u32 + 4;
+    c.extend_from_slice(&rel32(end, FREEZE_STUCK_SKIP));
+    c.resize(FREEZE_STUCK_TIME_TEST_ORIG.len(), 0x90);
+    write_code(FREEZE_STUCK_TIME_TEST, &c)?;
+    FREEZE_STUCK_NOW.store(flag, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Whether this frame's Box2D step took longer than BOX2D_THREAD_MAX_WAIT_IN_MS (window exit;
+/// false without the freeze patch or with BOX2D_FREEZE_STUCK_BODIES off).
+unsafe fn box2d_step_slow() -> bool {
+    if FREEZE_STUCK_NOW.load(Ordering::Relaxed) == 0 || *(MAGIC_FREEZE_STUCK_BODIES as *const u8) == 0 {
+        return false;
+    }
+    let gg = rd(GAME_GLOBAL_PTR);
+    let world_data = if gg != 0 { rd(gg + 0x0c) } else { 0 };
+    let grid_world = if world_data != 0 { rd(world_data + 0x44) } else { 0 };
+    let b2 = if grid_world != 0 { rd(grid_world + GW_B2WORLD) } else { 0 };
+    b2 != 0 && *((b2 + B2_STEP_MS) as *const f64) > *(MAGIC_THREAD_MAX_WAIT_MS as *const f32) as f64
+}
+
+/// The tick of the frame about to be simulated asks for the stuck-body freeze (some player
+/// reported a slow Box2D step), or not.
+pub fn set_box2d_freeze(on: bool) {
+    let flag = FREEZE_STUCK_NOW.load(Ordering::Relaxed);
+    if flag != 0 {
+        unsafe { *(flag as *mut u8) = on as u8 };
+    }
 }
 
 /// GridWorld: every grid physics body (`std::vector<b2Body*>` at +0x560, in creation order)
@@ -1713,20 +1933,45 @@ extern "C" fn free_solid_next(grid_world: u32) -> u32 {
 }
 
 /// The pathfinding job (FUN_00861a50, launched by DeathMatch::Update at 0x006b2be1, i.e.
-/// before the simulation window, and run inline by [`patch_inline_async`]): `call
-/// FUN_00439bb0; mov eax,[eax+0xc]` loads the camera rect (WorldData+0: float x, y, w, h)
-/// whose centre the next clearance-refresh cycle covers.
-const PF_REFRESH_VIEW: u32 = 0x0086_1abf;
-const PF_REFRESH_VIEW_ORIG: [u8; 8] = [0xE8, 0xEC, 0x80, 0xBD, 0xFF, 0x8B, 0x40, 0x0C];
-/// Clearance-refresh state (FUN_008605e0's coroutine): +4/+8 centre (int), +0x18 line.
+/// before the simulation window, and run inline by [`patch_inline_async`]), from the
+/// `PATHFINDING_DISTANCE_FIELD_ENABLED` test to the clearance-refresh step (exclusive):
+/// `cmp byte [state+0x14],0; jz ..` (cycle finished: state zeroed), `mov eax,[state+0x18];
+/// test eax,eax; jnz step` (mid-cycle), else capture `[job]` into state+0 and the camera
+/// centre `trunc(w * 0.5 + x)`, `trunc(h * 0.5 + y)` (WorldData+0 rect) into state+4/+8;
+/// `mov ecx,state; call FUN_008605e0` (the step), then 0x00861b07.
+const PF_REFRESH_SITE: u32 = 0x0086_1a7b;
+const PF_REFRESH_ORIG: [u8; 140] = [
+    0x80, 0x3d, 0x34, 0x85, 0x20, 0x01, 0x00, 0x74, 0x2b, 0x0f, 0x57, 0xc0, 0x89, 0x74, 0x24, 0x60, 0xc6, 0x44, 0x24, 0x64,
+    0x00, 0x33, 0xc0, 0xf3, 0x0f, 0x7f, 0x05, 0x20, 0x85, 0x20, 0x01, 0xa3, 0x38, 0x85, 0x20, 0x01, 0xf3, 0x0f, 0x7e, 0x44,
+    0x24, 0x60, 0x66, 0x0f, 0xd6, 0x05, 0x30, 0x85, 0x20, 0x01, 0xeb, 0x05, 0xa1, 0x38, 0x85, 0x20, 0x01, 0x85, 0xc0, 0x75,
+    0x45, 0x8b, 0x07, 0xa3, 0x20, 0x85, 0x20, 0x01, 0xe8, 0xec, 0x80, 0xbd, 0xff, 0x8b, 0x40, 0x0c, 0xf3, 0x0f, 0x10, 0x50,
+    0x08, 0xf3, 0x0f, 0x10, 0x48, 0x0c, 0xf3, 0x0f, 0x59, 0x15, 0x1c, 0x36, 0x05, 0x01, 0xf3, 0x0f, 0x59, 0x0d, 0x1c, 0x36,
+    0x05, 0x01, 0xf3, 0x0f, 0x58, 0x10, 0xf3, 0x0f, 0x58, 0x48, 0x04, 0xf3, 0x0f, 0x2c, 0xc2, 0xf3, 0x0f, 0x2c, 0xc9, 0xa3,
+    0x24, 0x85, 0x20, 0x01, 0x89, 0x0d, 0x28, 0x85, 0x20, 0x01, 0xb9, 0x20, 0x85, 0x20, 0x01, 0xe8, 0xd9, 0xea, 0xff, 0xff,
+];
+const PF_REFRESH_DONE: u32 = 0x0086_1b07;
+/// Clearance-refresh state (FUN_008605e0's coroutine, 0x1c bytes): +0 pathfinding chunk
+/// table, +4/+8 centre (int), +0xc/+0x10 progress in the current chunk, +0x14 cycle finished
+/// (byte), +0x18 line (0 = start a cycle).
 const PF_REFRESH_STATE: u32 = 0x0120_8520;
+const PF_REFRESH_STATE_LEN: usize = 0x1c;
+const PF_REFRESH_STEP_FN: u32 = 0x0086_05e0;
+/// FUN_00860150's chunk scratch (pointer to 134×134 solid flags, filled when a chunk's
+/// refresh starts, read by its second half one frame later; allocated on first use).
+const PF_REFRESH_SCRATCH_PTR: u32 = 0x0122_70c8;
+const PF_REFRESH_SCRATCH_LEN: usize = 0x4624;
 
 /// Focus centres of the last simulation window (slot order), for the clearance refresh.
 static PF_FOCI: std::sync::Mutex<Vec<(f32, f32)>> = std::sync::Mutex::new(Vec::new());
-/// Refresh cycles started so far (picks the next focus in turn).
-static PF_REFRESH_CYCLES: AtomicU32 = AtomicU32::new(0);
-/// The rect handed to the job: `{x, y, 0, 0}` (f32 bits), so its centre is the focus.
-static PF_REFRESH_RECT: [AtomicU32; 4] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+
+/// One player's refresh cycle: the coroutine state and, mid-chunk, its scratch.
+struct PfRefresh {
+    state: [u8; PF_REFRESH_STATE_LEN],
+    scratch: Vec<u8>,
+}
+
+/// Per-player refresh cycles (slot order), used with two or more players.
+static PF_REFRESH: std::sync::Mutex<Vec<PfRefresh>> = std::sync::Mutex::new(Vec::new());
 
 /// With PATHFINDING_DISTANCE_FIELD_ENABLED (on by default) the pathfinding job refreshes the
 /// node clearance field (the byte at pf_chunk + 0x80009 + 3 * node, which the search reads as
@@ -1735,64 +1980,76 @@ static PF_REFRESH_RECT: [AtomicU32; 4] = [AtomicU32::new(0), AtomicU32::new(0), 
 /// next cycle when done. The job runs before the simulation window, so that camera is each
 /// client's *render* camera: clients refreshed different chunks at different frames, and an
 /// enemy whose path search ran in between got a different path (seed 1404389217, f=1554:
-/// rat 969's next path node). Each cycle now centres on a player instead, in turn (slot
-/// order, the focus centres published by the previous window), so every player's
-/// surroundings stay fresh as the local player's do in vanilla.
+/// rat 969's next path node). The cycle now centres on the players (the focus centres
+/// published by the previous window): with one player exactly vanilla's single cycle; with
+/// more, every player runs its own cycle each frame (slot order, own coroutine state and
+/// chunk scratch), so every player's surroundings are refreshed at vanilla's rate.
 unsafe fn patch_pathfinding_refresh(ex: &mut Exec) -> Result<(), PatchError> {
-    expect(PF_REFRESH_VIEW, &PF_REFRESH_VIEW_ORIG)?;
-    let f = ((pf_refresh_view as extern "C" fn() -> u32) as u32).to_le_bytes();
-    // mov eax,pf_refresh_view; call eax; ret (eax = rect; ecx/edx are dead at the site)
-    let stub = ex.put(&[0xB8, f[0], f[1], f[2], f[3], 0xFF, 0xD0, 0xC3]);
-    let mut call = vec![0xE8];
-    call.extend_from_slice(&rel32(PF_REFRESH_VIEW + 5, stub));
-    call.extend_from_slice(&[0x90; 3]);
-    write_code(PF_REFRESH_VIEW, &call)
+    expect(PF_REFRESH_SITE, &PF_REFRESH_ORIG)?;
+    let f = ((pf_refresh as extern "C" fn(u32)) as u32).to_le_bytes();
+    // Site: call stub; jmp done. Stub: push edi (the job); mov eax,pf_refresh; call eax;
+    // add esp,4; ret (ESI = 0 and EDI stay as the code after expects them; EAX/ECX/EDX and
+    // the XMM registers are dead).
+    let stub = ex.put(&[0x57, 0xB8, f[0], f[1], f[2], f[3], 0xFF, 0xD0, 0x83, 0xC4, 0x04, 0xC3]);
+    let mut code = vec![0xE8];
+    code.extend_from_slice(&rel32(PF_REFRESH_SITE + 5, stub));
+    code.push(0xE9);
+    code.extend_from_slice(&rel32(PF_REFRESH_SITE + 10, PF_REFRESH_DONE));
+    write_code(PF_REFRESH_SITE, &code)
 }
 
-/// Called once per clearance-refresh cycle (when the job captures a new centre): the rect of
-/// the next player in turn, or of the origin before any window published the players.
-extern "C" fn pf_refresh_view() -> u32 {
-    let foci = PF_FOCI.lock().unwrap_or_else(|p| p.into_inner());
-    let (x, y) = if foci.is_empty() {
-        (0.0f32, 0.0f32)
-    } else {
-        foci[PF_REFRESH_CYCLES.fetch_add(1, Ordering::Relaxed) as usize % foci.len()]
-    };
-    for (slot, v) in PF_REFRESH_RECT.iter().zip([x, y, 0.0, 0.0]) {
-        slot.store(v.to_bits(), Ordering::Relaxed);
+/// One refresh step of the cycle in [`PF_REFRESH_STATE`] around (x, y), as vanilla runs it.
+unsafe fn pf_refresh_step(job: u32, (x, y): (f32, f32)) {
+    let state = PF_REFRESH_STATE as *mut u8;
+    if *state.add(0x14) != 0 {
+        std::ptr::write_bytes(state, 0, PF_REFRESH_STATE_LEN);
     }
-    PF_REFRESH_RECT.as_ptr() as u32
+    if rd(PF_REFRESH_STATE + 0x18) == 0 {
+        *(PF_REFRESH_STATE as *mut u32) = rd(job);
+        *((PF_REFRESH_STATE + 4) as *mut i32) = x as i32;
+        *((PF_REFRESH_STATE + 8) as *mut i32) = y as i32;
+    }
+    let step: extern "fastcall" fn(u32) = std::mem::transmute(PF_REFRESH_STEP_FN as usize);
+    step(PF_REFRESH_STATE);
+}
+
+/// The job's clearance refresh around the players (see [`patch_pathfinding_refresh`]).
+extern "C" fn pf_refresh(job: u32) {
+    unsafe {
+        let foci = PF_FOCI.lock().unwrap_or_else(|p| p.into_inner());
+        if foci.len() <= 1 {
+            pf_refresh_step(job, foci.first().copied().unwrap_or((0.0, 0.0)));
+            return;
+        }
+        let mut cycles = PF_REFRESH.lock().unwrap_or_else(|p| p.into_inner());
+        if cycles.is_empty() {
+            // The single cycle so far continues as player 1's.
+            let mut state = [0u8; PF_REFRESH_STATE_LEN];
+            std::ptr::copy_nonoverlapping(PF_REFRESH_STATE as *const u8, state.as_mut_ptr(), PF_REFRESH_STATE_LEN);
+            cycles.push(PfRefresh { state, scratch: Vec::new() });
+        }
+        cycles.resize_with(foci.len(), || PfRefresh { state: [0; PF_REFRESH_STATE_LEN], scratch: Vec::new() });
+        let mid_chunk = |s: &[u8; PF_REFRESH_STATE_LEN]| u32::from_le_bytes([s[0x10], s[0x11], s[0x12], s[0x13]]) != 0;
+        for (cycle, &focus) in cycles.iter_mut().zip(foci.iter()) {
+            std::ptr::copy_nonoverlapping(cycle.state.as_ptr(), PF_REFRESH_STATE as *mut u8, PF_REFRESH_STATE_LEN);
+            let scratch = rd(PF_REFRESH_SCRATCH_PTR) as *mut u8;
+            if mid_chunk(&cycle.state) && !scratch.is_null() && cycle.scratch.len() == PF_REFRESH_SCRATCH_LEN {
+                std::ptr::copy_nonoverlapping(cycle.scratch.as_ptr(), scratch, PF_REFRESH_SCRATCH_LEN);
+            }
+            pf_refresh_step(job, focus);
+            std::ptr::copy_nonoverlapping(PF_REFRESH_STATE as *const u8, cycle.state.as_mut_ptr(), PF_REFRESH_STATE_LEN);
+            let scratch = rd(PF_REFRESH_SCRATCH_PTR) as *const u8;
+            if mid_chunk(&cycle.state) && !scratch.is_null() {
+                cycle.scratch.resize(PF_REFRESH_SCRATCH_LEN, 0);
+                std::ptr::copy_nonoverlapping(scratch, cycle.scratch.as_mut_ptr(), PF_REFRESH_SCRATCH_LEN);
+            }
+        }
+    }
 }
 
 /// Publish this window's focus centres (slot order) for the clearance refresh.
 pub fn pathfinding_foci(foci: &[(f32, f32)]) {
     *PF_FOCI.lock().unwrap_or_else(|p| p.into_inner()) = foci.to_vec();
-}
-
-/// Ragdoll creation on death (FUN_00abb7d0): `mov eax,[eax+0x5c]; test eax,eax; jz +7;
-/// add eax,0x20; mov [esp+0x34],eax` picks the dying entity's stains overlay (eax =
-/// SpriteStainsComponent, +0x5c = SpriteStains) for both ragdoll loads (FUN_00be8240).
-const RAGDOLL_STAINS_SITE: u32 = 0x00ab_c082;
-const RAGDOLL_STAINS_ORIG: [u8; 14] = [0x8B, 0x40, 0x5C, 0x85, 0xC0, 0x74, 0x07, 0x83, 0xC0, 0x20, 0x89, 0x44, 0x24, 0x34];
-static RAGDOLL_STAINS_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// SpriteStains keeps the stain colours in an image at +0x00, which the simulation updates
-/// (SpriteStainsSystem FUN_00c22080, EntityAddRandomStains, cleaning). The image at +0x20, of
-/// the same size, is a horizontally blurred copy written only by the GPU texture upload
-/// (FUN_00c21020). That upload runs from the render-side queue FUN_0084e3f0 (at most 3 per
-/// frame), and FUN_00c20f80 queues it only while the sprite was drawn in the previous frame.
-/// So +0x20 held each client's last *drawn* stains, all zero for an entity it never saw.
-/// The ragdoll loader blends that overlay into the ragdoll images. Small ragdoll parts get
-/// box fixtures from FUN_009817d0, which merges neighbouring pixels of equal colour into
-/// one box (FUN_00928250). So the same 5-pixel part got 3 fixtures on one client and 5 on
-/// the other, with a different mass (seed 1786459272, f=5345). The overlay is now the stain
-/// colours at +0x00: the same colours, no longer blurred by one pixel.
-unsafe fn patch_ragdoll_stains() -> Result<(), PatchError> {
-    expect(RAGDOLL_STAINS_SITE, &RAGDOLL_STAINS_ORIG)?;
-    // add eax,0x20 -> nop x3
-    write_code(RAGDOLL_STAINS_SITE + 7, &[0x90; 3])?;
-    RAGDOLL_STAINS_ON.store(true, Ordering::Relaxed);
-    Ok(())
 }
 
 static FREEZE_LAST: std::sync::Mutex<Vec<(f32, f32)>> = std::sync::Mutex::new(Vec::new());

@@ -31,11 +31,23 @@ local Input = dofile_once(ROOT .. "input.lua")
 local Players = dofile_once(ROOT .. "players.lua")
 local State = dofile_once(ROOT .. "state.lua")
 local Bot = dofile_once(ROOT .. "bot.lua")
-local Inventory = dofile_once(ROOT .. "inventory.lua")
+Players.log = log
+Bot.log = log
 
 local session = nil   -- { seed, input_delay, player, players, scenario }
 local solo = cfg.solo
 local finished = false
+
+-- In a session the vanilla scripts' "near the camera" tests answer for every player's view
+-- (camera_bounds.lua, answered by the `lua_camera_bounds` patch); the radar perk marks
+-- enemies on its holder's own screen. The solo baseline (no patches) stays vanilla.
+if not solo then
+  ModLuaFileAppend("data/scripts/lib/utilities.lua", ROOT .. "camera_bounds.lua")
+  local radar = "data/scripts/perks/radar.lua"
+  local text, n = ModTextFileGetContent(radar):gsub("is_in_camera_bounds%(enemy_x, enemy_y, %-4%)",
+    "noita_online_in_camera_bounds_of(pos_x, pos_y, enemy_x, enemy_y, -4)")
+  if n == 1 then ModTextFileSetContent(radar, text) else log("radar.lua: camera test not found (" .. n .. ")") end
+end
 
 local function drain_events()
   for _, e in ipairs(NO.poll_events()) do log("net: " .. e) end
@@ -66,12 +78,12 @@ if solo then
   log("solo baseline mode, seed " .. session.seed)
   NO.lib.no_prof_install()
 else
-  local mask = NO.lib.no_apply_patches()
-  if mask < 0 then
+  local count = NO.lib.no_apply_patches()
+  if count < 0 then
     log("FATAL: determinism patches failed: " .. NO.last_error())
     error("noita_online: " .. NO.last_error())
   end
-  log(string.format("determinism patches applied (mask %x)", mask))
+  log(string.format("determinism patches applied (%d)", count))
   -- Every client must run the same mods (they change the simulation); the server compares this.
   local mods = ModGetActiveModIDs() or {}
   table.sort(mods)
@@ -106,7 +118,6 @@ local magic = string.format([[<MagicNumbers
   DEBUG_NO_PAUSE_ON_WINDOW_FOCUS_LOST="1"
   DEBUG_SINGLE_THREADED_LOADING="1"
   DEBUG_THREADED_WORLD_CREATION="0"
-  BOX2D_THREAD_MAX_WAIT_IN_MS="100000"
   GRID_FLEXIBLE_MAX_UPDATES="0"
   %s
 />]], session.seed, solo and "" or 'STREAMING_ENABLED="0"')
@@ -155,7 +166,7 @@ local function local_input(f)
     local slot = Players.local_slot()
     local px, py = 0, 0
     if slot and EntityGetIsAlive(slot.entity) then px, py = EntityGetTransform(slot.entity) end
-    return Bot.input(session.player, f, px, py)
+    return Players.bot_ops(Bot.input(session.player, f, px, py))
   end
   return Players.capture_local(render_mouse)
 end
@@ -175,7 +186,7 @@ local function current_foci()
     if EntityGetIsAlive(slot.entity) then
       local x, y = EntityGetTransform(slot.entity)
       x, y = math.floor(x), math.floor(y)
-      foci[#foci + 1] = { x - FOCUS_HW, y - FOCUS_HH, x + FOCUS_HW, y + FOCUS_HH, x = x, y = y }
+      foci[#foci + 1] = { x - FOCUS_HW, y - FOCUS_HH, x + FOCUS_HW, y + FOCUS_HH, x = x, y = y, own = slot.id == Players.local_id }
     end
   end
   return foci
@@ -183,21 +194,41 @@ end
 
 -- Inside the simulation window every client uses the same camera (first live player),
 -- because camera-dependent engine systems feed the simulation; rendering uses our own.
-local render_cam = nil
 local function set_sim_camera(foci)
-  -- Forced, and locked for the rest of the window: the engine ignores unforced camera
-  -- requests while its camera lock is on.
+  -- Forced: the camera is at the same place on every client for the whole window.
   if foci[1] then NO.lib.no_set_sim_camera(foci[1].x, foci[1].y) end
 end
--- After the window (no_sim_leave released the camera lock), so the unforced request applies.
+-- After the window: the view is the camera Noita computed for our player in the window
+-- (Players.local_camera_target), set like the engine's own camera update does (unforced).
 local function set_render_camera()
-  local slot = Players.local_slot()
-  if not slot or not EntityGetIsAlive(slot.entity) then return end
-  local x, y = EntityGetTransform(slot.entity)
-  if not render_cam then render_cam = { x = x, y = y } end
-  render_cam.x = render_cam.x + (x - render_cam.x) * 0.2
-  render_cam.y = render_cam.y + (y - render_cam.y) * 0.2
-  GameSetCameraPos(render_cam.x, render_cam.y)
+  local x, y = Players.local_camera_target()
+  if not x then
+    local slot = Players.local_slot()
+    if not slot or not EntityGetIsAlive(slot.entity) then return end
+    x, y = EntityGetTransform(slot.entity)
+  end
+  GameSetCameraPos(x, y)
+end
+
+-- GameSetCameraFree(true) makes the engine load its debug free-camera light (two white lights
+-- of radius 750, data/entities/_debug/free_camera_light.xml) and keep it at the camera
+-- (FUN_006b3ff0). Vanilla play has no such light, so it is switched off, identically on every
+-- client (inside the window; the entity is part of the simulation).
+local free_light = nil
+local function douse_free_camera_light()
+  if free_light then return end
+  local cx, cy = GameGetCameraPos()
+  for _, e in ipairs(EntityGetInRadius(cx, cy, 32) or {}) do
+    if EntityGetFilename(e) == "data/entities/_debug/free_camera_light.xml" then
+      for _, c in ipairs(EntityGetComponentIncludingDisabled(e, "LightComponent") or {}) do
+        ComponentSetValue2(c, "radius", 0)
+        ComponentSetValue2(c, "r", 0)
+        ComponentSetValue2(c, "g", 0)
+        ComponentSetValue2(c, "b", 0)
+      end
+      free_light = e
+    end
+  end
 end
 
 local ENTLOG = os.getenv("NOITA_ONLINE_ENTLOG")
@@ -242,12 +273,16 @@ function OnWorldPreUpdate()
       log(string.format("prelog f=%d p0=%.6f,%.6f cam=%.4f,%.4f", f, x, y, cx, cy))
     end
     Players.apply_tick(f, tick)
+    Players.feed_local_camera()
     for _, r in ipairs(foci) do NO.lib.no_stream_focus(r[1], r[2], r[3], r[4]) end
+    local own = -1
     for i, r in ipairs(foci) do
       centre_buf[2 * (i - 1)] = r.x
       centre_buf[2 * (i - 1) + 1] = r.y
+      if r.own then own = i - 1 end
     end
     NO.lib.no_focus_freeze(centre_buf, #foci)
+    NO.lib.no_local_view(own)
     if session.scenario == "bot" then Bot.world_events(f, Players.slots) end
   end
 end
@@ -256,6 +291,7 @@ function OnWorldPostUpdate()
   if finished then return end
   local f = GameGetFrameNum()
   if in_sim_window then
+    if ready then douse_free_camera_light() end
     if ready and f % UNLOAD_EVERY == 0 then
       local foci = current_foci()
       for i, r in ipairs(foci) do
@@ -314,9 +350,9 @@ function OnWorldPostUpdate()
     in_sim_window = false
     if ready then
       set_render_camera()
+      Players.update_reticle()
       render_mouse = { DEBUG_GetMouseWorld() }
-      local slot = Players.local_slot()
-      Inventory.draw(slot and slot.entity)
+      Players.gui_update()
     end
   end
   if f % 600 == 0 then drain_events() end

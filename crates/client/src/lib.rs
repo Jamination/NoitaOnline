@@ -3,7 +3,15 @@
 //! All exported functions are `extern "C"`, called from the game thread only. Networking runs
 //! on a background thread (`net`), so packet handling never waits for the game's frames.
 
+#[cfg(all(windows, target_arch = "x86"))]
+pub mod cambound;
+#[cfg(all(windows, target_arch = "x86"))]
+pub mod camreaders;
 pub mod clock;
+#[cfg(all(windows, target_arch = "x86"))]
+pub mod cosmetic;
+#[cfg(all(windows, target_arch = "x86"))]
+pub mod gridcap;
 pub mod net;
 #[cfg(all(windows, target_arch = "x86"))]
 pub mod patches;
@@ -11,9 +19,16 @@ pub mod perf;
 #[cfg(all(windows, target_arch = "x86"))]
 pub mod prof;
 #[cfg(all(windows, target_arch = "x86"))]
+pub mod ragdoll;
+#[cfg(all(windows, target_arch = "x86"))]
 pub mod report;
 #[cfg(all(windows, target_arch = "x86"))]
 pub mod world;
+#[cfg(all(windows, target_arch = "x86"))]
+pub mod invgui;
+#[cfg(all(windows, target_arch = "x86"))]
+pub mod slots;
+pub mod views;
 
 use net::{ConnectParams, Shared, Status};
 use protocol::{ClientMsg, EntityPos, CH_RELIABLE};
@@ -145,13 +160,21 @@ pub unsafe extern "C" fn no_start_info(out: *mut StartInfoC) -> i32 {
     })
 }
 
-/// Queue the local player's input for simulation frame `frame`.
+/// This client's Box2D step took longer than BOX2D_THREAD_MAX_WAIT_IN_MS since its last
+/// input (patch `box2d_freeze`). Every input carries it as a trailing byte, which
+/// `no_wait_tick` strips: a tick in which any player reports a slow step freezes the most
+/// stuck physics body on every client, as vanilla does on a machine whose physics falls behind.
+pub(crate) static BOX2D_STEP_SLOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Queue the local player's input for simulation frame `frame` (plus the slow-step byte, see
+/// [`BOX2D_STEP_SLOW`]).
 ///
 /// # Safety
 /// `data` must point at `len` readable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn no_send_input(frame: u32, data: *const u8, len: u32) -> i32 {
-    let bytes = if len == 0 { Vec::new() } else { std::slice::from_raw_parts(data, len as usize).to_vec() };
+    let mut bytes = if len == 0 { Vec::new() } else { std::slice::from_raw_parts(data, len as usize).to_vec() };
+    bytes.push(BOX2D_STEP_SLOW.swap(false, std::sync::atomic::Ordering::Relaxed) as u8);
     with_rt(-1, |rt| {
         let mut s = rt.shared.state.lock().unwrap();
         let Some(stream) = &mut s.stream else { return -2 };
@@ -164,7 +187,8 @@ pub unsafe extern "C" fn no_send_input(frame: u32, data: *const u8, len: u32) ->
 }
 
 /// Block until the tick for `frame` arrives (or `timeout_ms`), then write it to `out` as
-/// `[count u8] count × ([player u8][len u16 LE][bytes])`.
+/// `[count u8] count × ([player u8][len u16 LE][bytes])`, each input without its slow-step
+/// byte ([`BOX2D_STEP_SLOW`]; the frames before the input delay have empty inputs).
 /// Returns bytes written, -1 timeout, -2 disconnected, -3 buffer too small.
 ///
 /// # Safety
@@ -179,12 +203,20 @@ pub unsafe extern "C" fn no_wait_tick(frame: u32, timeout_ms: u32, out: *mut u8,
     let deadline = started + Duration::from_millis(timeout_ms as u64);
     let mut s = shared.state.lock().unwrap();
     loop {
-        if let Some(inputs) = s.stream.as_mut().and_then(|st| st.take_tick(frame)) {
+        if let Some(mut inputs) = s.stream.as_mut().and_then(|st| st.take_tick(frame)) {
             drop(s);
             let waited = started.elapsed().as_micros() as u64;
             with_rt((), |rt| rt.timer.window_wait_us += waited);
             #[cfg(all(windows, target_arch = "x86"))]
             prof::WAIT_US.fetch_add(waited, std::sync::atomic::Ordering::Relaxed);
+            let mut step_slow = false;
+            for (_, d) in inputs.iter_mut() {
+                step_slow |= d.pop().is_some_and(|b| b != 0);
+            }
+            #[cfg(all(windows, target_arch = "x86"))]
+            patches::set_box2d_freeze(step_slow);
+            #[cfg(not(all(windows, target_arch = "x86")))]
+            let _ = step_slow;
             let mut buf = Vec::with_capacity(64);
             buf.push(inputs.len().min(255) as u8);
             for (p, d) in inputs.iter().take(255) {
@@ -439,8 +471,8 @@ pub unsafe extern "C" fn no_log(text: *const c_char) {
     with_rt((), |rt| rt.shared.send(CH_RELIABLE, &ClientMsg::Log { text }));
 }
 
-/// Install the determinism patches into noita.exe (idempotent). Returns the applied-set
-/// bitmask (>0) or -1 on failure (details in `no_last_error`).
+/// Install the determinism patches into noita.exe (idempotent). Returns the number of
+/// patches installed (≥ 0) or -1 on failure (details in `no_last_error`).
 #[no_mangle]
 pub extern "C" fn no_apply_patches() -> i32 {
     #[cfg(all(windows, target_arch = "x86"))]
@@ -547,8 +579,8 @@ pub extern "C" fn no_sim_leave() {
 /// Set the simulation camera centre (inside the simulation window). Unlike Lua's
 /// GameSetCameraPos it forces the move (the engine ignores unforced requests while its
 /// camera lock is set, which left the simulation camera on last frame's position on some
-/// clients and frames), then keeps the lock on until `no_sim_leave`, so no unforced request
-/// moves the simulation camera on any client.
+/// clients and frames), then clears the lock, so the lock state in the window is the same on
+/// every client and what vanilla has at that point of a frame.
 #[no_mangle]
 pub extern "C" fn no_set_sim_camera(x: f32, y: f32) {
     #[cfg(all(windows, target_arch = "x86"))]
@@ -559,9 +591,127 @@ pub extern "C" fn no_set_sim_camera(x: f32, y: f32) {
     let _ = (x, y);
 }
 
-/// Publish the focus centres (n × {x, y} floats, slot order) for physics-body freezing and
-/// the pathfinding clearance refresh, and trigger the freeze pass when a focus moved far
-/// (call inside the simulation window).
+/// Register the session's player slot entities (slot order), this client's slot index
+/// (`local`, -1: none) and its input proxy entity (`proxy_id`, 0: none). See `slots`.
+///
+/// # Safety
+/// `ids` must point at `n` entity ids.
+#[no_mangle]
+pub unsafe extern "C" fn no_slots_set(ids: *const u32, n: u32, local: i32, proxy_id: u32) {
+    #[cfg(all(windows, target_arch = "x86"))]
+    slots::set_slots(std::slice::from_raw_parts(ids, n as usize), local, proxy_id);
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    let _ = (ids, n, local, proxy_id);
+}
+
+/// Current entity id of every slot (they change when a player is polymorphed and back) into
+/// `out` (capacity `cap`). Returns the slot count written.
+///
+/// # Safety
+/// `out` must point at `cap` writable ids.
+#[no_mangle]
+pub unsafe extern "C" fn no_slots_get(out: *mut u32, cap: u32) -> u32 {
+    #[cfg(all(windows, target_arch = "x86"))]
+    {
+        slots::slot_ids(std::slice::from_raw_parts_mut(out, cap as usize)) as u32
+    }
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    {
+        let _ = (out, cap);
+        0
+    }
+}
+
+/// Solo baseline: install only the slot polymorph patch (sessions get it from
+/// `no_apply_patches`). Returns 0, or -1 on failure (see `no_last_error`).
+#[no_mangle]
+pub extern "C" fn no_slots_install() -> i32 {
+    #[cfg(all(windows, target_arch = "x86"))]
+    if let Err(e) = unsafe { slots::install_polymorph_only() } {
+        set_last_error(e.0);
+        return -1;
+    }
+    0
+}
+
+/// Noita's inventory GUI (see `invgui`): the local player entity whose GUI the mod runs.
+#[no_mangle]
+pub extern "C" fn no_gui_set_local(entity_id: u32) {
+    #[cfg(all(windows, target_arch = "x86"))]
+    invgui::set_local(entity_id);
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    let _ = entity_id;
+}
+
+/// Run the local player's inventory GUI once (outside the simulation window), recording
+/// its simulation changes as ops. Returns 1 if it ran.
+#[no_mangle]
+pub extern "C" fn no_gui_update() -> i32 {
+    #[cfg(all(windows, target_arch = "x86"))]
+    unsafe {
+        invgui::gui_update() as i32
+    }
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    0
+}
+
+/// Run the local player's pending full-inventory "replace which item" screen (outside the
+/// simulation window), recording its choice as ops. Returns 1 while it stays open.
+#[no_mangle]
+pub extern "C" fn no_gui_swap_update() -> i32 {
+    #[cfg(all(windows, target_arch = "x86"))]
+    unsafe {
+        invgui::swap_update() as i32
+    }
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    0
+}
+
+/// Copy the GUI ops recorded since the last call into `out`. Returns their length, or -3 if
+/// they do not fit (they are then dropped).
+///
+/// # Safety
+/// `out` must point at `cap` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn no_gui_take_ops(out: *mut u8, cap: u32) -> i32 {
+    #[cfg(all(windows, target_arch = "x86"))]
+    {
+        let ops = invgui::take_ops();
+        if ops.len() > cap as usize {
+            return -3;
+        }
+        std::ptr::copy_nonoverlapping(ops.as_ptr(), out, ops.len());
+        ops.len() as i32
+    }
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    {
+        let _ = (out, cap);
+        0
+    }
+}
+
+/// Apply player `owner_id`'s GUI ops (inside the simulation window, every client, in tick
+/// order). Returns the number applied, -1 if malformed.
+///
+/// # Safety
+/// `data` must point at `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn no_gui_apply(owner_id: u32, data: *const u8, len: u32) -> i32 {
+    #[cfg(all(windows, target_arch = "x86"))]
+    {
+        let d = if len == 0 { &[][..] } else { std::slice::from_raw_parts(data, len as usize) };
+        invgui::apply_ops(owner_id, d)
+    }
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    {
+        let _ = (owner_id, data, len);
+        0
+    }
+}
+
+/// Publish the focus centres (n × {x, y} floats, slot order) for physics-body freezing, the
+/// pathfinding clearance refresh and every player's view (`views`), and trigger the freeze
+/// pass when a focus moved far (call inside the simulation window).
 ///
 /// # Safety
 /// `xy` must point at `2 * n` readable f32.
@@ -570,11 +720,22 @@ pub unsafe extern "C" fn no_focus_freeze(xy: *const f32, n: u32) {
     #[cfg(all(windows, target_arch = "x86"))]
     {
         let foci: Vec<(f32, f32)> = (0..n as usize).map(|i| (*xy.add(2 * i), *xy.add(2 * i + 1))).collect();
+        views::set_foci(&foci);
         patches::pathfinding_foci(&foci);
         patches::focus_freeze_step(&foci);
     }
     #[cfg(not(all(windows, target_arch = "x86")))]
     let _ = (xy, n);
+}
+
+/// This client's player's view: its index among the foci last passed to `no_focus_freeze`,
+/// -1 when it has none (spectating). The client renders the screen shake of that view.
+#[no_mangle]
+pub extern "C" fn no_local_view(i: i32) {
+    #[cfg(all(windows, target_arch = "x86"))]
+    camreaders::set_local_view(usize::try_from(i).ok());
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    let _ = i;
 }
 
 /// Start-of-frame wait for chunk-generation jobs due for integration this frame (call in

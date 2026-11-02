@@ -121,6 +121,8 @@ pub struct Connection {
     rtt_us: f64,
     rtt_var_us: f64,
     rtt_sampled: bool,
+    rtt_min_us: u64,
+    rtt_samples: u32,
     last_recv: u64,
     last_send: u64,
     ack_pending: bool,
@@ -163,6 +165,8 @@ impl Connection {
             rtt_us: 100_000.0,
             rtt_var_us: 50_000.0,
             rtt_sampled: false,
+            rtt_min_us: u64::MAX,
+            rtt_samples: 0,
             last_recv: now,
             last_send: 0,
             ack_pending: false,
@@ -181,6 +185,18 @@ impl Connection {
     /// Smoothed round-trip time in microseconds.
     pub fn rtt_us(&self) -> u64 {
         self.rtt_us as u64
+    }
+
+    /// Smallest round-trip sample so far (µs; `u64::MAX` before the first one): the network
+    /// path itself, without the peer's scheduling delays (a client busy loading the game acks
+    /// late), which the smoothed estimate carries for many samples.
+    pub fn rtt_min_us(&self) -> u64 {
+        self.rtt_min_us
+    }
+
+    /// Number of round-trip samples taken so far.
+    pub fn rtt_samples(&self) -> u32 {
+        self.rtt_samples
     }
 
     pub fn timed_out(&self, now: u64) -> bool {
@@ -512,6 +528,8 @@ impl Connection {
         let sample = now.saturating_sub(p.time) as f64;
         let msgs = std::mem::take(&mut p.msgs);
         self.stats.packets_acked += 1;
+        self.rtt_min_us = self.rtt_min_us.min(sample as u64);
+        self.rtt_samples = self.rtt_samples.saturating_add(1);
         if !self.rtt_sampled {
             self.rtt_us = sample;
             self.rtt_var_us = sample / 2.0;
