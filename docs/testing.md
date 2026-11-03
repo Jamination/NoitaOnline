@@ -34,13 +34,15 @@ throws, kicks, item pickups, item switching, fights, in a 4800-frame cycle of ei
 phases) and the simulation spawns enemies, items, liquids and explosives around the
 players at fixed frames and polymorphs the last player during each cycle's long walk. So
 that every cycle exercises all of that for the whole session, the scenario keeps the bot
-players alive (1000 max HP, healed to full below half), refills their spells' uses before
-the bomb phase and gives them a potion before the throw phase when their first item slot
-is empty. Its potions hold a fixed rotation of liquids (no polymorphines) and its water
-pours are bounded, so the players stay on the terrain they dig instead of floating up a
-growing sea. `bot f=...` lines in `client_<id>.log` (every 300 frames per player) show each
-player's HP, position, held item, inventory, spell uses, nearby projectiles and its last
-Fire/Throw/Kick/Interact frames.
+players alive (1000 max HP, healed to full below half), makes them keep their items when
+another player kicks them (`is_immune_to_kicks`: the bots press Kick at the same frames, and
+a kicked player otherwise throws its whole inventory, see the README's limitations), refills
+their spells' uses before the bomb phase and gives them a potion before the throw phase when
+their first item slot is empty. Its potions hold a fixed rotation of liquids (no
+polymorphines) and its water pours are bounded, so the players stay on the terrain they dig
+instead of floating up a growing sea. `bot f=...` lines in `client_<id>.log` (every 300
+frames per player) show each player's HP, position, held item, inventory, spell uses,
+nearby projectiles and its last Fire/Throw/Kick/Interact frames.
 
 ```sh
 harness/e2e.sh --pin --players 4 --frames 36000 --out run/e2e/full          # 10 minutes

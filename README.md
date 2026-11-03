@@ -78,19 +78,35 @@ harness/evaluate.py --run run/e2e/full --baseline run/e2e/baseline --netsim-run 
 
 ## Limitations
 
+The goal is the base game's behaviour; these are the deviations multiplayer forces.
+
 - Lockstep: a session starts with all players present; players cannot join mid-session.
-  A player who leaves or dies becomes a frozen spectator. Starting a new game ends that
-  client's session (restart Noita to join another).
+  A player who leaves or dies (also as a polymorphed creature) becomes a frozen spectator
+  instead of ending the run for everyone. Starting a new game ends that client's session
+  (restart Noita to join another).
+- Input latency: your inputs take effect after the session's input delay (round trip + 2
+  frames, 3 frames on a LAN) plus one frame, about 67 ms on a LAN, more over the internet.
 - Noita's own inventory GUI (HUD, quick bar, inventory screen, pickup prompts) runs for
   each player on their own client; its edits travel through lockstep, so they take effect
   after the input delay. The inventory screen and the full-inventory "replace which item"
   screen do not pause the world for the other players (your character stands still while
   one is open).
 - Pausing (escape menu) stalls every client: lockstep advances only with all inputs.
-- The free camera does not move on its own; see [determinism](docs/determinism.md).
-- Camera-relative engine behaviour (on-screen particles, rain, CameraBound enemies) is
-  evaluated around every player's view, modelled from the player's position plus a
-  64 px margin for the vanilla camera's look-ahead.
+- Players can kick each other. Noita treats a kicked player like any kicked creature that
+  carries items: besides the push and the kick damage, it throws every wand and item out of
+  its inventory (only wand ghosts are immune). Single-player Noita has no second kicker, so
+  this only happens with several players; the engine's rule is kept.
+- Camera-relative engine behaviour (on-screen particles, rain, CameraBound enemies, AI
+  hunting, fog of war, screen shake) is evaluated around every player's view, modelled from
+  the player's position plus a 64 px margin for the vanilla camera's look-ahead. Weather
+  and music follow the first player. Markers the engine draws into the world (telepathy,
+  radar) are seen by every player.
+- One player's world-changing events (fungal shift, explosions, positional sounds) are
+  shared, as the world is; only their messages are shown to that player alone.
+- The in-game date (holiday content, weather changes on the hour) is the server's session
+  clock in UTC, the same for every player.
 - Every client simulates every player, so a client's CPU load grows with the player count.
+- Gamepad paths (stick aim, analog flying, camera look-ahead, rumble) are implemented but
+  untested: the test machine has no gamepad.
 - Only the Noita build of 2025-01-25 (PE timestamp `0x6794ee3c`) is supported; the
   runtime verifies every patched instruction and refuses to run on another build.

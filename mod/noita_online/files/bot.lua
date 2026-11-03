@@ -392,10 +392,19 @@ end
 -- HP and is healed to full whenever it drops below half (far more than one frame of damage
 -- here); before the bomb phase its spells' uses are refilled (vanilla's spell refresher), and
 -- before the throw phase a potion is put into its first item slot (key 5) if that is empty.
+-- It also keeps its items when another player kicks it: Noita's kick makes a kicked creature
+-- with an ItemPickUpperComponent throw every item it carries unless `is_immune_to_kicks`
+-- (vanilla sets it only on wand ghosts; the player has it off), and every bot presses Kick
+-- at the same frames of the walk/kick phase, so two bots standing together disarmed each
+-- other for the rest of the session. Their kicks still push and hurt each other.
 local CYCLE = 8 * PHASE
 local BOT_HP = 40 -- 1000 HP (a player starts with 4)
 
 local function sustain(e)
+  local picker = EntityGetFirstComponentIncludingDisabled(e, "ItemPickUpperComponent")
+  if picker and not ComponentGetValue2(picker, "is_immune_to_kicks") then
+    ComponentSetValue2(picker, "is_immune_to_kicks", true)
+  end
   local dm = EntityGetFirstComponentIncludingDisabled(e, "DamageModelComponent")
   if not dm then return end
   local max_hp = ComponentGetValue2(dm, "max_hp")
