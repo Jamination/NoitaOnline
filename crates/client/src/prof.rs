@@ -3,9 +3,17 @@
 //! dispatches, the world draw) and writes their inclusive main-thread time per frame every
 //! 600 frames to `$NOITA_ONLINE_OUT/sections_<instance>.txt`. Works with and without the
 //! determinism patches (install after them: wrappers call whatever the site calls now).
+//!
+//! `NOITA_ONLINE_STEPLOG=from-to` uses the same wrappers to find the stage of a step where
+//! clients first differ: in that frame range it logs [`crate::patches::step_state`] at every
+//! section edge (`e<i>` entry, `x<i>` exit of `SECTIONS[i]`), after every entity system's
+//! update (`s<i>`, systems in update order, named by `N s<i> <RTTI name>` header lines) and at
+//! the simulation window's entry and exit (`we`, `wx`), as `<frame> <point> <state>` lines in
+//! `$NOITA_ONLINE_OUT/step_<instance>.txt`.
 
+use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 type Bool = i32;
@@ -68,7 +76,11 @@ const SECTIONS: &[(&str, Hook)] = &[
 const DM_UPDATE: usize = 0;
 const WORLD: usize = 4;
 const AFTER_ENTITIES: usize = 19;
+/// The entity system manager's update (`FUN_0057a4a0`: every system's vtable+0xc).
+const SYSTEMS: usize = 21;
 const N: usize = SECTIONS.len();
+/// Entity system manager (singleton of `FUN_0042d610`); +0x14/+0x18 system pointer vector.
+const SYSTEM_MANAGER: u32 = 0x0122_36e0;
 
 struct State {
     start: [Option<Instant>; N],
@@ -103,9 +115,19 @@ extern "C" fn enter(i: u32) {
     if i == DM_UPDATE && s.window_start.is_none() {
         s.window_start = Some(now);
     }
+    drop(s);
+    if STEPLOG.is_some() {
+        if i == SYSTEMS {
+            unsafe { hook_systems() };
+        }
+        step_point('e', i as u32);
+    }
 }
 
 extern "C" fn exit(i: u32) {
+    if STEPLOG.is_some() {
+        step_point('x', i);
+    }
     let now = Instant::now();
     let mut s = STATE.lock().unwrap_or_else(|p| p.into_inner());
     let i = i as usize;
@@ -115,6 +137,12 @@ extern "C" fn exit(i: u32) {
     }
     s.last_exit[i] = Some(now);
     if i != DM_UPDATE {
+        return;
+    }
+    if let Some((_, _, log)) = STEPLOG.as_ref() {
+        let _ = log.lock().unwrap_or_else(|p| p.into_inner()).flush();
+    }
+    if !*PROF_ON {
         return;
     }
     s.frames += 1;
@@ -136,7 +164,6 @@ extern "C" fn exit(i: u32) {
     s.window_start = Some(now);
     drop(s);
     if let (Ok(dir), inst) = (std::env::var("NOITA_ONLINE_OUT"), std::env::var("NOITA_ONLINE_INSTANCE").unwrap_or_default()) {
-        use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(std::path::Path::new(&dir).join(format!("sections_{inst}.txt"))) {
             let _ = f.write_all(out.as_bytes());
         }
@@ -164,6 +191,96 @@ extern "C" fn exit(i: u32) {
                 let _ = f.write_all(text.as_bytes());
             }
         }
+    }
+}
+
+static PROF_ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("NOITA_ONLINE_PROF").is_some());
+
+/// `NOITA_ONLINE_STEPLOG=from-to`: (from, to, `step_<instance>.txt`).
+#[allow(clippy::type_complexity)]
+static STEPLOG: LazyLock<Option<(u32, u32, Mutex<std::io::BufWriter<std::fs::File>>)>> = LazyLock::new(|| {
+    let v = std::env::var("NOITA_ONLINE_STEPLOG").ok()?;
+    let (a, b) = v.split_once('-')?;
+    let out = std::env::var("NOITA_ONLINE_OUT").ok()?;
+    let inst = std::env::var("NOITA_ONLINE_INSTANCE").unwrap_or_default();
+    let f = std::fs::File::create(std::path::Path::new(&out).join(format!("step_{inst}.txt"))).ok()?;
+    Some((a.parse().ok()?, b.parse().ok()?, Mutex::new(std::io::BufWriter::new(f))))
+});
+
+/// `NOITA_ONLINE_STEPLOG_TILES=1`: also log [`crate::patches::step_tiles`] (`T <frame> <point>
+/// ...` lines) at the window entry and at the grid update's entry and exit.
+static STEPLOG_TILES: LazyLock<bool> = LazyLock::new(|| std::env::var_os("NOITA_ONLINE_STEPLOG_TILES").is_some());
+
+/// Log the step state at `point` (`NOITA_ONLINE_STEPLOG`; no-op outside its frame range).
+pub(crate) fn step_mark(point: &str) {
+    let Some((a, b, log)) = STEPLOG.as_ref() else { return };
+    if let Some((frame, state)) = unsafe { crate::patches::step_state(*a, *b) } {
+        let mut log = log.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = writeln!(log, "{frame} {point} {state}");
+        if *STEPLOG_TILES && matches!(point, "we" | "e12" | "x12") {
+            let _ = writeln!(log, "T {frame} {point} {}", unsafe { crate::patches::step_tiles() });
+        }
+    }
+}
+
+fn step_point(tag: char, i: u32) {
+    step_mark(&format!("{tag}{i}"));
+}
+
+extern "C" fn system_exit(i: u32) {
+    step_point('s', i);
+}
+
+/// RTTI name of the class whose vtable is `vtbl` (MSVC: vtable[-1] = complete object locator,
+/// +0xc type descriptor, +8 decorated name).
+unsafe fn rtti_name(vtbl: u32) -> String {
+    let image = 0x0040_0000..0x0140_0000;
+    let col = *((vtbl - 4) as *const u32);
+    if !image.contains(&col) {
+        return "?".into();
+    }
+    let td = *((col + 0xc) as *const u32);
+    if !image.contains(&td) {
+        return "?".into();
+    }
+    std::ffi::CStr::from_ptr((td + 8) as *const std::ffi::c_char).to_string_lossy().into_owned()
+}
+
+/// Wrap every entity system's update (vtable+0xc) so [`system_exit`] logs the state after it
+/// (`NOITA_ONLINE_STEPLOG`). Runs once, on entry of the system manager's update.
+unsafe fn hook_systems() {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let (begin, end) = (*((SYSTEM_MANAGER + 0x14) as *const u32), *((SYSTEM_MANAGER + 0x18) as *const u32));
+    let count = end.saturating_sub(begin) / 4;
+    let page = VirtualAlloc(std::ptr::null_mut(), 0x2_0000, 0x3000, 0x40) as u32;
+    if page == 0 || count == 0 {
+        return;
+    }
+    let exit_cb = (system_exit as extern "C" fn(u32)) as u32;
+    let mut at = page;
+    let mut hooked = Vec::new();
+    let mut names = String::new();
+    for k in 0..count {
+        let system = *((begin + 4 * k) as *const u32);
+        if system == 0 {
+            continue;
+        }
+        let vtbl = *(system as *const u32);
+        let slot = vtbl + 0xc;
+        names.push_str(&format!("N s{k} {} {:08x}\n", rtti_name(vtbl), *(slot as *const u32)));
+        if hooked.contains(&slot) || at + 0x100 > page + 0x2_0000 {
+            continue;
+        }
+        hooked.push(slot);
+        let target = *(slot as *const u32);
+        let stub = wrap(&mut at, k, target, None, exit_cb);
+        write(slot, &stub.to_le_bytes());
+    }
+    if let Some((_, _, log)) = STEPLOG.as_ref() {
+        let _ = log.lock().unwrap_or_else(|p| p.into_inner()).write_all(names.as_bytes());
     }
 }
 
@@ -254,13 +371,38 @@ unsafe fn write(addr: u32, bytes: &[u8]) {
     FlushInstructionCache(GetCurrentProcess(), addr as *const u8, bytes.len());
 }
 
-/// Install the section wrappers (idempotent; no-op unless `NOITA_ONLINE_PROF` is set).
+/// Write a wrapper stub for `target` at `*at` (advanced past it) and return its address:
+/// a return-address slot (sites are not re-entered), then
+/// `[enter idx]; pop [slot]; call target; push [slot]; exit idx; ret`.
+unsafe fn wrap(at: &mut u32, idx: u32, target: u32, enter_cb: Option<u32>, exit_cb: u32) -> u32 {
+    let slot = *at;
+    let stub = slot + 4;
+    let mut c = Vec::with_capacity(256);
+    if let Some(cb) = enter_cb {
+        callback(&mut c, idx, cb);
+    }
+    c.extend_from_slice(&[0x8F, 0x05]);
+    c.extend_from_slice(&slot.to_le_bytes());
+    c.push(0xE8);
+    let call_end = stub + c.len() as u32 + 4;
+    c.extend_from_slice(&target.wrapping_sub(call_end).to_le_bytes());
+    c.extend_from_slice(&[0xFF, 0x35]);
+    c.extend_from_slice(&slot.to_le_bytes());
+    callback(&mut c, idx, exit_cb);
+    c.push(0xC3);
+    std::ptr::copy_nonoverlapping(c.as_ptr(), stub as *mut u8, c.len());
+    *at = (stub + c.len() as u32 + 15) & !15;
+    stub
+}
+
+/// Install the section wrappers (idempotent; no-op unless `NOITA_ONLINE_PROF` or
+/// `NOITA_ONLINE_STEPLOG` is set).
 ///
 /// # Safety
 /// Inside noita.exe build 0x6794ee3c, game thread, after the determinism patches.
 pub unsafe fn install() {
     static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if std::env::var_os("NOITA_ONLINE_PROF").is_none() || DONE.swap(true, Ordering::Relaxed) {
+    if (!*PROF_ON && STEPLOG.is_none()) || DONE.swap(true, Ordering::Relaxed) {
         return;
     }
     let page = VirtualAlloc(std::ptr::null_mut(), 0x4000, 0x3000, 0x40) as u32;
@@ -280,23 +422,7 @@ pub unsafe fn install() {
             }
             Hook::Vtbl(slot) => *(slot as *const u32),
         };
-        // Return-address slot (sites are not re-entered), then the stub:
-        // enter; pop [slot]; call target; push [slot]; exit; ret
-        let slot = at;
-        let stub = at + 4;
-        let mut c = Vec::with_capacity(256);
-        callback(&mut c, i as u32, enter_cb);
-        c.extend_from_slice(&[0x8F, 0x05]);
-        c.extend_from_slice(&slot.to_le_bytes());
-        c.push(0xE8);
-        let call_end = stub + c.len() as u32 + 4;
-        c.extend_from_slice(&target.wrapping_sub(call_end).to_le_bytes());
-        c.extend_from_slice(&[0xFF, 0x35]);
-        c.extend_from_slice(&slot.to_le_bytes());
-        callback(&mut c, i as u32, exit_cb);
-        c.push(0xC3);
-        std::ptr::copy_nonoverlapping(c.as_ptr(), stub as *mut u8, c.len());
-        at = (stub + c.len() as u32 + 15) & !15;
+        let stub = wrap(&mut at, i as u32, target, Some(enter_cb), exit_cb);
         match *hook {
             Hook::Call(site) => write(site + 1, &stub.wrapping_sub(site + 5).to_le_bytes()),
             Hook::Vtbl(slot) => write(slot, &stub.to_le_bytes()),

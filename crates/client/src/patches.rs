@@ -378,15 +378,24 @@ unsafe fn redirect_call(site: u32, orig: u32, new_target: u32) -> Result<(), Pat
 /// chunk) while everything else runs inline: chunk jobs get an unpatched copy of the
 /// async submit, and their only global-LCG write is removed. Integration stays
 /// frame-deterministic through the chunk-wait barrier. Each job runs through
-/// [`chunk_job_stub`], which gives it its own cell RNG stream ([`patch_chunk_rng`]). Must run
-/// before [`patch_inline_jobs`] (it copies the original submit routine).
+/// [`chunk_job_stub`], which gives it its own cell RNG stream ([`patch_chunk_rng`]) and its
+/// submission frame ([`chunk_job_submitted`], [`patch_chunk_frame`]). Must run before
+/// [`patch_inline_jobs`] (it copies the original submit routine).
 unsafe fn patch_threaded_chunkgen(ex: &mut Exec) -> Result<(), PatchError> {
     expect(CELL_CTOR_LCG_STORE, &[0xA3, 0x1C, 0x74, 0x20, 0x01])?;
     expect(POOL_ASYNC_FN, &[0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x18])?;
     let job_jmp = rel32(CHUNK_JOB_JMP + 5, CHUNK_JOB_FN);
     expect(CHUNK_JOB_JMP, &[0xE9, job_jmp[0], job_jmp[1], job_jmp[2], job_jmp[3]])?;
     let copy = copy_function(ex, POOL_ASYNC_FN, POOL_ASYNC_LEN, &POOL_ASYNC_RELCALLS)?;
-    redirect_call(CHUNKGEN_SUBMIT_CALL, POOL_ASYNC_FN, copy)?;
+    // EDI = the job at the submit call: push ecx; push edi; mov eax,chunk_job_submitted;
+    // call eax; add esp,4; pop ecx; jmp copy
+    let f = ((chunk_job_submitted as extern "C" fn(u32)) as u32).to_le_bytes();
+    let stub_at = ex.base + ex.used;
+    let mut stub = vec![0x51, 0x57, 0xB8, f[0], f[1], f[2], f[3], 0xFF, 0xD0, 0x83, 0xC4, 0x04, 0x59, 0xE9];
+    stub.extend_from_slice(&rel32(stub_at + stub.len() as u32 + 4, copy));
+    let submit = ex.put(&stub);
+    debug_assert_eq!(submit, stub_at);
+    redirect_call(CHUNKGEN_SUBMIT_CALL, POOL_ASYNC_FN, submit)?;
     write_code(CELL_CTOR_LCG_STORE, &[0x90; 5])?;
     let stub = chunk_job_stub(ex);
     let mut jmp = vec![0xE9];
@@ -403,6 +412,32 @@ const CHUNK_JOB_FN: u32 = 0x0073_b040;
 thread_local! {
     /// The cell RNG state of the chunk job running on this thread, if any ([`patch_chunk_rng`]).
     static CHUNK_JOB_RNG: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// The submission frame of the chunk job running on this thread, if any
+    /// ([`patch_chunk_frame`]).
+    static CHUNK_JOB_FRAME: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The grid frame counter (the world's vtable+0x10, `[GridWorld+0x4fc]`) at each pending
+/// chunk job's submission, by job ([`chunk_job_submitted`]; taken by [`chunk_job_begin`]).
+static CHUNK_SUBMIT_FRAMES: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// The world's frame counter (vtable+0x10).
+unsafe fn world_frame(world: u32) -> u32 {
+    let get: extern "thiscall" fn(u32) -> u32 = std::mem::transmute(rd(rd(world) + 0x10) as usize);
+    get(world)
+}
+
+/// Game thread, as the chunk-generation dispatch submits `job` (whose world, job+0x74, is
+/// set): remember the grid frame.
+extern "C" fn chunk_job_submitted(job: u32) {
+    let world = unsafe { rd(job + 0x74) };
+    if world == 0 {
+        return;
+    }
+    let frame = unsafe { world_frame(world) };
+    let mut v = CHUNK_SUBMIT_FRAMES.lock().unwrap_or_else(|p| p.into_inner());
+    v.retain(|&(j, _)| j != job);
+    v.push((job, frame));
 }
 
 /// Session seed (set by [`fix_seeds`]): salt of the chunk jobs' cell RNG streams.
@@ -422,16 +457,23 @@ unsafe fn chunk_job_stub(ex: &mut Exec) -> u32 {
 }
 
 /// A chunk job starts on this thread: its cell RNG stream starts from the session seed and
-/// the chunk's coordinates, the same on every client and every time the chunk is built.
+/// the chunk's coordinates, the same on every client and every time the chunk is built; its
+/// cells' creation frame is its submission frame.
 extern "C" fn chunk_job_begin(job: u32) {
     let (cx, cy) = unsafe { (rd(job + 0x58), rd(job + 0x5c)) };
     let seed = SESSION_SEED.load(Ordering::Relaxed) ^ cx.wrapping_mul(0x9e37_79b1) ^ cy.wrapping_mul(0x85eb_ca77);
     let _ = CHUNK_JOB_RNG.try_with(|r| r.set(Some(seed)));
+    let frame = {
+        let mut v = CHUNK_SUBMIT_FRAMES.lock().unwrap_or_else(|p| p.into_inner());
+        v.iter().position(|&(j, _)| j == job).map(|i| v.swap_remove(i).1)
+    };
+    let _ = CHUNK_JOB_FRAME.try_with(|f| f.set(frame));
     chunk_job_delay();
 }
 
 extern "C" fn chunk_job_end() {
     let _ = CHUNK_JOB_RNG.try_with(|r| r.set(None));
+    let _ = CHUNK_JOB_FRAME.try_with(|f| f.set(None));
 }
 
 /// Diagnostics: `NOITA_ONLINE_CHUNKJOB_DELAY=<instance>:<ms>` delays the start of every chunk
@@ -516,6 +558,47 @@ extern "C" fn cell_rng_draw(state: *mut u32) -> u32 {
     }
 }
 
+/// The fire and lifetime-liquid constructors read the creation frame through the world's
+/// vtable+0x10 (ECX = the world): CFireCell (FUN_00709ef0) `mov eax,[ecx]; mov esi,edx;
+/// call [eax+0x10]` (fire age), CLiquidCell (FUN_0070ae10) `mov eax,[ebx]; call [eax+0x10]`
+/// (ECX = EBX; liquid lifetime start). Replacement: (site, original, the bytes kept before
+/// the call).
+const CELL_FRAME_SITES: [(u32, &[u8], &[u8]); 2] = [
+    (0x0070_9f6a, &[0x8B, 0x01, 0x8B, 0xF2, 0xFF, 0x50, 0x10], &[0x8B, 0xF2]),
+    (0x0070_ae97, &[0x8B, 0x03, 0xFF, 0x50, 0x10], &[]),
+];
+
+/// Chunk jobs build cells with the real GridWorld, whose frame counter (+0x4fc) the game
+/// thread increments at the start of every grid update. A fire or lifetime liquid cell
+/// generated or reloaded on a worker thread therefore got the frame the job happened to
+/// reach it in: a creation frame (and so a burn-out or expiry frame) that depended on
+/// thread timing. Inside a chunk job the constructors now read the job's submission frame
+/// ([`chunk_job_submitted`], game thread); everywhere else the world's counter, as before.
+unsafe fn patch_chunk_frame(_: &mut Exec) -> Result<(), PatchError> {
+    for (site, orig, _) in CELL_FRAME_SITES {
+        expect(site, orig)?;
+    }
+    let f: unsafe extern "thiscall" fn(u32) -> u32 = cell_frame;
+    for (site, orig, keep) in CELL_FRAME_SITES {
+        let mut code = keep.to_vec();
+        let call_end = site + code.len() as u32 + 5;
+        code.push(0xE8);
+        code.extend_from_slice(&rel32(call_end, f as usize as u32));
+        debug_assert_eq!(code.len(), orig.len());
+        write_code(site, &code)?;
+    }
+    Ok(())
+}
+
+/// The creation frame a cell constructor sees: the submission frame of the chunk job running
+/// on this thread, else the world's frame counter.
+unsafe extern "thiscall" fn cell_frame(world: u32) -> u32 {
+    match CHUNK_JOB_FRAME.try_with(|f| f.get()) {
+        Ok(Some(frame)) => frame,
+        _ => world_frame(world),
+    }
+}
+
 /// Group job submit (FUN_0084c240): 0xd4 bytes, rel32 calls at +0x64 and +0x92.
 const POOL_GROUP_FN: u32 = 0x0084_c240;
 const POOL_GROUP_LEN: usize = 0xd4;
@@ -524,8 +607,10 @@ const POOL_GROUP_RELCALLS: [usize; 2] = [0x64, 0x92];
 const GRID_TILE_SUBMIT_CALLS: [u32; 3] = [0x0072_7d5a, 0x0072_8051, 0x0072_82b5];
 
 /// The falling-sand grid's 64x64 tiles run in parallel deterministically (each tile owns
-/// its RNG and the four checkerboard passes never let tiles race), so they keep the
-/// worker threads; other pool jobs run inline. Must run before [`patch_inline_jobs`].
+/// its RNG, queues its world edits for the game thread, and the four checkerboard passes
+/// never let tiles race; the explosion path, which did not hold to that, is
+/// [`crate::explosions`]), so they keep the worker threads; other pool jobs run inline. Must
+/// run before [`patch_inline_jobs`].
 unsafe fn patch_threaded_grid(ex: &mut Exec) -> Result<(), PatchError> {
     expect(POOL_GROUP_FN, &[0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x14])?;
     let copy = copy_function(ex, POOL_GROUP_FN, POOL_GROUP_LEN, &POOL_GROUP_RELCALLS)?;
@@ -633,6 +718,7 @@ pub unsafe fn apply_all() -> Result<u32, PatchError> {
     if std::env::var_os("NOITA_ONLINE_PROF").is_some() {
         install_job_profiler(&mut ex)?;
     }
+    crate::explosions::install_log()?;
     APPLIED.store(count + 1, Ordering::Relaxed);
     Ok(count)
 }
@@ -1039,7 +1125,9 @@ const PATCHES: &[(&str, PatchFn)] = &[
     ("chunkwait", patch_chunk_wait),
     ("threaded_chunkgen", patch_threaded_chunkgen),
     ("chunk_rng", patch_chunk_rng),
+    ("chunk_frame", patch_chunk_frame),
     ("threaded_grid", patch_threaded_grid),
+    ("tile_explosions", |ex| unsafe { crate::explosions::patch_tile_explosions(ex) }),
     ("threaded_render", patch_threaded_render),
     ("threaded_pathfinding", patch_threaded_pathfinding),
     ("inline_group", |_| unsafe { patch_inline_group() }),
@@ -1382,6 +1470,8 @@ pub unsafe fn sim_rng_enter() {
     prof_window(true);
     // What vanilla's grid render queued at the end of the last frame (`cell_emitters`).
     crate::cosmetic::emit_cell_particles();
+    crate::prof::step_mark("we");
+    rng_watch(true);
 }
 
 /// Leaving the simulation window: save the sim stream, put the per-client states back,
@@ -1394,6 +1484,8 @@ pub unsafe fn sim_rng_leave() {
     if !IN_WINDOW.swap(false, Ordering::Relaxed) {
         return;
     }
+    crate::prof::step_mark("wx");
+    rng_watch(false);
     rng_log('>');
     prof_window(false);
     // Box2D safety net (`box2d_freeze`): a slow step goes out with the next input; this
@@ -1517,6 +1609,20 @@ pub unsafe fn set_camera_pos(x: f32, y: f32) {
     *((gg + GG_CAMERA_LOCK) as *mut u8) = 0;
 }
 
+/// Diagnostics (`NOITA_ONLINE_RNGWATCH`, [`crate::rngwatch`]): watch the simulation RNGs for
+/// writes from other threads while the window is open.
+unsafe fn rng_watch(enter: bool) {
+    if std::env::var_os("NOITA_ONLINE_RNGWATCH").is_none() {
+        return;
+    }
+    let gg = rd(GAME_GLOBAL_PTR);
+    let wd = if gg != 0 { rd(gg + 0x0c) } else { 0 };
+    let gw = if wd != 0 { rd(wd + 0x44) } else { 0 };
+    let rs = RAND_STATE_ADDR.load(Ordering::Relaxed);
+    let watch = [(GLOBAL_LCG, 4), (PARTICLE_RNG, 8), (if gw != 0 { gw + 4 } else { 0 }, 4), (rs, 4)];
+    crate::rngwatch::on_window(enter, if gg != 0 { rd(gg) } else { 0 }, watch);
+}
+
 /// Diagnostics: `NOITA_ONLINE_RNGLOG=from-to` appends the simulation RNG states at every
 /// window entry (`<`) and exit (`>`) in that frame range to `$NOITA_ONLINE_OUT/rng_<instance>.txt`.
 unsafe fn rng_log(tag: char) {
@@ -1608,9 +1714,23 @@ unsafe fn body_hash_lines(frame: u32, tag: char, grid_world: u32) -> String {
         return out;
     }
     let each = std::env::var_os("NOITA_ONLINE_RNGLOG_BODIES").is_some();
+    let (n, all, sleep) = body_hashes(b2, |i, body, h, flags, st| {
+        if each {
+            let x = *((body + 0x18) as *const f64);
+            let y = *((body + 0x20) as *const f64);
+            let _ = writeln!(out, "b {frame} {tag} {i} {h:08x} {x} {y} t{} f{flags:04x} s{st}", rd(body + 8));
+        }
+    });
+    let _ = writeln!(out, "B {frame} {tag} {n} {all:08x} sleep={sleep:08x}");
+    out
+}
+
+/// Every b2World body in list order: (count, motion hash, sleep hash), calling `each(index,
+/// body, body motion hash, flags, sleep time)`. The motion hash covers dwords 6..43
+/// (transform, sweep, velocities); the sleep hash the flags (awake 2, active 0x20; the island
+/// flag 1 masked) and the sleep time.
+unsafe fn body_hashes(b2: u32, mut each: impl FnMut(u32, u32, u32, u16, f64)) -> (u32, u32, u32) {
     let (mut all, mut n) = (0x811c_9dc5u32, 0u32);
-    // Sleep state, not part of the motion hash: flags (awake 2, active 0x20; the island flag 1
-    // masked) and the sleep time.
     let mut sleep = 0x811c_9dc5u32;
     let mut body = rd(b2 + 0x1922c);
     while body != 0 && n < 100_000 {
@@ -1624,16 +1744,40 @@ unsafe fn body_hash_lines(frame: u32, tag: char, grid_world: u32) -> String {
         for v in [flags as u32, st.to_bits() as u32, (st.to_bits() >> 32) as u32] {
             sleep = (sleep ^ v).wrapping_mul(0x0100_0193);
         }
-        if each {
-            let x = *((body + 0x18) as *const f64);
-            let y = *((body + 0x20) as *const f64);
-            let _ = writeln!(out, "b {frame} {tag} {n} {h:08x} {x} {y} t{} f{flags:04x} s{st}", rd(body + 8));
-        }
+        each(n, body, h, flags, st);
         n += 1;
         body = rd(body + 0xb8);
     }
-    let _ = writeln!(out, "B {frame} {tag} {n} {all:08x} sleep={sleep:08x}");
-    out
+    (n, all, sleep)
+}
+
+/// Diagnostics for `NOITA_ONLINE_STEPLOG` ([`crate::prof`]): if the game frame is in
+/// `from..=to`, the frame and the state a step's stages change: whether the window is open,
+/// every RNG (the simulation's inside the window), the GridWorld RNG, the Box2D body count
+/// and motion / sleep hashes.
+pub(crate) unsafe fn step_state(from: u32, to: u32) -> Option<(u32, String)> {
+    let gg = rd(GAME_GLOBAL_PTR);
+    let frame = if gg != 0 { rd(gg) } else { 0 };
+    if gg == 0 || frame < from || frame > to {
+        return None;
+    }
+    let s = RngBank::capture();
+    let wd = rd(gg + 0x0c);
+    let gw = if wd != 0 { rd(wd + 0x44) } else { 0 };
+    let b2 = if gw != 0 { rd(gw + GW_B2WORLD) } else { 0 };
+    let (n, all, sleep) = if b2 != 0 { body_hashes(b2, |_, _, _, _, _| {}) } else { (0, 0, 0) };
+    let line = format!(
+        "w={} lcg={:08x} plat={:08x}/{:08x} pm={:.0} part={:.0} rand={:08x} gw={:08x} nb={n} bh={all:08x} sl={sleep:08x}",
+        in_window() as u8,
+        s.lcg,
+        s.plat_a0,
+        s.plat_a4,
+        s.pm,
+        s.particle,
+        s.rand,
+        if gw != 0 { rd(gw + 4) } else { 0 }
+    );
+    Some((frame, line))
 }
 
 /// Diagnostics: every 64x64 grid tile (tile map in key order) as `T frame x y rng` and the
@@ -1641,48 +1785,29 @@ unsafe fn body_hash_lines(frame: u32, tag: char, grid_world: u32) -> String {
 unsafe fn grid_tiles_dump(frame: u32) -> String {
     use std::fmt::Write;
     let mut out = String::new();
-    let gg = rd(GAME_GLOBAL_PTR);
-    let world_data = if gg != 0 { rd(gg + 0x0c) } else { 0 };
-    let grid_world = if world_data != 0 { rd(world_data + 0x44) } else { 0 };
-    let imp = if grid_world != 0 { rd(grid_world + 0x5d0) } else { 0 };
+    let imp = grid_impl();
     if imp == 0 {
         return out;
     }
-    let mgr = rd(imp + 0x40);
-    let head = if mgr != 0 { rd(mgr + 0x14) } else { 0 };
-    if head != 0 {
-        // in-order walk of the MSVC red-black tree (node: left, parent, right, .., isnil +0xd)
-        let mut stack = Vec::new();
-        let mut n = rd(head + 4);
-        loop {
-            while n != 0 && n != head && *((n + 0xd) as *const u8) == 0 {
-                stack.push(n);
-                n = rd(n);
-            }
-            let Some(m) = stack.pop() else { break };
-            let tile = rd(m + 0x20);
-            if tile != 0 {
-                let r = |o: u32| rd(tile + o) as i32;
-                let _ = writeln!(
-                    out,
-                    "T {frame} {} {} {:08x} d={},{},{},{} u={},{},{},{} w={}",
-                    r(0x540),
-                    r(0x544),
-                    rd(tile + 4),
-                    r(0x480),
-                    r(0x484),
-                    r(0x488),
-                    r(0x48c),
-                    r(0x550),
-                    r(0x554),
-                    r(0x558),
-                    r(0x55c),
-                    *((tile + 0x46c) as *const u8)
-                );
-            }
-            n = rd(m + 8);
-        }
-    }
+    for_each_tile(imp, |tile| {
+        let r = |o: u32| rd(tile + o) as i32;
+        let _ = writeln!(
+            out,
+            "T {frame} {} {} {:08x} d={},{},{},{} u={},{},{},{} w={}",
+            r(0x540),
+            r(0x544),
+            rd(tile + 4),
+            r(0x480),
+            r(0x484),
+            r(0x488),
+            r(0x48c),
+            r(0x550),
+            r(0x554),
+            r(0x558),
+            r(0x55c),
+            *((tile + 0x46c) as *const u8)
+        );
+    });
     let count = rd(imp) as usize;
     let arr = rd(imp + 4);
     let _ = write!(out, "A {frame} {count}");
@@ -1692,6 +1817,111 @@ unsafe fn grid_tiles_dump(frame: u32) -> String {
     }
     out.push('\n');
     out
+}
+
+/// The threaded grid (GridWorld+0x5d0: active list {count, tiles, .., +0x30 deferred count,
+/// +0x34 deferred tiles}, +0x40 tile manager), or 0.
+unsafe fn grid_impl() -> u32 {
+    let gg = rd(GAME_GLOBAL_PTR);
+    let world_data = if gg != 0 { rd(gg + 0x0c) } else { 0 };
+    let grid_world = if world_data != 0 { rd(world_data + 0x44) } else { 0 };
+    if grid_world != 0 {
+        rd(grid_world + 0x5d0)
+    } else {
+        0
+    }
+}
+
+/// Every tile of the threaded grid's tile map (manager +0x14), in key order.
+unsafe fn for_each_tile(imp: u32, mut f: impl FnMut(u32)) {
+    let mgr = rd(imp + 0x40);
+    let head = if mgr != 0 { rd(mgr + 0x14) } else { 0 };
+    if head == 0 {
+        return;
+    }
+    // in-order walk of the MSVC red-black tree (node: left, parent, right, .., isnil +0xd)
+    let mut stack = Vec::new();
+    let mut n = rd(head + 4);
+    loop {
+        while n != 0 && n != head && *((n + 0xd) as *const u8) == 0 {
+            stack.push(n);
+            n = rd(n);
+        }
+        let Some(m) = stack.pop() else { break };
+        let tile = rd(m + 0x20);
+        if tile != 0 {
+            f(tile);
+        }
+        n = rd(m + 8);
+    }
+}
+
+/// Diagnostics for `NOITA_ONLINE_STEPLOG_TILES` ([`crate::prof`]): the active tile list
+/// (count, deferred count, hash of its order) and every tile of the tile map as
+/// `x,y:rng:cells:meta` (tile index, its RNG, an FNV hash of its rect's material ids, a hash of
+/// its dirty / update rects and wake flags).
+pub(crate) unsafe fn step_tiles() -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let imp = grid_impl();
+    let gg = rd(GAME_GLOBAL_PTR);
+    let table = chunk_table_ptr();
+    if imp == 0 || table == 0 {
+        return out;
+    }
+    let fnv = |h: u32, v: u32| (h ^ v).wrapping_mul(0x0100_0193);
+    let tile_id = |t: u32| ((rd(t + 0x540) & 0xffff) << 16) | (rd(t + 0x544) & 0xffff);
+    let (count, deferred) = (rd(imp), rd(imp + 0x30));
+    let mut order = 0x811c_9dc5u32;
+    for i in 0..count.min(65536) {
+        order = fnv(order, tile_id(rd(rd(imp + 4) + 4 * i)));
+    }
+    for i in 0..deferred.min(65536) {
+        order = fnv(order, tile_id(rd(rd(imp + 0x34) + 4 * i)));
+    }
+    let _ = write!(out, "act={count} def={deferred} order={order:08x}");
+    let materials = rd(rd(gg + 0x18) + 0x18);
+    for_each_tile(imp, |tile| {
+        let r = |o: u32| rd(tile + o) as i32;
+        let (x0, y0, w, h) = (r(0x470), r(0x474), r(0x478), r(0x47c));
+        let mut cells = 0x811c_9dc5u32;
+        let chunk_of = |x: i32, y: i32| rd(table + 4 * ((((y >> 9) + 256) & 511) as u32 * 512 + (((x >> 9) + 256) & 511) as u32));
+        for y in y0..y0.saturating_add(h.clamp(0, 512)) {
+            let mut chunk = chunk_of(x0, y);
+            for x in x0..x0.saturating_add(w.clamp(0, 512)) {
+                if x & 511 == 0 {
+                    chunk = chunk_of(x, y);
+                }
+                let cell = if chunk != 0 { rd(rd(chunk) + 4 * ((((y & 511) as u32) << 9) | (x & 511) as u32)) } else { 0 };
+                let id = if cell != 0 { rd(cell + 0x14).wrapping_sub(materials) / 0x290 } else { 0xffff };
+                cells = fnv(cells, id);
+            }
+        }
+        let mut rects = 0x811c_9dc5u32;
+        for o in [0x480, 0x484, 0x488, 0x48c, 0x550, 0x554, 0x558, 0x55c] {
+            rects = fnv(rects, rd(tile + o));
+        }
+        let flags = u32::from_le_bytes([
+            *((tile + 0x46c) as *const u8),
+            *((tile + 0x46d) as *const u8),
+            *((tile + 0x46e) as *const u8),
+            *((tile + 0x53c) as *const u8),
+        ]);
+        let _ = write!(out, " {},{}:{:x}:{cells:x}:{rects:x}:{flags:x}:{:x}", r(0x540), r(0x544), rd(tile + 4), rd(tile + 0x538));
+    });
+    out
+}
+
+/// The chunk table (GridWorld+0x500 ChunkMap, +8), or 0 without a world.
+unsafe fn chunk_table_ptr() -> u32 {
+    let gg = rd(GAME_GLOBAL_PTR);
+    let world_data = if gg != 0 { rd(gg + 0x0c) } else { 0 };
+    let grid_world = if world_data != 0 { rd(world_data + 0x44) } else { 0 };
+    if grid_world != 0 {
+        rd(grid_world + 0x508)
+    } else {
+        0
+    }
 }
 
 /// GridWorld::OnCameraRectChanged's call that freezes/destroys physics bodies far from the

@@ -11,6 +11,8 @@ pub mod clock;
 #[cfg(all(windows, target_arch = "x86"))]
 pub mod cosmetic;
 #[cfg(all(windows, target_arch = "x86"))]
+pub mod explosions;
+#[cfg(all(windows, target_arch = "x86"))]
 pub mod gridcap;
 pub mod net;
 #[cfg(all(windows, target_arch = "x86"))]
@@ -22,6 +24,8 @@ pub mod prof;
 pub mod ragdoll;
 #[cfg(all(windows, target_arch = "x86"))]
 pub mod report;
+#[cfg(all(windows, target_arch = "x86"))]
+pub mod rngwatch;
 #[cfg(all(windows, target_arch = "x86"))]
 pub mod world;
 #[cfg(all(windows, target_arch = "x86"))]
