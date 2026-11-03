@@ -184,14 +184,14 @@ extern "C" fn cosmetic_cell(fx: f32, fy: f32) -> i32 {
 }
 
 /// movups [esp+16*i], xmm_i (i = 0..8) after `sub esp,0x80`; and the restore.
-fn xmm_save() -> Vec<u8> {
+pub(crate) fn xmm_save() -> Vec<u8> {
     let mut c = vec![0x81, 0xEC, 0x80, 0x00, 0x00, 0x00];
     for i in 0..8u8 {
         c.extend_from_slice(&[0x0F, 0x11, 0x44 | (i << 3), 0x24, i * 16]);
     }
     c
 }
-fn xmm_restore() -> Vec<u8> {
+pub(crate) fn xmm_restore() -> Vec<u8> {
     let mut c = Vec::new();
     for i in 0..8u8 {
         c.extend_from_slice(&[0x0F, 0x10, 0x44 | (i << 3), 0x24, i * 16]);
@@ -201,7 +201,7 @@ fn xmm_restore() -> Vec<u8> {
 }
 
 /// Append `jcc rel32` / `jmp rel32` to `code` (placed at `base`).
-fn jump(code: &mut Vec<u8>, base: u32, op: &[u8], to: u32) {
+pub(crate) fn jump(code: &mut Vec<u8>, base: u32, op: &[u8], to: u32) {
     code.extend_from_slice(op);
     let end = base + code.len() as u32 + 4;
     code.extend_from_slice(&rel32(end, to));

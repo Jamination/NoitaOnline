@@ -4,6 +4,7 @@ local M = {}
 
 local bit = require("bit")
 local ffi = require("ffi")
+local NO = dofile_once("mods/noita_online/files/native.lua")
 
 -- Exact f32 bits of a Lua number (Noita transforms are f32).
 local f2u = ffi.new("union { float f; uint32_t u; }")
@@ -47,35 +48,39 @@ local function mix_inventory(h, e)
   return h
 end
 
+-- The entities come from the client runtime (no_entity_snapshot: what EntityGetInRadius(0, 0,
+-- 1e9), EntityGetTransform and EntityHasTag return, read natively in one call, sorted by id).
+local recs, recs_cap = nil, 0
+
 -- all_positions: also report every other entity (kind 2), for pinpointing divergences.
 function M.collect(proxy, all_positions)
-  local ents = EntityGetInRadius(0, 0, 1e9)
-  table.sort(ents)
+  local n = NO.lib.no_entity_snapshot(proxy or 0, recs, recs_cap)
+  if n > recs_cap then
+    recs_cap = n + 1024
+    recs = ffi.new("no_entity_rec_t[?]", recs_cap)
+    n = NO.lib.no_entity_snapshot(proxy or 0, recs, recs_cap)
+  end
   local h = 0x811c9dc5
   local positions = {}
-  for _, e in ipairs(ents) do
-    if e ~= proxy then
-      local x, y, rot = EntityGetTransform(e)
-      h = mix(h, e)
-      h = mix(h, fbits(x))
-      h = mix(h, fbits(y))
-      h = mix(h, fbits(rot or 0))
-      local kind = nil
-      if EntityHasTag(e, "noita_online_player") then
-        kind = 0
-        h = mix_inventory(h, e)
-      elseif EntityHasTag(e, "enemy") then
-        kind = 1
-      elseif all_positions then
-        kind = 2
-      end
-      if kind then
-        positions[#positions + 1] = { id = e, kind = kind, x = x, y = y }
-      end
+  for i = 0, n - 1 do
+    local r = recs[i]
+    local e = r.id
+    h = mix(h, e)
+    h = mix(h, fbits(r.x))
+    h = mix(h, fbits(r.y))
+    h = mix(h, fbits(r.rot))
+    local kind = r.kind
+    if kind == 0 then
+      h = mix_inventory(h, e)
+    elseif kind == 2 and not all_positions then
+      kind = nil
+    end
+    if kind then
+      positions[#positions + 1] = { id = e, kind = kind, x = r.x, y = r.y }
     end
   end
   -- Lua number in [0, 2^32) so FFI converts it to uint64 exactly.
-  return (h % 0x100000000), positions, #ents
+  return (h % 0x100000000), positions
 end
 
 return M

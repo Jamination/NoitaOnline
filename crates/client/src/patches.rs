@@ -336,9 +336,9 @@ unsafe fn patch_inline_group() -> Result<(), PatchError> {
     write_code(POOL_GROUP_JZ, &[0x90, 0x90])
 }
 
-/// Async jobs (the Box2D step, cosmetic particles, chunk saving, ... — everything but chunk
-/// generation, see [`patch_threaded_chunkgen`]) run synchronously at submission: the
-/// Box2D step would otherwise overlap the next frame's simulation.
+/// Async jobs (cosmetic particles, chunk saving, the pathfinding search, ... — everything but
+/// chunk generation, see [`patch_threaded_chunkgen`], and the Box2D step, see
+/// [`crate::box2d`]) run synchronously at submission: they would otherwise race the simulation.
 unsafe fn patch_inline_async() -> Result<(), PatchError> {
     expect(POOL_ASYNC_SITE, &[0x8D, 0x45, 0xF4, 0x66, 0xC7, 0x43, 0x24, 0x00, 0x00, 0x50, 0x8D, 0x45, 0xEC, 0x89, 0x7B, 0x20])?;
     // mov word [ebx+0x24],0; mov [ebx+0x20],edi; push ebx; call slot_runner; add esp,4;
@@ -379,7 +379,7 @@ unsafe fn copy_function(ex: &mut Exec, addr: u32, len: usize, relcalls: &[usize]
 }
 
 /// Point the `call` at `site` (currently calling `orig`) at `new_target`.
-unsafe fn redirect_call(site: u32, orig: u32, new_target: u32) -> Result<(), PatchError> {
+pub(crate) unsafe fn redirect_call(site: u32, orig: u32, new_target: u32) -> Result<(), PatchError> {
     let orig_rel = rel32(site + 5, orig);
     expect(site, &[0xE8, orig_rel[0], orig_rel[1], orig_rel[2], orig_rel[3]])?;
     let mut call = vec![0xE8];
@@ -1276,6 +1276,7 @@ const PATCHES: &[(&str, PatchFn)] = &[
     ("cell_emitters", |ex| unsafe { crate::cosmetic::patch_cell_emitters(ex) }),
     ("rain_views", |ex| unsafe { crate::cosmetic::patch_rain(ex) }),
     ("box2d_freeze", patch_box2d_freeze),
+    ("box2d_overlap", |ex| unsafe { crate::box2d::patch(ex) }),
     ("stuck_wake_aabb", patch_stuck_wake_aabb),
     ("free_solids_order", patch_free_solids_order),
     ("pathfinding_refresh", patch_pathfinding_refresh),
@@ -1652,6 +1653,9 @@ pub unsafe fn sim_rng_enter() {
     if IN_WINDOW.swap(true, Ordering::Relaxed) {
         return;
     }
+    // The Box2D step of the last world update (`box2d_overlap`) has normally been joined by
+    // DeathMatch::Update already.
+    crate::box2d::join();
     join_render_tiles();
     // The render used this client's own screen shake (`screen_shake`): back to the shared one.
     crate::camreaders::shake_render_leave();
@@ -1699,8 +1703,9 @@ pub unsafe fn sim_rng_leave() {
     rng_log('>');
     prof_window(false);
     // Box2D safety net (`box2d_freeze`): a slow step goes out with the next input; this
-    // frame's freeze request is used up.
-    if box2d_step_slow() {
+    // frame's freeze request is used up. With `box2d_overlap` the step may not have run yet:
+    // it is checked when it finishes.
+    if !crate::box2d::active() && box2d_step_slow() {
         crate::BOX2D_STEP_SLOW.store(true, Ordering::Relaxed);
     }
     set_box2d_freeze(false);
@@ -1985,6 +1990,29 @@ unsafe fn grid_summary(grid_world: u32) -> String {
         }
     }
     out
+}
+
+/// Diagnostics (`box2d_overlap` check mode): every RNG of the bank plus the GridWorld RNG.
+pub(crate) unsafe fn rng_fingerprint() -> u64 {
+    let s = RngBank::capture();
+    let gg = rd(GAME_GLOBAL_PTR);
+    let wd = if gg != 0 { rd(gg + 0x0c) } else { 0 };
+    let gw = if wd != 0 { rd(wd + 0x44) } else { 0 };
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for v in [s.lcg as u64, s.plat_a0 as u64, s.plat_a4 as u64, s.pm.to_bits(), s.particle.to_bits(), s.rand as u64, if gw != 0 { rd(gw + 4) as u64 } else { 0 }] {
+        h = (h ^ v).wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+/// Diagnostics (`box2d_overlap` check mode): count, motion and sleep hashes of every body.
+pub(crate) unsafe fn bodies_fingerprint(grid_world: u32) -> u64 {
+    let b2 = rd(grid_world + GW_B2WORLD);
+    if b2 == 0 {
+        return 0;
+    }
+    let (n, all, sleep) = body_hashes(b2, |_, _, _, _, _| {});
+    (((all as u64) << 32) | sleep as u64) ^ ((n as u64) << 16)
 }
 
 /// Every b2World body in list order: (count, motion hash, sleep hash), calling `each(index,
@@ -2395,9 +2423,10 @@ unsafe fn patch_box2d_freeze(ex: &mut Exec) -> Result<(), PatchError> {
     Ok(())
 }
 
-/// Whether this frame's Box2D step took longer than BOX2D_THREAD_MAX_WAIT_IN_MS (window exit;
-/// false without the freeze patch or with BOX2D_FREEZE_STUCK_BODIES off).
-unsafe fn box2d_step_slow() -> bool {
+/// Whether the last Box2D step took longer than BOX2D_THREAD_MAX_WAIT_IN_MS (game thread, after
+/// the step: window exit, or where `box2d_overlap` finished it; false without the freeze patch
+/// or with BOX2D_FREEZE_STUCK_BODIES off).
+pub(crate) unsafe fn box2d_step_slow() -> bool {
     if FREEZE_STUCK_NOW.load(Ordering::Relaxed) == 0 || *(MAGIC_FREEZE_STUCK_BODIES as *const u8) == 0 {
         return false;
     }

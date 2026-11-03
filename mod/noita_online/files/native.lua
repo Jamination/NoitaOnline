@@ -12,6 +12,7 @@ typedef struct {
 } no_start_info_t;
 
 typedef struct { uint32_t id; uint32_t kind; float x; float y; } no_entity_pos_t;
+typedef struct { uint32_t id; float x; float y; float rot; uint32_t kind; } no_entity_rec_t;
 
 uint32_t no_abi_version(void);
 int32_t no_init(void);
@@ -24,6 +25,7 @@ int32_t no_wait_tick(uint32_t frame, uint32_t timeout_ms, uint8_t* out, uint32_t
 int32_t no_input_delay(void);
 int32_t no_input_fresh(void);
 int32_t no_report_state(uint32_t frame, uint32_t chunk_period, uint32_t has_entities, uint64_t entity_hash, const no_entity_pos_t* positions, uint32_t n);
+uint32_t no_entity_snapshot(uint32_t proxy, no_entity_rec_t* out, uint32_t cap);
 uint32_t no_frame_mark(void);
 void no_set_frame_cap(uint32_t fps);
 void no_mem_stats(uint32_t* out);

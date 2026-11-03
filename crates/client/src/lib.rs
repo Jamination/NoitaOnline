@@ -4,12 +4,16 @@
 //! on a background thread (`net`), so packet handling never waits for the game's frames.
 
 #[cfg(all(windows, target_arch = "x86"))]
+pub mod box2d;
+#[cfg(all(windows, target_arch = "x86"))]
 pub mod cambound;
 #[cfg(all(windows, target_arch = "x86"))]
 pub mod camreaders;
 pub mod clock;
 #[cfg(all(windows, target_arch = "x86"))]
 pub mod cosmetic;
+#[cfg(all(windows, target_arch = "x86"))]
+pub mod digest;
 #[cfg(all(windows, target_arch = "x86"))]
 pub mod earlyinput;
 #[cfg(all(windows, target_arch = "x86"))]
@@ -314,6 +318,26 @@ pub(crate) unsafe fn dump_window_entry(frame: u32) {
     let path = path.with_file_name(format!("{}e.bin", path.file_stem().and_then(|s| s.to_str()).unwrap_or("dump")));
     let _ = world::dump_cells(&path.with_extension("cells.txt"), x0, y0, x1, y1);
     let _ = world::dump_particles(&path.with_extension("parts.txt"));
+}
+
+/// The entities `State.collect` digests (files/state.lua): every live entity except `proxy`,
+/// sorted by id, with its transform and kind. Writes up to `cap` records; returns the count
+/// (more than `cap`: call again with a larger buffer).
+///
+/// # Safety
+/// `out` must point at `cap` writable records; Noita's game thread, world initialised.
+#[no_mangle]
+pub unsafe extern "C" fn no_entity_snapshot(proxy: u32, out: *mut u8, cap: u32) -> u32 {
+    #[cfg(all(windows, target_arch = "x86"))]
+    {
+        let out = if cap == 0 || out.is_null() { &mut [][..] } else { std::slice::from_raw_parts_mut(out as *mut digest::EntityRec, cap as usize) };
+        digest::snapshot(proxy, out) as u32
+    }
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    {
+        let _ = (proxy, out, cap);
+        0
+    }
 }
 
 /// Send this frame's state report. Chunk hashes are staggered: with `chunk_period` > 0
@@ -890,6 +914,7 @@ pub extern "C" fn no_shutdown() {
     {
         report::join();
         cosmetic::join_cell_emitters();
+        box2d::join();
     }
     let handle = with_rt(None, |rt| {
         rt.shared.stop.store(true, std::sync::atomic::Ordering::Relaxed);
