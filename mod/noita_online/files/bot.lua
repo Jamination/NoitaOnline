@@ -36,6 +36,11 @@ local SCENE = os.getenv("NOITA_ONLINE_SCENE")
 local SCENE_POOLS = SCENE == "pools"
 local SCENE_APART = SCENE == "apart"
 local SCENE_POLY = SCENE == "poly"
+-- NOITA_ONLINE_SCENE=chests (with the human scenario "items"): every 300 frames from 600 a
+-- physics chest is put on the spawn point (the previous one removed), so it rolls through
+-- the players standing there.
+local SCENE_CHESTS = SCENE == "chests"
+local scene_chest = 0
 local POOLS = { "acid", "magic_liquid_charm", "magic_liquid_mana_regeneration", "radioactive_liquid" }
 
 function M.input(pi, f, px, py)
@@ -45,8 +50,21 @@ function M.input(pi, f, px, py)
   local s = { buttons = {}, count_r = 0, count_l = 0, mx = px + 60 * dir, my = py, ax = 60 * dir, ay = 0 }
   if SCENE_POOLS or SCENE_APART then return s end
   if SCENE_POLY then
-    -- walk back and forth, attack every 40 frames (as a creature: one of its AI attacks)
+    -- Until 1300 like the human session pf4_human3: everyone stands at the spawn point (where
+    -- the input proxies are); the first player presses Down every 50 frames at 400-600 (the
+    -- "items" cycle, see poly_events) and, as a sheep_bat (650-1250), taps like a human's:
+    -- Left/Right for 3 frames every 16, Up+Fly for 5 frames every 25. From 1300: walk back and
+    -- forth, fly up now and then, attack every 40 frames (as a creature: one of its AI attacks).
+    if f < 1300 then
+      if pi == 0 and f >= 400 and f <= 600 and f % 50 < 2 then s.buttons.Down = true end
+      if pi == 0 and f >= 700 and f < 1250 then
+        if f % 16 < 3 then s.buttons[math.floor(f / 160) % 2 == 0 and "Left" or "Right"] = true end
+        if f % 25 < 5 then s.buttons.Up = true; s.buttons.Fly = true end
+      end
+      return s
+    end
     if t % 200 < 120 then s.buttons[dir > 0 and "Right" or "Left"] = true end
+    if t % 200 >= 140 and t % 200 < 170 then s.buttons.Up = true; s.buttons.Fly = true end
     if t % 40 < 4 then s.buttons.Fire = true; s.buttons.LeftClick = true end
     return s
   end
@@ -109,12 +127,25 @@ local SPAWNS = {
   "data/entities/animals/shotgunner_weak.xml",
   "data/entities/animals/slimeshooter_weak.xml",
 }
+local POTION = "data/entities/items/pickup/potion_empty.xml"
 local ITEMS = {
   "data/entities/items/pickup/goldnugget_50.xml",
   "data/entities/items/wand_level_01.xml",
-  "data/entities/items/pickup/potion.xml",
+  POTION,
   "data/entities/items/pickup/heart.xml",
 }
+-- The scenario's potions hold these in turn (potion.xml mostly picks magic liquids, among
+-- them the polymorphines: pools of broken ones kept the players polymorphed for whole phases).
+local LIQUIDS = {
+  "water", "oil", "acid", "lava", "blood", "alcohol", "slime", "radioactive_liquid", "liquid_fire",
+  "blood_cold", "gunpowder_unstable", "magic_liquid_berserk", "magic_liquid_charm",
+  "magic_liquid_movement_faster", "magic_liquid_mana_regeneration",
+}
+local function load_item(file, x, y, n)
+  local e = EntityLoad(file, x, y)
+  if file == POTION then AddMaterialInventoryMaterial(e, LIQUIDS[n % #LIQUIDS + 1], 1000) end
+  return e
+end
 
 local apart_enemies = {}
 local apart_home = nil
@@ -220,23 +251,49 @@ local function standing(p)
   return p.entity and EntityGetIsAlive(p.entity) and not EntityHasTag(p.entity, "noita_online_dead")
 end
 
--- NOITA_ONLINE_SCENE=poly (polymorph checks; players walk and press Fire every 40 frames):
--- the last player becomes a sheep at frame 240 (effect_polymorph.xml, 600 frames, then
--- restored) and unstable at 1000 (effect_polymorph_unstable.xml); the first player is
--- polymorphed into a random creature at 300 (effect_polymorph_random.xml) and its creature
--- is killed at 700 (death while polymorphed). Every slot's entity is logged every 30 frames.
+-- NOITA_ONLINE_SCENE=poly (polymorph checks). Until 1300 it mirrors the human session
+-- pf4_human3 at the spawn point (where every client's input proxy stands): a polymorphine
+-- flask is thrown at the first player's feet at 300 (lands whole); the first player's Down
+-- presses at 400-600 put the "items" cycle at its feet (heart, wand, polymorphine flask,
+-- chest, perk); at 650 the first player (the simulation camera's) becomes a flying sheep_bat
+-- (files/poly_bat.xml, 600 frames), driven by taps of Left/Right/Up/Fly. Then everyone walks
+-- and presses Fire every 40 frames: the last player becomes a sheep at 1300
+-- (effect_polymorph.xml, 600 frames, then restored); a polymorphine flask breaks 24 px
+-- beside the first player at 1400; the first player is polymorphed into a random creature
+-- at 1900 (effect_polymorph_random.xml) and its creature is killed at 2300 (death while
+-- polymorphed); the last player becomes unstable at 2000 (effect_polymorph_unstable.xml).
+-- Every slot's entity is logged every 30 frames.
+local function polymorphine_flask(x, y)
+  local e = EntityLoad("data/entities/items/pickup/potion_empty.xml", x, y)
+  AddMaterialInventoryMaterial(e, "magic_liquid_polymorph", 1000)
+  return e
+end
+
 local function poly_events(f, players)
   local first, last = players[1], players[#players]
-  if f == 240 and standing(last) then
+  if f == 300 and standing(first) then
+    local x, y = EntityGetTransform(first.entity)
+    local e = polymorphine_flask(x - 6, y - 16)
+    PhysicsApplyForce(e, -20, 40)
+    if M.log then M.log(string.format("poly f=%d flask %d thrown at %.1f,%.1f", f, e, x - 6, y - 16)) end
+  elseif f == 650 and standing(first) then
+    LoadGameEffectEntityTo(first.entity, "mods/noita_online/files/poly_bat.xml")
+  elseif f == 1300 and standing(last) then
     LoadGameEffectEntityTo(last.entity, "data/entities/misc/effect_polymorph.xml")
-  elseif f == 300 and #players > 1 and standing(first) then
+  elseif f == 1400 and standing(first) then
+    local x, y = EntityGetTransform(first.entity)
+    local e = polymorphine_flask(x + 24, y - 10)
+    EntityInflictDamage(e, 10, "DAMAGE_PROJECTILE", "", "NORMAL", 0, 0, 0, x + 24, y - 10, 0)
+    if M.log then M.log(string.format("poly f=%d flask %d broken at %.1f,%.1f", f, e, x + 24, y - 10)) end
+  elseif f == 1900 and #players > 1 and standing(first) then
     LoadGameEffectEntityTo(first.entity, "data/entities/misc/effect_polymorph_random.xml")
-  elseif f == 700 and #players > 1 and standing(first) then
+  elseif f == 2000 and standing(last) then
+    LoadGameEffectEntityTo(last.entity, "data/entities/misc/effect_polymorph_unstable.xml")
+  elseif f == 2300 and #players > 1 and standing(first) then
     local x, y = EntityGetTransform(first.entity)
     EntityInflictDamage(first.entity, 1000, "DAMAGE_CURSE", "", "NORMAL", 0, 0, 0, x, y, 0)
-  elseif f == 1000 and standing(last) then
-    LoadGameEffectEntityTo(last.entity, "data/entities/misc/effect_polymorph_unstable.xml")
   end
+  if f >= 400 and f <= 620 then M.items_events(f, players) end
   if f >= 240 and f % 30 == 0 and M.log then
     for i, q in ipairs(players) do
       local e = q.entity
@@ -269,6 +326,11 @@ end
 local ITEM_CYCLE = { "heart", "wand", "flask", "chest", "perk", "polymorph" }
 local item_state = {}
 function M.items_events(f, players)
+  if SCENE_CHESTS and f >= 600 and f % 300 == 0 then
+    if scene_chest ~= 0 and EntityGetIsAlive(scene_chest) then EntityKill(scene_chest) end
+    scene_chest = EntityLoad("data/entities/items/pickup/chest_random.xml", 228, -86)
+    if M.log then M.log(string.format("chests: chest %d at frame %d", scene_chest, f)) end
+  end
   for i, p in ipairs(players) do
     local st = item_state[i] or { n = 0, down = false, kick = false }
     item_state[i] = st
@@ -323,6 +385,92 @@ function M.items_events(f, players)
   end
 end
 
+-- Default scenario: the bot players never die, so every 4800-frame cycle (the 8 phases of
+-- M.input) exercises movement, casts, digging with explosions, throws, kicks, pickups and
+-- item switching for the whole session (a dead player is an input-less spectator). Test
+-- scenario only: a standing player (or the creature it is polymorphed into) gets BOT_HP max
+-- HP and is healed to full whenever it drops below half (far more than one frame of damage
+-- here); before the bomb phase its spells' uses are refilled (vanilla's spell refresher), and
+-- before the throw phase a potion is put into its first item slot (key 5) if that is empty.
+local CYCLE = 8 * PHASE
+local BOT_HP = 40 -- 1000 HP (a player starts with 4)
+
+local function sustain(e)
+  local dm = EntityGetFirstComponentIncludingDisabled(e, "DamageModelComponent")
+  if not dm then return end
+  local max_hp = ComponentGetValue2(dm, "max_hp")
+  if max_hp < BOT_HP then
+    ComponentSetValue2(dm, "max_hp", BOT_HP)
+    ComponentSetValue2(dm, "hp", BOT_HP)
+  elseif ComponentGetValue2(dm, "hp") < max_hp * 0.5 then
+    ComponentSetValue2(dm, "hp", max_hp)
+  end
+end
+
+local function quick_inventory(e)
+  for _, c in ipairs(EntityGetAllChildren(e) or {}) do
+    if EntityGetName(c) == "inventory_quick" then return c end
+  end
+end
+
+-- The item in quick item slot x (number key 5 + x), if any.
+local function quick_item(quick, x)
+  for _, c in ipairs(EntityGetAllChildren(quick) or {}) do
+    local ic = EntityGetFirstComponentIncludingDisabled(c, "ItemComponent")
+    if ic and not EntityHasTag(c, "wand") and ComponentGetValue2(ic, "inventory_slot") == x then return c end
+  end
+end
+
+local function give_potion(f, i, e, x, y)
+  local quick = quick_inventory(e)
+  if not quick or quick_item(quick, 0) then return end
+  local potion = load_item(POTION, x, y, math.floor(f / CYCLE) + i)
+  GamePickUpInventoryItem(e, potion, false)
+  local ic = EntityGetFirstComponentIncludingDisabled(potion, "ItemComponent")
+  if ic then ComponentSetValue2(ic, "inventory_slot", 0, 0) end
+  if M.log then
+    M.log(string.format("bot f=%d slot=%d potion %d given (in quick bar: %s)", f, i, potion,
+      tostring(EntityGetParent(potion) == quick)))
+  end
+end
+
+-- `bot` lines (every 300 frames per standing player, and just before each throw): HP,
+-- position, held item (w<slot> wand, i<slot> item), wands and items in the quick bar, limited
+-- spell uses left in its wands, the shots its wands have fired and the last frames its Fire,
+-- Throw, Kick and Interact buttons were pressed.
+local function report(f, i, e, x, y)
+  local dm = EntityGetFirstComponentIncludingDisabled(e, "DamageModelComponent")
+  local inv = EntityGetFirstComponentIncludingDisabled(e, "Inventory2Component")
+  local held = inv and ComponentGetValue2(inv, "mActiveItem") or 0
+  local held_s = "-"
+  if held ~= 0 and EntityGetIsAlive(held) then
+    local ic = EntityGetFirstComponentIncludingDisabled(held, "ItemComponent")
+    held_s = (EntityHasTag(held, "wand") and "w" or "i") .. (ic and ComponentGetValue2(ic, "inventory_slot") or "?")
+  end
+  local wands, items, uses, shots = 0, 0, 0, 0
+  local quick = quick_inventory(e)
+  for _, c in ipairs(quick and EntityGetAllChildren(quick) or {}) do
+    if EntityHasTag(c, "wand") then
+      wands = wands + 1
+      local ability = EntityGetFirstComponentIncludingDisabled(c, "AbilityComponent")
+      shots = shots + (ability and ComponentGetValue2(ability, "stat_times_player_has_shot") or 0)
+      for _, card in ipairs(EntityGetAllChildren(c) or {}) do
+        local ic = EntityGetFirstComponentIncludingDisabled(card, "ItemComponent")
+        local u = ic and ComponentGetValue2(ic, "uses_remaining") or -1
+        if u > 0 then uses = uses + u end
+      end
+    else
+      items = items + 1
+    end
+  end
+  local ctl = EntityGetFirstComponentIncludingDisabled(e, "ControlsComponent")
+  local function last(b) return ctl and ComponentGetValue2(ctl, "mButtonFrame" .. b) or -1 end
+  M.log(string.format(
+    "bot f=%d slot=%d hp=%.0f/%.0f x=%.0f y=%.0f held=%s wands=%d items=%d uses=%d shots=%d fire=%d throw=%d kick=%d interact=%d",
+    f, i, dm and ComponentGetValue2(dm, "hp") * 25 or -1, dm and ComponentGetValue2(dm, "max_hp") * 25 or -1,
+    x, y, held_s, wands, items, uses, shots, last("Fire"), last("Throw"), last("Kick"), last("Interact")))
+end
+
 -- players: array of {id=, entity=} in slot order.
 function M.world_events(f, players)
   if f < 120 then return end
@@ -355,15 +503,22 @@ function M.world_events(f, players)
     if p.entity and EntityGetIsAlive(p.entity) then
       local x, y = EntityGetTransform(p.entity)
       local k = math.floor(f / 300)
+      if standing(p) then
+        sustain(p.entity)
+        if f % CYCLE == 2 * PHASE - 30 then GameRegenItemActionsInPlayer(p.entity) end
+        if f % CYCLE == 3 * PHASE - 30 then give_potion(f, i, p.entity, x, y - 10) end
+        if M.log and (f % 300 == 150 or f % CYCLE == 3 * PHASE + 50) then report(f, i, p.entity, x, y) end
+      end
       if f % 900 == 450 then
         EntityLoad(SPAWNS[(k + i) % #SPAWNS + 1], x + 90 * ((i % 2 == 0) and 1 or -1), y - 20)
       end
       if f % 600 == 300 then
-        EntityLoad(ITEMS[(k + i) % #ITEMS + 1], x + 25, y - 10)
+        load_item(ITEMS[(k + i) % #ITEMS + 1], x + 25, y - 10, k + i)
       end
-      if f == 1500 then
-        -- the last player still standing is polymorphed (a sheep for 600 frames, then
-        -- restored); a dead player's spectator body is not polymorphable
+      if f % CYCLE == 6 * PHASE then
+        -- every cycle the last player still standing is polymorphed for the long-walk phase
+        -- (a sheep for 600 frames, then restored before the wand edit of the idle phase); a
+        -- dead player's spectator body is not polymorphable
         local target = nil
         for _, q in ipairs(players) do
           if standing(q) then target = q end
@@ -371,11 +526,13 @@ function M.world_events(f, players)
         if target == p then LoadGameEffectEntityTo(p.entity, "data/entities/misc/effect_polymorph.xml") end
       end
       if f % 1800 == 900 then
-        -- liquids pouring from above and an explosive barrel nearby
+        -- liquids pouring from above, a bounded amount (circle-of-water spells, emitting a
+        -- ring of water every frame for 260 frames, piled up a sea the players floated up in)
         for j = 0, 4 do
-          EntityLoad("data/entities/projectiles/deck/circle_water.xml", x - 40 + j * 20, y - 60)
+          GameCreateParticle("water", x - 40 + j * 20, y - 60, 300, 0, 0, false, false)
         end
       end
+      -- an explosive barrel and a bomb nearby
       if f % 2400 == 1200 then
         EntityLoad("data/entities/props/physics_propane_tank.xml", x + 70, y - 30)
         EntityLoad("data/entities/projectiles/bomb.xml", x + 70, y - 10)

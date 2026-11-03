@@ -1057,6 +1057,7 @@ const PATCHES: &[(&str, PatchFn)] = &[
     ("cell_emitters", |ex| unsafe { crate::cosmetic::patch_cell_emitters(ex) }),
     ("rain_views", |ex| unsafe { crate::cosmetic::patch_rain(ex) }),
     ("box2d_freeze", patch_box2d_freeze),
+    ("stuck_wake_aabb", patch_stuck_wake_aabb),
     ("free_solids_order", patch_free_solids_order),
     ("pathfinding_refresh", patch_pathfinding_refresh),
     ("ragdoll_stains", |ex| unsafe { crate::ragdoll::patch_ragdoll_stains_blur(ex) }),
@@ -1368,6 +1369,12 @@ pub unsafe fn sim_rng_enter() {
     });
     sync_platform_frame();
     rng_log('<');
+    {
+        let gg = rd(GAME_GLOBAL_PTR);
+        let wd = if gg != 0 { rd(gg + 0x0c) } else { 0 };
+        let gw = if wd != 0 { rd(wd + 0x44) } else { 0 };
+        crate::wakewatch::on_window_entry(if gw != 0 { rd(gw + GW_B2WORLD) } else { 0 });
+    }
     let gg = rd(GAME_GLOBAL_PTR);
     if gg != 0 {
         crate::dump_window_entry(rd(gg));
@@ -1532,10 +1539,14 @@ unsafe fn rng_log(tag: char) {
     let world_data = if gg != 0 { rd(gg + 0x0c) } else { 0 };
     let grid_world = if world_data != 0 { rd(world_data + 0x44) } else { 0 };
     let gw_rng = if grid_world != 0 { rd(grid_world + 4) } else { 0 };
+    // Floating-point control state of the game thread (x87 control word, SSE MXCSR).
+    let mut cw: u16 = 0;
+    let mut csr: u32 = 0;
+    std::arch::asm!("fnstcw word ptr [{0}]", "stmxcsr dword ptr [{1}]", in(reg) &mut cw, in(reg) &mut csr);
     if let Ok(mut f) = file.lock() {
         let _ = writeln!(
             f,
-            "{frame} {tag} lcg={:08x} plat={:08x}/{:08x} pm={:.0} part={:.0} rand={:08x} gw={gw_rng:08x} t={:08x} pf={}",
+            "{frame} {tag} lcg={:08x} plat={:08x}/{:08x} pm={:.0} part={:.0} rand={:08x} gw={gw_rng:08x} t={:08x} pf={} fp={cw:04x}/{csr:04x}",
             s.lcg,
             s.plat_a0,
             s.plat_a4,
@@ -1598,6 +1609,9 @@ unsafe fn body_hash_lines(frame: u32, tag: char, grid_world: u32) -> String {
     }
     let each = std::env::var_os("NOITA_ONLINE_RNGLOG_BODIES").is_some();
     let (mut all, mut n) = (0x811c_9dc5u32, 0u32);
+    // Sleep state, not part of the motion hash: flags (awake 2, active 0x20; the island flag 1
+    // masked) and the sleep time.
+    let mut sleep = 0x811c_9dc5u32;
     let mut body = rd(b2 + 0x1922c);
     while body != 0 && n < 100_000 {
         let mut h = 0x811c_9dc5u32;
@@ -1605,15 +1619,20 @@ unsafe fn body_hash_lines(frame: u32, tag: char, grid_world: u32) -> String {
             h = (h ^ rd(body + 4 * k)).wrapping_mul(0x0100_0193);
         }
         all = (all ^ h).wrapping_mul(0x0100_0193);
+        let flags = *((body + 0xc) as *const u16) & !1;
+        let st = *((body + 0x108) as *const f64);
+        for v in [flags as u32, st.to_bits() as u32, (st.to_bits() >> 32) as u32] {
+            sleep = (sleep ^ v).wrapping_mul(0x0100_0193);
+        }
         if each {
             let x = *((body + 0x18) as *const f64);
             let y = *((body + 0x20) as *const f64);
-            let _ = writeln!(out, "b {frame} {tag} {n} {h:08x} {x} {y}");
+            let _ = writeln!(out, "b {frame} {tag} {n} {h:08x} {x} {y} t{} f{flags:04x} s{st}", rd(body + 8));
         }
         n += 1;
         body = rd(body + 0xb8);
     }
-    let _ = writeln!(out, "B {frame} {tag} {n} {all:08x}");
+    let _ = writeln!(out, "B {frame} {tag} {n} {all:08x} sleep={sleep:08x}");
     out
 }
 
@@ -1865,6 +1884,80 @@ pub fn set_box2d_freeze(on: bool) {
     let flag = FREEZE_STUCK_NOW.load(Ordering::Relaxed);
     if flag != 0 {
         unsafe { *(flag as *mut u8) = on as u8 };
+    }
+}
+
+/// PlayerCollisionSystem (FUN_00bfa850, playercollision_system.cpp): while a player is stuck
+/// in the ground (stuck_in_ground_counter > 10) and has its collision body, every 10 frames
+/// it wakes the Box2D bodies of an AABB around it: `call FUN_009d0d40` (b2 broadphase
+/// QueryAABB; [esp+4] callback, [esp+8] the b2AABB of four doubles). The code calls the
+/// CharacterDataComponent getters of collision_aabb_min_x/min_y/max_x/max_y, but only one
+/// corner is stored, into lowerBound: `pos + max + 3` (Box2D coordinates). upperBound is
+/// never written: it is whatever an earlier call left on the game thread's stack. Which
+/// sleeping bodies woke (often every body below and right of the player, across the loaded
+/// world) depended on that client's earlier code paths, e.g. its own input.
+const STUCK_WAKE_QUERY_CALL: u32 = 0x00bf_b2f5;
+const B2_QUERY_AABB_FN: u32 = 0x009d_0d40;
+/// `pos + 3` / `pos - 3`: the 3 px margin (float) of the stored corner.
+const STUCK_WAKE_MARGIN: u32 = 0x0105_3ae8;
+/// Pixel -> Box2D: `(x - ox) / sx`, `(y - oy) / sy` (doubles).
+const B2_ORIGIN_X: u32 = 0x0120_7b28;
+const B2_ORIGIN_Y: u32 = 0x0120_7b30;
+const B2_SCALE_X: u32 = 0x0120_7b38;
+const B2_SCALE_Y: u32 = 0x0120_7b40;
+/// CharacterDataComponent LensValue<float> collision_aabb_* (base value +0, override +4 set
+/// at frame +8; the getter FUN_00898180 returns the override while it is under 2 frames old).
+const CDATA_AABB_MIN_X: u32 = 0x4c;
+const CDATA_AABB_MIN_Y: u32 = 0x64;
+
+/// The query gets the box the code evidently meant: lowerBound `pos + min - 3`, upperBound
+/// the stored corner `pos + max + 3`, i.e. the player's collision box grown by 3 px, with the
+/// engine's float/double arithmetic. The stub runs at the call with EDI = the entity
+/// (position +0x70/+0x74) and ESI = its CharacterDataComponent.
+unsafe fn patch_stuck_wake_aabb(ex: &mut Exec) -> Result<(), PatchError> {
+    let mut call = vec![0xE8];
+    call.extend_from_slice(&rel32(STUCK_WAKE_QUERY_CALL + 5, B2_QUERY_AABB_FN));
+    expect(STUCK_WAKE_QUERY_CALL, &call)?;
+    let cb = ((stuck_wake_aabb as unsafe extern "C" fn(*mut f64, u32, u32)) as u32).to_le_bytes();
+    let stub_at = ex.base + ex.used;
+    // pushad; push edi; push esi; push dword [esp+0x30] (the AABB); mov eax,cb; call eax;
+    // add esp,12; popad; jmp FUN_009d0d40
+    let mut stub = vec![0x60, 0x57, 0x56, 0xFF, 0x74, 0x24, 0x30, 0xB8, cb[0], cb[1], cb[2], cb[3], 0xFF, 0xD0, 0x83, 0xC4, 0x0C, 0x61, 0xE9];
+    stub.extend_from_slice(&rel32(stub_at + stub.len() as u32 + 4, B2_QUERY_AABB_FN));
+    let at = ex.put(&stub);
+    let mut site = vec![0xE8];
+    site.extend_from_slice(&rel32(STUCK_WAKE_QUERY_CALL + 5, at));
+    write_code(STUCK_WAKE_QUERY_CALL, &site)
+}
+
+/// See [`patch_stuck_wake_aabb`]. `aabb`: lower.x, lower.y, upper.x, upper.y.
+unsafe extern "C" fn stuck_wake_aabb(aabb: *mut f64, cdata: u32, entity: u32) {
+    let frame = rd(rd(GAME_GLOBAL_PTR)) as i32;
+    let lens = |o: u32| {
+        let l = cdata + o;
+        if frame.wrapping_sub(rd(l + 8) as i32) <= 1 {
+            *((l + 4) as *const f32)
+        } else {
+            *(l as *const f32)
+        }
+    };
+    let margin = *(STUCK_WAKE_MARGIN as *const f32);
+    let px = *((entity + 0x70) as *const f32);
+    let py = *((entity + 0x74) as *const f32);
+    let d = |a: u32| *(a as *const f64);
+    let lower_x = (((lens(CDATA_AABB_MIN_X) + px) - margin) as f64 - d(B2_ORIGIN_X)) / d(B2_SCALE_X);
+    let lower_y = (((lens(CDATA_AABB_MIN_Y) + py) - margin) as f64 - d(B2_ORIGIN_Y)) / d(B2_SCALE_Y);
+    let (stale_x, stale_y) = (*aabb.add(2), *aabb.add(3));
+    *aabb.add(2) = *aabb;
+    *aabb.add(3) = *aabb.add(1);
+    *aabb = lower_x;
+    *aabb.add(1) = lower_y;
+    if std::env::var_os("NOITA_ONLINE_WAKEWATCH").is_some() {
+        crate::wakewatch::write_line(&format!(
+            "{frame} stuck_wake entity_pos={px},{py} stack_upper={stale_x:e},{stale_y:e} aabb={lower_x},{lower_y},{},{}",
+            *aabb.add(2),
+            *aabb.add(3)
+        ));
     }
 }
 

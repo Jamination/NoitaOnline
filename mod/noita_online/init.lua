@@ -300,6 +300,24 @@ function OnWorldPostUpdate()
   local f = GameGetFrameNum()
   if in_sim_window then
     if ready then douse_free_camera_light() end
+    if ready and os.getenv("NOITA_ONLINE_PCLOG") then
+      -- Diagnostics: every slot's PlayerCollision and CharacterData state, every frame.
+      for i, slot in ipairs(Players.slots) do
+        if EntityGetIsAlive(slot.entity) then
+          local x, y = EntityGetTransform(slot.entity)
+          local parts = { string.format("pclog f=%d slot=%d e=%d pos=%.6f,%.6f", f, i, slot.entity, x, y) }
+          for _, name in ipairs({ "PlayerCollisionComponent", "CharacterDataComponent" }) do
+            local c = EntityGetFirstComponentIncludingDisabled(slot.entity, name)
+            local m = c and ComponentGetMembers(c) or {}
+            local keys = {}
+            for k in pairs(m) do keys[#keys + 1] = k end
+            table.sort(keys)
+            for _, k in ipairs(keys) do parts[#parts + 1] = k .. "=" .. tostring(m[k]) end
+          end
+          log(table.concat(parts, " "))
+        end
+      end
+    end
     if ready and f % UNLOAD_EVERY == 0 then
       local foci = current_foci()
       for i, r in ipairs(foci) do

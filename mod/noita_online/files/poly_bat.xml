@@ -1,0 +1,7 @@
+<!-- NOITA_ONLINE_SCENE=poly: the vanilla polymorph effect with the flying sheep_bat as its
+     target (vanilla picks sheep_bat / sheep_fly for sheep.xml only by a global-LCG chance). -->
+<Entity>
+  <Base file="data/entities/misc/effect_polymorph.xml">
+    <GameEffectComponent polymorph_target="data/entities/animals/sheep_bat.xml" />
+  </Base>
+</Entity>

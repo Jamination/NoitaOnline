@@ -29,6 +29,8 @@ pub mod invgui;
 #[cfg(all(windows, target_arch = "x86"))]
 pub mod slots;
 pub mod views;
+#[cfg(all(windows, target_arch = "x86"))]
+pub mod wakewatch;
 
 use net::{ConnectParams, Shared, Status};
 use protocol::{ClientMsg, EntityPos, CH_RELIABLE};

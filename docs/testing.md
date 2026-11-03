@@ -30,8 +30,17 @@ Steam-free, config forced by `harness/prep_prefix.sh`, save wiped per launch), s
 user's Steam installation and saves are never touched. The server passes
 `--scenario bot`: every client drives its player with the scripted bot
 (`mod/noita_online/files/bot.lua`: walking, levitating, spell casts, bomb digging, potion
-throws, kicks, item pickups, fights) and the simulation spawns enemies, items, liquids and
-explosives around the players at fixed frames.
+throws, kicks, item pickups, item switching, fights, in a 4800-frame cycle of eight
+phases) and the simulation spawns enemies, items, liquids and explosives around the
+players at fixed frames and polymorphs the last player during each cycle's long walk. So
+that every cycle exercises all of that for the whole session, the scenario keeps the bot
+players alive (1000 max HP, healed to full below half), refills their spells' uses before
+the bomb phase and gives them a potion before the throw phase when their first item slot
+is empty. Its potions hold a fixed rotation of liquids (no polymorphines) and its water
+pours are bounded, so the players stay on the terrain they dig instead of floating up a
+growing sea. `bot f=...` lines in `client_<id>.log` (every 300 frames per player) show each
+player's HP, position, held item, inventory, spell uses, nearby projectiles and its last
+Fire/Throw/Kick/Interact frames.
 
 ```sh
 harness/e2e.sh --pin --players 4 --frames 36000 --out run/e2e/full          # 10 minutes
@@ -49,9 +58,9 @@ harness/evaluate.py --run run/e2e/full --netsim-run run/e2e/netsim \
   bases (e.g. 2 and 4 with two clients each). Without `--pin`, `NOITA_CPUSET` (e.g.
   `0,1,6,7`) confines every client of the run to those CPUs instead.
 * `--solo` is the single-player baseline: the same scripted scenario without networking
-  or engine patches, one player per instance. As in a session, the player becomes a
-  spectator at 0 HP instead of dying, so the scenario's world events keep running (a
-  vanilla death stopped them and made the baseline's second half much lighter).
+  or engine patches, one player per instance. As in a session, a player at 0 HP (not
+  reached in the bot scenario) becomes a spectator instead of dying, so the scenario's
+  world events keep running.
 * `--netsim` applies 5 % loss and 100 ms latency to every datagram the server sends *and*
   receives (i.e. on both directions of every client link).
 
