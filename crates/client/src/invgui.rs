@@ -26,8 +26,8 @@
 //! picker's own client runs it after the window ([`swap_update`]). The container capacity
 //! queries the simulation shares with the GUI run with the GUI globals set to the
 //! container owner's ([`wrap_capacity`]). Direct field writes of the GUI (item slots, spell
-//! `uses_remaining` shown in tooltips, the inventory refresh request) are undone by the mod
-//! around the call (`files/players.lua`).
+//! `uses_remaining` shown in tooltips, the inventory refresh request) are undone around the
+//! call ([`gui_update`]).
 
 use crate::patches::{expect, rd, rel32, write_code, Exec, PatchError};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -63,10 +63,21 @@ const KILL_FN: u32 = 0x0044_df60;
 /// EntityManager*; GetEntityById: thiscall(manager, id), `ret 4`.
 const ENTITY_MANAGER: u32 = 0x0120_4b98;
 const ENTITY_BY_ID_FN: u32 = 0x0056_eba0;
-/// ItemComponent type index (cdecl, no arguments); component buffers at manager+0x2c.
+/// Component type indices (cdecl, no arguments; component buffers at manager+0x2c):
+/// ItemComponent, ControlsComponent, Inventory2Component.
 const ITEM_COMPONENT_TYPE_FN: u32 = 0x0095_8780;
-/// ItemComponent::inventory_slot (ivec2).
+const CONTROLS_COMPONENT_TYPE_FN: u32 = 0x0095_96b0;
+const INVENTORY2_COMPONENT_TYPE_FN: u32 = 0x0095_9970;
+/// ItemComponent::inventory_slot (ivec2), ::uses_remaining (int).
 const ITEM_SLOT: u32 = 0xd8;
+const ITEM_USES: u32 = 0x68;
+/// Inventory2Component::mForceRefresh (bool).
+const INVENTORY2_FORCE_REFRESH: u32 = 0x6a;
+/// ControlsComponent byte ranges the GUI reads: the mButtonDown*/mButtonFrame* pair of every
+/// button but the wheel (ChangeItemR/L at 0xb4..0xcc) and mButtonLastFrameFire (0x50), from
+/// the field setter FUN_005db800: Fire 0x48/0x4c, Fire2 0x54 … Dig 0xac/0xb0, Inventory
+/// 0xcc/0xd0 … RightClick 0xfc/0x100.
+const GUI_CONTROL_RANGES: [(u32, u32); 3] = [(0x48, 0x50), (0x54, 0xb4), (0xcc, 0x104)];
 /// GUI globals read by the take/put functions: the entity whose GUI runs, the dragged item's
 /// entity id, and that entity's inventory_full container.
 const GUI_OWNER: u32 = 0x0122_24f0;
@@ -336,13 +347,14 @@ unsafe fn entity(id: u32) -> u32 {
     e
 }
 
-/// The ItemComponent of entity `e` (null if none).
-unsafe fn item_component(e: u32) -> u32 {
+/// The first component (enabled or not) of entity `e` whose type index `type_fn` returns
+/// (null if none), as `EntityGetFirstComponentIncludingDisabled`.
+unsafe fn first_component(e: u32, type_fn: u32) -> u32 {
     let mgr = rd(ENTITY_MANAGER);
     if e == 0 || mgr == 0 {
         return 0;
     }
-    let tid: extern "C" fn() -> i32 = std::mem::transmute(ITEM_COMPONENT_TYPE_FN as usize);
+    let tid: extern "C" fn() -> i32 = std::mem::transmute(type_fn as usize);
     let t = tid();
     let bufs = rd(mgr + 0x2c);
     let n = (rd(mgr + 0x30) - bufs) as i32 >> 2;
@@ -361,6 +373,20 @@ unsafe fn item_component(e: u32) -> u32 {
         return 0;
     }
     get(buf, i)
+}
+
+/// The ItemComponent of entity `e` (null if none).
+unsafe fn item_component(e: u32) -> u32 {
+    first_component(e, ITEM_COMPONENT_TYPE_FN)
+}
+
+/// The children of entity `e` (Entity*, child order).
+unsafe fn children<'a>(e: u32) -> &'a [u32] {
+    let v = if e != 0 { rd(e + CHILDREN) } else { 0 };
+    if v == 0 || rd(v) == 0 || rd(v + 4) <= rd(v) {
+        return &[];
+    }
+    std::slice::from_raw_parts(rd(v) as *const u32, ((rd(v + 4) - rd(v)) / 4) as usize)
 }
 
 extern "C" fn on_hook(kind: u32, ecx: u32, edx: u32, sp: *const u32) {
@@ -455,6 +481,12 @@ pub fn set_local(id: u32) {
 /// Run the local player's GUI once, recording its simulation changes as ops instead of
 /// applying them. Returns false if the GUI component has not been seen yet.
 ///
+/// The GUI reads this client's buttons straight from its input, like vanilla, through the
+/// player's ControlsComponent: set from the input proxy's for the call ([`GUI_CONTROL_RANGES`];
+/// the wheel stays lockstep input, which the simulation applies itself), then restored. Its
+/// direct writes of simulation fields (the slots it assigns to items and spells, spell uses
+/// shown in tooltips, the inventory's refresh request it consumes) are undone after the call.
+///
 /// # Safety
 /// Game thread, outside the simulation window.
 pub unsafe fn gui_update() -> bool {
@@ -463,6 +495,30 @@ pub unsafe fn gui_update() -> bool {
     let flag = FLAG.load(Ordering::Relaxed);
     if id == 0 || e == 0 || comp == 0 || sys == 0 || flag == 0 || entity(id) != e {
         return false;
+    }
+    let Some((_, proxy_controls)) = crate::slots::proxy_controls() else { return false };
+    // ItemComponents of the quick bar, the spell inventory and the cards in wands: slot and uses.
+    let mut items: Vec<(u32, [u32; 3])> = Vec::with_capacity(48);
+    for name in [&b"inventory_quick"[..], b"inventory_full"] {
+        let Some(&container) = children(e).iter().find(|&&c| entity_name(c) == name) else { continue };
+        for &item in children(container) {
+            for ic in std::iter::once(item_component(item)).chain(children(item).iter().map(|&card| item_component(card))) {
+                if ic != 0 {
+                    items.push((ic, [rd(ic + ITEM_SLOT), rd(ic + ITEM_SLOT + 4), rd(ic + ITEM_USES)]));
+                }
+            }
+        }
+    }
+    let inventory = first_component(e, INVENTORY2_COMPONENT_TYPE_FN);
+    let refresh = if inventory != 0 { *((inventory + INVENTORY2_FORCE_REFRESH) as *const u8) } else { 0 };
+    let controls = first_component(e, CONTROLS_COMPONENT_TYPE_FN);
+    let mut kept = [0u8; 0x104];
+    if controls != 0 {
+        for (a, b) in GUI_CONTROL_RANGES {
+            let n = (b - a) as usize;
+            std::ptr::copy_nonoverlapping((controls + a) as *const u8, kept.as_mut_ptr().add(a as usize), n);
+            std::ptr::copy_nonoverlapping((proxy_controls + a) as *const u8, (controls + a) as *mut u8, n);
+        }
     }
     // Our player is the only one for the layout (vanilla single-player HUD position).
     let list = rd(PLAYER_LIST_OWNER);
@@ -475,6 +531,19 @@ pub unsafe fn gui_update() -> bool {
     *(flag as *mut u8) = 1;
     let f: extern "thiscall" fn(u32, u32, u32) = std::mem::transmute(GUI_UPDATE_FN as usize);
     f(sys, e, comp);
+    if controls != 0 {
+        for (a, b) in GUI_CONTROL_RANGES {
+            std::ptr::copy_nonoverlapping(kept.as_ptr().add(a as usize), (controls + a) as *mut u8, (b - a) as usize);
+        }
+    }
+    for (ic, [x, y, uses]) in items {
+        *((ic + ITEM_SLOT) as *mut u32) = x;
+        *((ic + ITEM_SLOT + 4) as *mut u32) = y;
+        *((ic + ITEM_USES) as *mut u32) = uses;
+    }
+    if inventory != 0 {
+        *((inventory + INVENTORY2_FORCE_REFRESH) as *mut u8) = refresh;
+    }
     *(flag as *mut u8) = 0;
     INVENTORY_OPEN.store(*(GUI_INVENTORY_OPEN as *const u8) as u32, Ordering::Relaxed);
     *(GUI_INVENTORY_OPEN as *mut u8) = 0;

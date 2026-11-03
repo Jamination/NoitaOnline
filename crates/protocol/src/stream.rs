@@ -34,6 +34,11 @@ impl ClientStream {
         self.inputs.push(data);
     }
 
+    /// The frame the next pushed input should be for (the frame after the last one queued).
+    pub fn next_input_frame(&self) -> u32 {
+        self.inputs_first + self.inputs.len() as u32
+    }
+
     pub fn has_unacked_inputs(&self) -> bool {
         !self.inputs.is_empty()
     }

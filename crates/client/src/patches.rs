@@ -1879,6 +1879,8 @@ extern "C" fn early_window_entry() {
     unsafe {
         // This frame's input into the proxy, before the window (render camera, own RNG).
         crate::earlyinput::update_proxy();
+        // The camera this client drew the last frame with goes out with this frame's input.
+        crate::views::set_local_camera(render_camera_now());
         let Some((x, y)) = ARMED_CAMERA.lock().unwrap_or_else(|p| p.into_inner()).take() else { return };
         if rd(GAME_GLOBAL_PTR) == 0 {
             return;
@@ -1886,6 +1888,35 @@ extern "C" fn early_window_entry() {
         sim_rng_enter();
         set_camera_pos(x, y);
     }
+}
+
+/// The camera position last requested through SetCameraPos ([`GG_CAMERA_REQUEST`]): outside
+/// the window, this client's render camera (without its screen shake), rounded to whole px.
+///
+/// # Safety
+/// Game thread.
+pub unsafe fn render_camera_now() -> Option<crate::views::Camera> {
+    let gg = rd(GAME_GLOBAL_PTR);
+    if gg == 0 {
+        return None;
+    }
+    crate::views::camera_px(*((gg + GG_CAMERA_REQUEST) as *const f32), *((gg + GG_CAMERA_REQUEST + 4) as *const f32))
+}
+
+/// The camera's int view rect {x, y, w, h} (GridWorld+0x498: what the grid render snapshots
+/// and the view-bound particle tests use), if the world exists.
+///
+/// # Safety
+/// Game thread.
+pub unsafe fn camera_int_rect() -> Option<[i32; 4]> {
+    let gg = rd(GAME_GLOBAL_PTR);
+    let world_data = if gg != 0 { rd(gg + 0x0c) } else { 0 };
+    let grid_world = if world_data != 0 { rd(world_data + 0x44) } else { 0 };
+    if grid_world == 0 {
+        return None;
+    }
+    let r = |o: u32| rd(grid_world + o) as i32;
+    Some([r(0x498), r(0x49c), r(0x4a0), r(0x4a4)])
 }
 
 /// GameGlobal::SetCameraPos with `force`, then the camera lock ([`GG_CAMERA_LOCK`]) off, for
@@ -2351,9 +2382,9 @@ const MAX_FOCI: usize = 16;
 static FREEZE_FOCI_N: AtomicU32 = AtomicU32::new(0);
 static FREEZE_FOCI_ARR: AtomicU32 = AtomicU32::new(0);
 
-/// Body freezing follows the players (foci) instead of each client's render camera: the
-/// camera-triggered pass is removed, the distance test uses the nearest focus, and the
-/// pass is triggered deterministically by [`focus_freeze_step`].
+/// Body freezing follows every player's view (the view centres, `views`) instead of each
+/// client's render camera: the camera-triggered pass is removed, the distance test uses the
+/// nearest view centre, and the pass is triggered deterministically by [`focus_freeze_step`].
 unsafe fn patch_focus_freeze(ex: &mut Exec) -> Result<(), PatchError> {
     expect(CAMERA_FREEZE_CALL, &[0xE8, 0x04, 0x10, 0x00, 0x00])?;
     expect(FREEZE_DIST_SITE, &FREEZE_DIST_ORIG)?;
@@ -2700,7 +2731,7 @@ const PF_REFRESH_STEP_FN: u32 = 0x0086_05e0;
 const PF_REFRESH_SCRATCH_PTR: u32 = 0x0122_70c8;
 const PF_REFRESH_SCRATCH_LEN: usize = 0x4624;
 
-/// Focus centres of the last simulation window (slot order), for the clearance refresh.
+/// View centres of the last simulation window (slot order), for the clearance refresh.
 static PF_FOCI: std::sync::Mutex<Vec<(f32, f32)>> = std::sync::Mutex::new(Vec::new());
 
 /// One player's refresh cycle: the coroutine state and, mid-chunk, its scratch.
@@ -2719,10 +2750,11 @@ static PF_REFRESH: std::sync::Mutex<Vec<PfRefresh>> = std::sync::Mutex::new(Vec:
 /// next cycle when done. The job runs before the simulation window, so that camera is each
 /// client's *render* camera: clients refreshed different chunks at different frames, and an
 /// enemy whose path search ran in between got a different path (seed 1404389217, f=1554:
-/// rat 969's next path node). The cycle now centres on the players (the focus centres
-/// published by the previous window): with one player exactly vanilla's single cycle; with
-/// more, every player runs its own cycle each frame (slot order, own coroutine state and
-/// chunk scratch), so every player's surroundings are refreshed at vanilla's rate.
+/// rat 969's next path node). The cycle now centres on every player's view (the view
+/// centres, i.e. cameras, published by the previous window): with one player exactly
+/// vanilla's single cycle; with more, every player runs its own cycle each frame (slot order,
+/// own coroutine state and chunk scratch), so every player's surroundings are refreshed at
+/// vanilla's rate.
 unsafe fn patch_pathfinding_refresh(ex: &mut Exec) -> Result<(), PatchError> {
     expect(PF_REFRESH_SITE, &PF_REFRESH_ORIG)?;
     let f = ((pf_refresh as extern "C" fn(u32)) as u32).to_le_bytes();
@@ -2786,15 +2818,15 @@ extern "C" fn pf_refresh(job: u32) {
     }
 }
 
-/// Publish this window's focus centres (slot order) for the clearance refresh.
+/// Publish this window's view centres (slot order) for the clearance refresh.
 pub fn pathfinding_foci(foci: &[(f32, f32)]) {
     *PF_FOCI.lock().unwrap_or_else(|p| p.into_inner()) = foci.to_vec();
 }
 
 static FREEZE_LAST: std::sync::Mutex<Vec<(f32, f32)>> = std::sync::Mutex::new(Vec::new());
 
-/// Publish this frame's focus centres (slot order) for the far-body freeze test, and run
-/// the freeze pass whenever a focus moved more than 512 px since the last pass.
+/// Publish this frame's view centres (slot order) for the far-body freeze test, and run
+/// the freeze pass whenever a view moved more than 512 px since the last pass.
 ///
 /// # Safety
 /// Game thread, inside the simulation window, world initialised.

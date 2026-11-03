@@ -11,7 +11,7 @@
 //! - "near the camera rect" / "inside the camera rect" tests pass if any view passes;
 //! - per-view rects are the engine camera rect (its w, h) moved to the view centre, so the
 //!   vanilla margins and distances keep their meaning; the one pure "on screen" test (pixel
-//!   scenes popping in) uses [`views::rect`], whose margin covers the camera look-ahead;
+//!   scenes popping in) uses [`views::rect`], the view's int rect;
 //! - the fog of war runs its 17×17-cell update around every view, each fog pixel once.
 //!
 //! Every hook falls back to the vanilla code path outside the window or without views

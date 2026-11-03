@@ -178,18 +178,49 @@ pub unsafe extern "C" fn no_start_info(out: *mut StartInfoC) -> i32 {
 /// stuck physics body on every client, as vanilla does on a machine whose physics falls behind.
 pub(crate) static BOX2D_STEP_SLOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Queue the local player's input for simulation frame `frame` (plus the slow-step byte, see
-/// [`BOX2D_STEP_SLOW`]).
+/// The camera stream of this client's inputs (see `views`).
+static CAMERA_ENCODER: Mutex<views::CameraEncoder> = Mutex::new(views::CameraEncoder::new());
+
+/// This client's render camera for the input being sent: the camera it drew the last frame
+/// with (taken at the early window entry, before the simulation camera replaces it).
+fn local_render_camera() -> Option<views::Camera> {
+    #[cfg(all(windows, target_arch = "x86"))]
+    unsafe {
+        if patches::in_window() {
+            views::local_camera()
+        } else {
+            patches::render_camera_now()
+        }
+    }
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    None
+}
+
+/// Queue the local player's input for simulation frame `frame`, with the input trailer
+/// (`views`): this client's render camera and the slow-step flag ([`BOX2D_STEP_SLOW`]).
 ///
 /// # Safety
 /// `data` must point at `len` readable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn no_send_input(frame: u32, data: *const u8, len: u32) -> i32 {
     let mut bytes = if len == 0 { Vec::new() } else { std::slice::from_raw_parts(data, len as usize).to_vec() };
-    bytes.push(BOX2D_STEP_SLOW.swap(false, std::sync::atomic::Ordering::Relaxed) as u8);
+    let cam = local_render_camera();
     with_rt(-1, |rt| {
         let mut s = rt.shared.state.lock().unwrap();
         let Some(stream) = &mut s.stream else { return -2 };
+        let next = stream.next_input_frame();
+        if frame < next {
+            // Already sent (the stream ignores it): the camera reference stays.
+            return 0;
+        }
+        let mut enc = CAMERA_ENCODER.lock().unwrap_or_else(|p| p.into_inner());
+        if frame > next {
+            // The stream fills the gap with repeats of the last input, whose camera delta the
+            // receivers would apply again: this camera goes out absolute.
+            enc.reset();
+        }
+        enc.encode(cam, BOX2D_STEP_SLOW.swap(false, std::sync::atomic::Ordering::Relaxed), &mut bytes);
+        drop(enc);
         stream.push_input(frame, bytes);
         s.input_dirty = true;
         drop(s);
@@ -199,8 +230,9 @@ pub unsafe extern "C" fn no_send_input(frame: u32, data: *const u8, len: u32) ->
 }
 
 /// Block until the tick for `frame` arrives (or `timeout_ms`), then write it to `out` as
-/// `[count u8] count × ([player u8][len u16 LE][bytes])`, each input without its slow-step
-/// byte ([`BOX2D_STEP_SLOW`]; the frames before the input delay have empty inputs).
+/// `[count u8] count × ([player u8][len u16 LE][bytes])`, each input without its trailer
+/// (`views`: the player's camera, kept for the views, and the slow-step flag,
+/// [`BOX2D_STEP_SLOW`]; the frames before the input delay have empty inputs).
 /// Returns bytes written, -1 timeout, -2 disconnected, -3 buffer too small.
 ///
 /// # Safety
@@ -224,10 +256,7 @@ pub unsafe extern "C" fn no_wait_tick(frame: u32, timeout_ms: u32, out: *mut u8,
             with_rt((), |rt| rt.timer.tick_taken(waited, margin));
             #[cfg(all(windows, target_arch = "x86"))]
             prof::WAIT_US.fetch_add(waited, std::sync::atomic::Ordering::Relaxed);
-            let mut step_slow = false;
-            for (_, d) in inputs.iter_mut() {
-                step_slow |= d.pop().is_some_and(|b| b != 0);
-            }
+            let step_slow = views::take_tick_trailers(inputs.iter_mut().map(|(p, d)| (*p, d)));
             #[cfg(all(windows, target_arch = "x86"))]
             patches::set_box2d_freeze(step_slow);
             #[cfg(not(all(windows, target_arch = "x86")))]
@@ -780,9 +809,28 @@ pub unsafe extern "C" fn no_gui_apply(owner_id: u32, data: *const u8, len: u32) 
     }
 }
 
-/// Publish the focus centres (n × {x, y} floats, slot order) for physics-body freezing, the
-/// pathfinding clearance refresh and every player's view (`views`), and trigger the freeze
-/// pass when a focus moved far (call inside the simulation window).
+/// Every player's view centre (`views`): for each of `n` players (`ids`, slot order) the
+/// camera its client last sent in a tick, written over that player's entry of `xy` (n × {x,
+/// y} floats); a player without one yet keeps the position passed in. Call inside the
+/// window before setting the simulation camera (view 0's) and publishing the views.
+///
+/// # Safety
+/// `ids` must point at `n` readable bytes, `xy` at `2 * n` writable f32.
+#[no_mangle]
+pub unsafe extern "C" fn no_view_centres(ids: *const u8, xy: *mut f32, n: u32) {
+    for i in 0..n as usize {
+        if let Some((x, y)) = views::camera_of(*ids.add(i)) {
+            *xy.add(2 * i) = x as f32;
+            *xy.add(2 * i + 1) = y as f32;
+        }
+    }
+}
+
+/// Publish the view centres (n × {x, y} floats, slot order, from `no_view_centres`) as every
+/// player's view (`views`, rects from the simulation camera's int view rect, i.e. view 0's)
+/// and for physics-body freezing and the pathfinding clearance refresh, and trigger the
+/// freeze pass when a view moved far (call inside the simulation window, after the
+/// simulation camera is set).
 ///
 /// # Safety
 /// `xy` must point at `2 * n` readable f32.
@@ -791,7 +839,7 @@ pub unsafe extern "C" fn no_focus_freeze(xy: *const f32, n: u32) {
     #[cfg(all(windows, target_arch = "x86"))]
     {
         let foci: Vec<(f32, f32)> = (0..n as usize).map(|i| (*xy.add(2 * i), *xy.add(2 * i + 1))).collect();
-        views::set_foci(&foci);
+        views::set(&foci, patches::camera_int_rect());
         patches::pathfinding_foci(&foci);
         patches::focus_freeze_step(&foci);
     }

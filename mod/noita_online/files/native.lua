@@ -46,6 +46,7 @@ void no_sim_enter(void);
 void no_sim_leave(void);
 uint32_t no_chunk_prewait(void);
 void no_chunk_stats(uint32_t* out);
+void no_view_centres(const uint8_t* ids, float* xy, uint32_t n);
 void no_focus_freeze(const float* xy, uint32_t n);
 void no_local_view(int32_t i);
 void no_set_sim_camera(float x, float y);

@@ -255,6 +255,7 @@ local FOCUS_HW, FOCUS_HH = 400, 300
 local ffi = require("ffi")
 local foci_buf = ffi.new("int32_t[128]")
 local centre_buf = ffi.new("float[64]")
+local id_buf = ffi.new("uint8_t[32]")
 
 local function current_foci()
   local foci = {}
@@ -262,17 +263,25 @@ local function current_foci()
     if EntityGetIsAlive(slot.entity) then
       local x, y = EntityGetTransform(slot.entity)
       x, y = math.floor(x), math.floor(y)
-      foci[#foci + 1] = { x - FOCUS_HW, y - FOCUS_HH, x + FOCUS_HW, y + FOCUS_HH, x = x, y = y, own = slot.id == Players.local_id }
+      foci[#foci + 1] = { x - FOCUS_HW, y - FOCUS_HH, x + FOCUS_HW, y + FOCUS_HH, x = x, y = y, id = slot.id, own = slot.id == Players.local_id }
     end
   end
   return foci
 end
 
--- Inside the simulation window every client uses the same camera (first live player),
--- because camera-dependent engine systems feed the simulation; rendering uses our own.
-local function set_sim_camera(foci)
+-- Every player's view (slot order, into centre_buf) is the camera its own client rendered,
+-- sent with its input (crates/client/src/views.rs); the simulation camera inside the window
+-- is the first live player's view, the same on every client, because camera-dependent engine
+-- systems feed the simulation. Rendering uses our own camera.
+local function set_views_and_sim_camera(foci)
+  for i, r in ipairs(foci) do
+    id_buf[i - 1] = r.id
+    centre_buf[2 * (i - 1)] = r.x
+    centre_buf[2 * (i - 1) + 1] = r.y
+  end
+  NO.lib.no_view_centres(id_buf, centre_buf, #foci)
   -- Forced: the camera is at the same place on every client for the whole window.
-  if foci[1] then NO.lib.no_set_sim_camera(foci[1].x, foci[1].y) end
+  if foci[1] then NO.lib.no_set_sim_camera(centre_buf[0], centre_buf[1]) end
 end
 -- After the window: the view is the camera Noita computed for our player in the window
 -- (Players.local_camera_target), set like the engine's own camera update does (unforced).
@@ -346,7 +355,7 @@ function OnWorldPreUpdate()
   if waited > 200 then log(string.format("chunk generation wait %d ms at frame %d", waited, f)) end
   if ready then
     local foci = current_foci()
-    set_sim_camera(foci)
+    set_views_and_sim_camera(foci)
     if ENTLOG and cfg.dense_from and f >= cfg.dense_from and f <= cfg.dense_to and Players.slots[1] then
       local x, y = EntityGetTransform(Players.slots[1].entity)
       local cx, cy = GameGetCameraPos()
@@ -357,8 +366,6 @@ function OnWorldPreUpdate()
     local own = -1
     for i, r in ipairs(foci) do
       for k = 1, 4 do foci_buf[(i - 1) * 4 + k - 1] = r[k] end
-      centre_buf[2 * (i - 1)] = r.x
-      centre_buf[2 * (i - 1) + 1] = r.y
       if r.own then own = i - 1 end
     end
     NO.lib.no_focus_freeze(centre_buf, #foci)

@@ -7,6 +7,9 @@
 --   then, if Noita's inventory GUI changed the inventory: u16 length, GUI op bytes
 --   (recorded and applied by the client runtime, see crates/client/src/invgui.rs).
 -- Quantising floats at capture time means every client applies bit-identical values.
+-- On the wire the client runtime appends its own trailer (this client's render camera for
+-- every player's view, the Box2D slow-step flag) and strips it again before the tick reaches
+-- Lua (crates/client/src/views.rs).
 local M = {}
 
 M.BUTTONS = {

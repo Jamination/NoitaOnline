@@ -282,22 +282,6 @@ local function normalize_inventory(slot)
   end
 end
 
--- ItemComponents of everything in player `e`'s inventory: quick bar, spell inventory and
--- the cards in wands.
-local function inventory_item_components(e)
-  local out = {}
-  for _, name in ipairs({ "inventory_quick", "inventory_full" }) do
-    local c = child_named(e, name)
-    for _, item in ipairs(c and EntityGetAllChildren(c) or {}) do
-      out[#out + 1] = EntityGetFirstComponentIncludingDisabled(item, "ItemComponent")
-      for _, card in ipairs(EntityGetAllChildren(item) or {}) do
-        out[#out + 1] = EntityGetFirstComponentIncludingDisabled(card, "ItemComponent")
-      end
-    end
-  end
-  return out
-end
-
 local function gui_component()
   local slot = M.local_slot()
   if not slot or not M.proxy_controls or not EntityGetIsAlive(slot.entity) then return nil end
@@ -311,23 +295,12 @@ function M.gui_open()
   return gui ~= nil and (M.swap_open or ComponentGetValue2(gui, "mActive"))
 end
 
--- The ControlsComponent fields the inventory GUI reads (every button but the wheel).
-local GUI_FIELDS = {}
-for _, b in ipairs(Input.BUTTONS) do
-  if b ~= "ChangeItemR" and b ~= "ChangeItemL" then
-    GUI_FIELDS[#GUI_FIELDS + 1] = "mButtonDown" .. b
-    GUI_FIELDS[#GUI_FIELDS + 1] = "mButtonFrame" .. b
-  end
-end
-
 -- Run Noita's inventory GUI (HUD, quick bar, tooltips, inventory screen) for this client's
 -- own player, after the simulation window. Its inventory edits do not happen here: the
 -- client runtime records them as ops, sent with the next input and applied by every client
 -- in the tick (apply_tick). It reads this client's buttons straight from its input, like
--- vanilla, through the player's ControlsComponent (set from the proxy for the call, then
--- restored; the wheel stays lockstep input, which the simulation applies itself). Its direct
--- writes of simulation fields (slots it assigns, spell uses shown in tooltips, the
--- inventory's refresh request it consumes) are undone after the call.
+-- vanilla; the client runtime sets them on the player's ControlsComponent for the call and
+-- undoes the GUI's direct writes of simulation fields after it (invgui.rs gui_update).
 function M.gui_update()
   local gui = gui_component()
   if not gui then return end
@@ -335,26 +308,7 @@ function M.gui_update()
   -- world pauses meanwhile and the inventory GUI does not run).
   M.swap_open = NO.lib.no_gui_swap_update() == 1
   if M.swap_open then return end
-  local slot = M.local_slot()
-  local saved = {}
-  for _, ic in ipairs(inventory_item_components(slot.entity)) do
-    local x, y = ComponentGetValue2(ic, "inventory_slot")
-    saved[#saved + 1] = { ic, x, y, ComponentGetValue2(ic, "uses_remaining") }
-  end
-  local inv = EntityGetFirstComponentIncludingDisabled(slot.entity, "Inventory2Component")
-  local refresh = inv and ComponentGetValue2(inv, "mForceRefresh")
-  local kept = {}
-  for i, f in ipairs(GUI_FIELDS) do
-    kept[i] = ComponentGetValue2(slot.controls, f)
-    ComponentSetValue2(slot.controls, f, ComponentGetValue2(M.proxy_controls, f))
-  end
   NO.lib.no_gui_update()
-  for i, f in ipairs(GUI_FIELDS) do ComponentSetValue2(slot.controls, f, kept[i]) end
-  for _, s in ipairs(saved) do
-    ComponentSetValue2(s[1], "inventory_slot", s[2], s[3])
-    ComponentSetValue2(s[1], "uses_remaining", s[4])
-  end
-  if inv then ComponentSetValue2(inv, "mForceRefresh", refresh) end
 end
 
 local bit = require("bit")

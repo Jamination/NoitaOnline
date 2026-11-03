@@ -99,10 +99,11 @@ The goal is the base game's behaviour; these are the deviations multiplayer forc
   its inventory (only wand ghosts are immune). Single-player Noita has no second kicker, so
   this only happens with several players; the engine's rule is kept.
 - Camera-relative engine behaviour (on-screen particles, rain, CameraBound enemies, AI
-  hunting, fog of war, screen shake) is evaluated around every player's view, modelled from
-  the player's position plus a 64 px margin for the vanilla camera's look-ahead. Weather
-  and music follow the first player. Markers the engine draws into the world (telepathy,
-  radar) are seen by every player.
+  hunting, fog of war, screen shake, chunk loading) is evaluated around every player's view:
+  the camera that player's own client rendered, sent with its input, so it lags that
+  player's screen by the input delay plus one frame (2 frames on a LAN). Weather and music
+  follow the first player. Markers the engine draws into the world (telepathy, radar) are
+  seen by every player.
 - One player's world-changing events (fungal shift, explosions, positional sounds) are
   shared, as the world is; only their messages are shown to that player alone.
 - The in-game date (holiday content, weather changes on the hour) is the server's session

@@ -15,7 +15,8 @@ pub const CH_RELIABLE: u8 = 0;
 pub const CH_UNRELIABLE: u8 = 1;
 
 /// Bumped whenever the message format or lockstep rules change; server and clients must match.
-pub const GAME_PROTOCOL_VERSION: u32 = 4;
+/// 5: every input carries its client's render camera (the client's input trailer).
+pub const GAME_PROTOCOL_VERSION: u32 = 5;
 
 /// Budget for one unreliable lockstep datagram's payload (fits rudp's unreliable limit).
 pub const STREAM_BUDGET: usize = 1100;
