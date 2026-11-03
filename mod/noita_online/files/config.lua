@@ -47,6 +47,7 @@ function M.load()
   if out then
     c.log_path = out .. "/client_" .. inst .. ".log"
     c.perf_path = out .. "/frames_" .. inst .. ".txt"
+    c.lat_path = out .. "/lat_" .. inst .. ".txt"
   end
   c.enabled = c.solo or c.server ~= nil
   return c

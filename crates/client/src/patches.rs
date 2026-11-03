@@ -1270,6 +1270,7 @@ const PATCHES: &[(&str, PatchFn)] = &[
     ("camera_bound", |ex| unsafe { crate::cambound::patch_camera_bound(ex) }),
     ("clock", |_| unsafe { crate::clock::install(write_code) }),
     ("early_window", patch_early_window),
+    ("early_input", |_| unsafe { crate::earlyinput::patch() }),
     ("freecam_static", |_| unsafe { patch_freecam_static() }),
     ("cell_flash", patch_cell_flash),
     ("cell_emitters", |ex| unsafe { crate::cosmetic::patch_cell_emitters(ex) }),
@@ -1788,6 +1789,8 @@ unsafe fn patch_early_window(ex: &mut Exec) -> Result<(), PatchError> {
 
 extern "C" fn early_window_entry() {
     unsafe {
+        // This frame's input into the proxy, before the window (render camera, own RNG).
+        crate::earlyinput::update_proxy();
         let Some((x, y)) = ARMED_CAMERA.lock().unwrap_or_else(|p| p.into_inner()).take() else { return };
         if rd(GAME_GLOBAL_PTR) == 0 {
             return;

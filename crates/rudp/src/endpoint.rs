@@ -161,6 +161,11 @@ impl Server {
         self.io.socket.local_addr()
     }
 
+    /// The UDP socket (non-blocking), e.g. to wait for incoming datagrams.
+    pub fn socket(&self) -> &UdpSocket {
+        &self.io.socket
+    }
+
     pub fn now_us(&self) -> u64 {
         self.clock.now_us()
     }
@@ -431,6 +436,16 @@ impl Client {
     /// without new input or datagrams (handshake resend, reliable resend, ack, keepalive,
     /// timeout check). `None` while a link simulator holds datagrams for later: poll then.
     pub fn next_deadline_us(&self) -> Option<u64> {
+        self.deadline(false)
+    }
+
+    /// [`Self::next_deadline_us`] for a caller whose own next packet (soon) carries the
+    /// pending acks.
+    pub fn next_deadline_us_deferring_acks(&self) -> Option<u64> {
+        self.deadline(true)
+    }
+
+    fn deadline(&self, defer_acks: bool) -> Option<u64> {
         if self.io.in_sim.is_some() || self.io.out_sim.is_some() {
             return None;
         }
@@ -440,7 +455,13 @@ impl Client {
                 .last_handshake_send
                 .map_or(now, |t| t + HANDSHAKE_RESEND_US)
                 .min(self.started + self.cfg.timeout_us + 1),
-            ClientState::Connected { .. } => self.conn.as_ref().map_or(now, |c| c.next_deadline(now)),
+            ClientState::Connected { .. } => self.conn.as_ref().map_or(now, |c| {
+                if defer_acks {
+                    c.next_deadline_deferring_acks(now)
+                } else {
+                    c.next_deadline(now)
+                }
+            }),
             ClientState::Disconnected(_) => u64::MAX,
         })
     }

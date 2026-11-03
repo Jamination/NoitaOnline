@@ -63,6 +63,7 @@ Inside the window:
 | `ragdoll_stains` | When a creature dies, its ragdoll images are blended with the creature's stains (`FUN_00abb7d0` → `FUN_00be8240`, overlay at `0x00abc082`). The overlay was the SpriteStains image at +0x20: the stain colours (+0x00) blurred with the left neighbour, written only by the stains texture upload (`FUN_00c21020`) from the render-side queue, and only for sprites drawn last frame. So each client blended in its own last *drawn* stains, all zero for a creature it never saw, and small ragdoll parts (one box fixture per run of equal-colour pixels, `FUN_009817d0`) got different fixtures and mass (seed 1786459272, f=5345). | The site passes a scratch image holding the upload's blur of the *current* stain colours, bit for bit as `FUN_00c21020` computes it (per channel (c + c_left) / (1 + a_left) in f32, ×255 truncated and clamped, `FUN_0044abc0`): vanilla's look from simulation state only (`ragdoll.rs`). It differs from vanilla only where vanilla's overlay lagged the stains (upload queue) or was empty (creature died off-screen). |
 | `platform_frame` | The platform frame counter (PlatformDesktop+0x20, its vtable+0x60 getter) counts main-loop frames from before the world exists (62 of them in a `-gamemode 0` start), so it differs between clients by the time each spent before its session started, e.g. in menus. About 60 sites read it, simulation ones among them: the SpriteStains update runs for an entity when `(frame ^ entity_id) & 15 == 0` (a player: every 3rd frame) and draws the global LCG there; PathFindingComponent (`FUN_00bca030`) and animal AI (`FUN_00b750b0`) schedule work by it. | The counter is set to GameGlobal's frame + 2^20 by `no_fix_seeds` and at every window entry. The base is above any pre-session count, so the counter only jumps forward. |
 | `analog_fly_rng` | With the option `gamepad_analog_flying` and a gamepad, the ControlsSystem (`FUN_00a8d7f0`) dithers the fly button from the analog trigger with one global-LCG step per frame. It runs only for an enabled ControlsComponent, i.e. the local input proxy, inside the window, so that client's simulation LCG ran ahead of the others'. | The dither uses its own LCG state (@0x00a8e8c1, 0x00a8e8d0); the dithered Fly bit is captured and sent as input. |
+| `early_input` | (latency) The ControlsSystem writes the input it reads for the player during the world update, and the mod captured the input proxy in `OnWorldPreUpdate`, i.e. the input polled for the previous frame: every input waited one frame more than the network needs. | The system's component update calls (`FUN_00a8d7f0` from the update loop @0x00c523f7 and from its parallel job @0x00d8b863) go through a hook that skips the input proxy's component when it was already updated for this update; the `early_window` hook runs that update for the proxy right before the `OnWorldPreUpdate` dispatch, before the window opens (render camera, own RNG), with the frame counter at the coming update's number for its press stamps. Local input only; it never touches the simulation. |
 | `inventory_gui` | Noita's inventory GUI (`InventoryGuiComponent`, update `FUN_00b7d8d0`) reads this client's keyboard and mouse and edits the inventory at once, inside the window: enabled for a client's own player only, it changed the simulation on that client alone (seed 1834914516: number key 2 equipped wand 2 on one client only). Its "inventory open" flag (`0x01222510`) is read by the simulation (item pickup refuses with the screen open). A full-inventory pickup (`FUN_00b906a0` → `FUN_00b811b0`) sets GameGlobal pause bit 2, after which every client runs only the "replace which item" screen (`FUN_00b813a0`) from its own input. | The engine's own GUI update is skipped for every player; the mod runs it for its own player after the window (`no_gui_update`), with the co-op player list (`[0x01204bc0]+0x58`) pointing at that player (the HUD is laid out per list index). While it runs, the GUI's simulation calls are recorded instead of executed: set active item `FUN_00b4ffa0`, take/put item `FUN_00b5eb00`/`FUN_00b5eb90`, `SendMessage<ThrowItem>` `FUN_00d0e670`, `SendMessage<ItemAboutToBeEaten>` `FUN_00d20850`, pick up `FUN_00b905f0`. The ops (entity ids, slots, message fields) travel in the input; every client replays them in the tick with the same engine calls (`no_gui_apply`). The open flag is cleared between GUI calls. `FUN_00b811b0` never pauses; the picker's own client runs the replace screen after the window (`no_gui_swap_update`), recorded the same way. |
 | `grid_cap` | The grid update (`FUN_00726340`) simulates at most `GRID_MAX_UPDATES_PER_FRAME` (128) active tiles. Above that it keeps the 128 nearest to the GetBorders centre (`std::sort` `FUN_0095d050`, comparator `FUN_00725e60`) and defers the rest into a `rand`-shuffled refill list. Inside the window that centre is the simulation camera (player 1), so in busy frames every other player's sand, liquids and fire stopped updating. | The cap is 128 per view (the caller's `[ebp-0x64]`). Each tile goes to its nearest view, each view's tiles are ordered by vanilla's key around that view (MSVC-sort port; view 0's centre is exactly vanilla's, the others get the same 64 px snapping shift), and the views are interleaved rank-major, so each player keeps its nearest min(n, 128) tiles. With ≤1 view the update is unchanged. |
 | `sprite_events` | Sprite animation events (`<Event>`, `max_distance` 500) fire only near the camera (SpriteSystem `FUN_00c1ab60`, SpriteAnimator `FUN_00c1b820`). Inside the window that is player 1, so other players' `throw_release` (throwing), `sprite_visible`, and their enemies' `jump_start` never fired. | Distance to the nearest view centre. |
@@ -119,7 +120,9 @@ All of them are derived from the session seed.
   player's inventory (items in child order, containers, slots, uses, active item).
 - Press stamps: the world update after `OnWorldPreUpdate(f)` runs as frame `f + 1`, and
   "just pressed" checks (item switching, throw, kick, interact) compare `mButtonFrame*`
-  with that number, so applied inputs are stamped `f + 1` (`Input.press_frame`).
+  with that number, so applied inputs are stamped `f + 1` (`Input.press_frame`). The input
+  proxy's ControlsSystem update runs early for that same update (`early_input`), so its
+  stamps are `f + 1` too, and the capture counts a press stamped `f + 1` as pressed.
 - Noita's ControlsSystem (`FUN_00a8d7f0`) derives fields of an *enabled* ControlsComponent
   every frame and leaves a disabled one (a slot's) alone; `Input.apply` derives them the
   same way from the tick input and the slot's state: `mFlyingTargetY = y - 10` (the fly
@@ -146,9 +149,14 @@ All of them are derived from the session seed.
   player is the mod setting `noita_online.local_entity`, set by `players.lua` (follows a
   polymorph; 0 when dead). Only the prints (and the "all orbs" achievement) depend on it.
 - The engine maps the mouse to world coordinates (`ControlsComponent.mMousePosition`)
-  inside the window, through the simulation camera. That is another player's view on every
-  client but the first. The mod maps the mouse again through the render camera
-  (`DEBUG_GetMouseWorld` after the render camera is set) and sends that position.
+  through the camera of the moment. Inside the window that is the simulation camera,
+  another player's view on every client but the first. The proxy's update runs before the
+  window (`early_input`), i.e. through this client's render camera, the view the player
+  aimed in; in a frame without that update the mod maps the mouse again through the render
+  camera (`DEBUG_GetMouseWorld` after the render camera is set) and sends that position.
+- Input delay changes during the session (`InputDelay`, see architecture.md) only change
+  which frame a client's captured input is sent for; every client simulates the server's
+  ticks, so they cannot desync.
 
 ## Verification
 
@@ -229,3 +237,6 @@ Diagnostics used to find the root causes above, enabled by environment variables
   prewait waited, in-lock fallback waits (longest wait, frame of the last one, and how many
   were still unfinished after the 5 s bound, i.e. integrated at a timing-dependent frame).
 - `NOITA_ONLINE_PROF` / `NOITA_ONLINE_SAMPLE`: profilers.
+- `NOITA_ONLINE_LATPROBE=1`: input-latency probe (`files/latprobe.lua`, `lat_<inst>.txt`;
+  also on vanilla play without a server); `harness/latency.py` counts the frames from the
+  input poll to the character's reaction.

@@ -332,11 +332,17 @@ pub fn arm_cell_emitters() {
     SCAN_ARMED.store(EMITTERS_ON.load(Ordering::Relaxed), Ordering::Relaxed);
 }
 
+/// Whether the buffer-swap hook is installed (the swap calls [`swap_start`]).
+pub(crate) fn swap_hooked() -> bool {
+    EMITTERS_ON.load(Ordering::Relaxed)
+}
+
 extern "C" fn swap_start() {
+    // SAFETY (both): game thread, between window exit and the next entry.
     if SCAN_ARMED.swap(false, Ordering::Relaxed) {
-        // SAFETY: game thread, between window exit and the next entry.
         unsafe { scan_cell_emitters() };
     }
+    unsafe { crate::report::release() };
 }
 
 /// Surface cells with a material particle effect in the union of every player's view, in

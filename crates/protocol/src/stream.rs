@@ -2,14 +2,15 @@
 
 use crate::{ClientMsg, Tick, STREAM_BUDGET};
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 #[derive(Default)]
 pub struct ClientStream {
     /// Unacknowledged local inputs, the first for frame `inputs_first`.
     inputs_first: u32,
     inputs: Vec<Vec<u8>>,
-    /// Ticks received and not yet consumed.
-    ticks: BTreeMap<u32, Tick>,
+    /// Ticks received and not yet consumed, with the time each arrived.
+    ticks: BTreeMap<u32, (Tick, Instant)>,
     /// Next tick frame not yet received (all earlier received or consumed).
     tick_ack: u32,
 }
@@ -53,10 +54,11 @@ impl ClientStream {
             }
         }
         let mut new = false;
+        let now = Instant::now();
         for (i, t) in ticks.into_iter().enumerate() {
             let f = first + i as u32;
             if f >= self.tick_ack && !self.ticks.contains_key(&f) {
-                self.ticks.insert(f, t);
+                self.ticks.insert(f, (t, now));
                 new = true;
             }
         }
@@ -68,6 +70,11 @@ impl ClientStream {
 
     /// Take the tick for `frame` if it has arrived.
     pub fn take_tick(&mut self, frame: u32) -> Option<Tick> {
+        self.take_tick_timed(frame).map(|(t, _)| t)
+    }
+
+    /// Take the tick for `frame` if it has arrived, with the time it arrived.
+    pub fn take_tick_timed(&mut self, frame: u32) -> Option<(Tick, Instant)> {
         self.ticks.remove(&frame)
     }
 

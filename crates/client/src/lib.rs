@@ -11,6 +11,8 @@ pub mod clock;
 #[cfg(all(windows, target_arch = "x86"))]
 pub mod cosmetic;
 #[cfg(all(windows, target_arch = "x86"))]
+pub mod earlyinput;
+#[cfg(all(windows, target_arch = "x86"))]
 pub mod explosions;
 #[cfg(all(windows, target_arch = "x86"))]
 pub mod gridcap;
@@ -208,12 +210,14 @@ pub unsafe extern "C" fn no_wait_tick(frame: u32, timeout_ms: u32, out: *mut u8,
     let started = Instant::now();
     let deadline = started + Duration::from_millis(timeout_ms as u64);
     let mut s = shared.state.lock().unwrap();
+    let mut first_check = true;
     loop {
-        if let Some(mut inputs) = s.stream.as_mut().and_then(|st| st.take_tick(frame)) {
+        if let Some((mut inputs, arrived)) = s.stream.as_mut().and_then(|st| st.take_tick_timed(frame)) {
             s.game_waiting = false;
             drop(s);
             let waited = started.elapsed().as_micros() as u64;
-            with_rt((), |rt| rt.timer.window_wait_us += waited);
+            let margin = first_check.then(|| started.saturating_duration_since(arrived));
+            with_rt((), |rt| rt.timer.tick_taken(waited, margin));
             #[cfg(all(windows, target_arch = "x86"))]
             prof::WAIT_US.fetch_add(waited, std::sync::atomic::Ordering::Relaxed);
             let mut step_slow = false;
@@ -248,11 +252,12 @@ pub unsafe extern "C" fn no_wait_tick(frame: u32, timeout_ms: u32, out: *mut u8,
             return -1;
         }
         if !s.game_waiting {
-            // The network thread reads datagrams only with the next input or while the
-            // game waits: have it watch the socket now.
+            // While the game waits the network thread acks at once and repeats unacked
+            // inputs every 16 ms (the server may lack one of ours).
             s.game_waiting = true;
             shared.net_wake.notify();
         }
+        first_check = false;
         s = shared.game_cond.wait_timeout(s, deadline - now).unwrap().0;
     }
 }
@@ -430,6 +435,8 @@ pub extern "C" fn no_frame_mark() -> u32 {
                             p99_frame_us: w.p99_us,
                             max_frame_us: w.max_us,
                             wait_us: w.wait_us,
+                            stalls: w.stalls,
+                            margin_min_us: w.margin_min_us,
                         },
                     );
                 }
@@ -437,6 +444,30 @@ pub extern "C" fn no_frame_mark() -> u32 {
         }
         dt
     })
+}
+
+/// The session's current input delay in frames (the server adapts it), or -1 outside a
+/// session. The input captured while simulating frame f is sent for frame f + delay.
+#[no_mangle]
+pub extern "C" fn no_input_delay() -> i32 {
+    with_rt(-1, |rt| {
+        let s = rt.shared.state.lock().unwrap();
+        if s.stream.is_some() {
+            s.input_delay as i32
+        } else {
+            -1
+        }
+    })
+}
+
+/// Whether the input proxy's ControlsComponent already holds this frame's input (`earlyinput`,
+/// press stamps for the coming update, mouse through the render camera): 1, else 0.
+#[no_mangle]
+pub extern "C" fn no_input_fresh() -> i32 {
+    #[cfg(all(windows, target_arch = "x86"))]
+    return earlyinput::fresh() as i32;
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    0
 }
 
 /// Write every recorded frame interval (µs, one per line) to `path`. Returns lines written.

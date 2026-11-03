@@ -84,8 +84,10 @@ The goal is the base game's behaviour; these are the deviations multiplayer forc
   A player who leaves or dies (also as a polymorphed creature) becomes a frozen spectator
   instead of ending the run for everyone. Starting a new game ends that client's session
   (restart Noita to join another).
-- Input latency: your inputs take effect after the session's input delay (round trip + 2
-  frames, 3 frames on a LAN) plus one frame, about 67 ms on a LAN, more over the internet.
+- Input latency: your inputs take effect after the session's input delay, the frames an
+  input needs to reach every client: 1 frame (17 ms) on a LAN, about the round trip over the
+  internet; the server adapts it to the network during the session. Inventory GUI actions
+  (number keys, the inventory screen) take one frame more.
 - Noita's own inventory GUI (HUD, quick bar, inventory screen, pickup prompts) runs for
   each player on their own client; its edits travel through lockstep, so they take effect
   after the input delay. The inventory screen and the full-inventory "replace which item"

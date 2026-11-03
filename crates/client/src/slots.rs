@@ -264,6 +264,18 @@ pub(crate) unsafe fn is_local(e: u32) -> bool {
     id != 0 && id_of(e) == id
 }
 
+/// This client's input proxy and its (enabled) ControlsComponent, if it exists.
+pub(crate) unsafe fn proxy_controls() -> Option<(u32, u32)> {
+    let e = entity(PROXY_ID.load(Ordering::Relaxed));
+    let mgr = rd(ENTITY_MANAGER);
+    if e == 0 || mgr == 0 {
+        return None;
+    }
+    let controls_of: extern "thiscall" fn(u32, u32) -> u32 = std::mem::transmute(CONTROLS_OF_FN as usize);
+    let c = controls_of(mgr, e);
+    (c != 0).then_some((e, c))
+}
+
 /// Run `f` (a players-vector update of the game mode `gm` for `e`) with `e` standing in the
 /// vector's first entry if it is not in the vector, as it would be in vanilla; the entry is
 /// restored afterwards, so the vector keeps only the input proxy outside these calls.

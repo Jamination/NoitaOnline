@@ -4,6 +4,7 @@
 //! `--players` clients have joined, then the server relays every player's per-frame input
 //! as one ordered `Tick` per simulation frame and cross-checks clients' state hashes.
 
+mod delay;
 mod lockstep;
 mod metrics;
 mod verify;
@@ -20,7 +21,8 @@ struct Args {
     players: u8,
     max_players: u8,
     seed: Option<u32>,
-    /// Fixed lockstep input delay in frames; None = derive from measured RTTs at start.
+    /// Fixed lockstep input delay in frames; None = derive it from measured RTTs at start
+    /// and adapt it to the clients' tick margins during the session (`delay`).
     input_delay: Option<u16>,
     netsim: Option<LinkConditions>,
     log_dir: Option<PathBuf>,
@@ -104,6 +106,7 @@ struct PerfAgg {
     frames: u64,
     sum_avg_us: f64,
     worst_p99_us: u32,
+    stalls: u64,
 }
 
 struct Logs {
@@ -144,7 +147,7 @@ fn elapsed_secs() -> f64 {
 
 enum Phase {
     Lobby,
-    Running { relay: lockstep::Relay, started: Instant, session_id: u64, seed: u32 },
+    Running { relay: lockstep::Relay, delay: delay::Controller, started: Instant, session_id: u64, seed: u32 },
 }
 
 fn main() {
@@ -189,6 +192,7 @@ fn run(args: Args) -> std::io::Result<()> {
     let mut cpu_last = cpu_start;
     let mut cpu_peak = 0.0f64;
     let mut ticks_sent: u64 = 0;
+    let mut delay_changes: u32 = 0;
     let mut had_session = false;
     let mut expected_mods: Option<u64> = None;
     // Lobby round-trip measurement before a start: (since, each ready client's sample count then).
@@ -297,18 +301,29 @@ fn run(args: Args) -> std::io::Result<()> {
                                 }
                             }
                         }
-                        ClientMsg::Perf { frames, avg_frame_us, p99_frame_us, max_frame_us, wait_us } => {
+                        ClientMsg::Perf { frames, avg_frame_us, p99_frame_us, max_frame_us, wait_us, stalls, margin_min_us } => {
                             let a = perf.entry(id).or_default();
                             a.reports += 1;
                             a.frames += frames as u64;
                             a.sum_avg_us += avg_frame_us as f64 * frames as f64;
                             a.worst_p99_us = a.worst_p99_us.max(p99_frame_us);
+                            a.stalls += stalls as u64;
                             if let Some(f) = &mut logs.perf {
                                 let _ = writeln!(
                                     f,
-                                    "{{\"t\":{:.3},\"player\":{id},\"frames\":{frames},\"avg_frame_us\":{avg_frame_us},\"p99_frame_us\":{p99_frame_us},\"max_frame_us\":{max_frame_us},\"wait_us\":{wait_us}}}",
-                                    elapsed_secs()
+                                    "{{\"t\":{:.3},\"player\":{id},\"frames\":{frames},\"avg_frame_us\":{avg_frame_us},\"p99_frame_us\":{p99_frame_us},\"max_frame_us\":{max_frame_us},\"wait_us\":{wait_us},\"stalls\":{stalls},\"margin_min_us\":{}}}",
+                                    elapsed_secs(),
+                                    if margin_min_us == u32::MAX { -1 } else { margin_min_us as i64 }
                                 );
+                            }
+                            if let Phase::Running { relay, delay, .. } = &mut phase {
+                                let w = delay::Window { stalls, margin_min_us };
+                                if let Some((d, why)) = delay.report(id, w, relay.active()) {
+                                    let _ = server.broadcast(CH_RELIABLE, &ServerMsg::InputDelay { delay: d }.encode());
+                                    server.flush();
+                                    delay_changes += 1;
+                                    logs.event(&format!("input delay -> {d} at frame {} ({why})", relay.next_frame()));
+                                }
                             }
                         }
                         ClientMsg::Log { text } => logs.event(&format!("client {id}: {text}")),
@@ -359,7 +374,7 @@ fn run(args: Args) -> std::io::Result<()> {
                         .map(|c| if c.rtt_samples() > 0 { c.rtt_min_us() } else { c.rtt_us() })
                         .max()
                         .unwrap_or(0);
-                    let input_delay = args.input_delay.unwrap_or_else(|| auto_input_delay(max_rtt));
+                    let input_delay = args.input_delay.unwrap_or_else(|| delay::initial(max_rtt));
                     // Shared calendar for date/time-dependent content (weather, holidays).
                     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
                     let params = format!("scenario={};time={}", args.scenario, now).into_bytes();
@@ -369,7 +384,13 @@ fn run(args: Args) -> std::io::Result<()> {
                         "session {session_id:016x} started: seed={seed} input_delay={input_delay} (max rtt {} us) players={roster:?}",
                         max_rtt
                     ));
-                    phase = Phase::Running { relay: lockstep::Relay::new(ready, input_delay as u32), started: Instant::now(), session_id, seed };
+                    phase = Phase::Running {
+                        relay: lockstep::Relay::new(ready, input_delay as u32),
+                        delay: delay::Controller::new(input_delay, args.input_delay.is_none()),
+                        started: Instant::now(),
+                        session_id,
+                        seed,
+                    };
                     had_session = true;
                 }
             }
@@ -430,12 +451,12 @@ fn run(args: Args) -> std::io::Result<()> {
                     );
                 }
             }
-            write_summary(&logs, &args, &phase, &players, &departed, &perf, &verifier, cpu_start, wall_start, cpu_peak, ticks_sent);
+            write_summary(&logs, &args, &phase, &players, &departed, &perf, &verifier, cpu_start, wall_start, cpu_peak, ticks_sent, delay_changes);
         }
 
         if args.exit_when_empty && had_session && players.is_empty() {
             logs.event("all players left; exiting");
-            write_summary(&logs, &args, &phase, &players, &departed, &perf, &verifier, cpu_start, wall_start, cpu_peak, ticks_sent);
+            write_summary(&logs, &args, &phase, &players, &departed, &perf, &verifier, cpu_start, wall_start, cpu_peak, ticks_sent, delay_changes);
             return Ok(());
         }
         if players.is_empty() {
@@ -445,7 +466,7 @@ fn run(args: Args) -> std::io::Result<()> {
                 phase = Phase::Lobby;
             }
         }
-        std::thread::sleep(Duration::from_millis(1));
+        wait_readable(server.socket(), Duration::from_millis(1));
     }
 }
 
@@ -462,6 +483,7 @@ fn write_summary(
     wall_start: Instant,
     cpu_peak: f64,
     ticks: u64,
+    delay_changes: u32,
 ) {
     let Some(dir) = &logs.dir else { return };
     let wall = wall_start.elapsed().as_secs_f64();
@@ -469,11 +491,12 @@ fn write_summary(
     let t = v.totals;
     let mut s = String::new();
     s.push_str("{\n");
-    if let Phase::Running { relay, started, session_id, seed } = phase {
+    if let Phase::Running { relay, delay, started, session_id, seed } = phase {
         s.push_str(&format!(
-            "  \"session\": {{\"id\": \"{session_id:016x}\", \"seed\": {seed}, \"frame\": {}, \"seconds\": {:.1}}},\n",
+            "  \"session\": {{\"id\": \"{session_id:016x}\", \"seed\": {seed}, \"frame\": {}, \"seconds\": {:.1}, \"input_delay\": {}, \"input_delay_changes\": {delay_changes}}},\n",
             relay.next_frame(),
-            started.elapsed().as_secs_f64()
+            started.elapsed().as_secs_f64(),
+            delay.delay()
         ));
     }
     s.push_str(&format!("  \"players_required\": {},\n", args.players));
@@ -498,7 +521,7 @@ fn write_summary(
         }
         let pf = perf.get(&id);
         s.push_str(&format!(
-            "\n    {{\"player\": {id}, \"name\": {:?}, \"connected\": {connected}, \"avg_out_Bps\": {:.0}, \"peak_out_Bps\": {:.0}, \"avg_in_Bps\": {:.0}, \"peak_in_Bps\": {:.0}, \"perf_frames\": {}, \"avg_frame_us\": {:.0}, \"worst_p99_frame_us\": {}}}",
+            "\n    {{\"player\": {id}, \"name\": {:?}, \"connected\": {connected}, \"avg_out_Bps\": {:.0}, \"peak_out_Bps\": {:.0}, \"avg_in_Bps\": {:.0}, \"peak_in_Bps\": {:.0}, \"perf_frames\": {}, \"avg_frame_us\": {:.0}, \"worst_p99_frame_us\": {}, \"tick_stalls\": {}}}",
             p.name,
             p.bytes_out.average(),
             p.bytes_out.max_per_sec,
@@ -507,6 +530,7 @@ fn write_summary(
             pf.map_or(0, |a| a.frames),
             pf.map_or(0.0, |a| if a.frames > 0 { a.sum_avg_us / a.frames as f64 } else { 0.0 }),
             pf.map_or(0, |a| a.worst_p99_us),
+            pf.map_or(0, |a| a.stalls),
         ));
     }
     s.push_str("\n  ]\n}\n");
@@ -530,11 +554,15 @@ const RTT_PROBES: u32 = 8;
 const RTT_PROBE_EVERY: Duration = Duration::from_millis(25);
 const RTT_SETTLE_MAX: Duration = Duration::from_secs(2);
 
-/// Frames of input delay that hide a full input round trip (client -> server -> clients)
-/// at `rtt_us` (a link's fastest round trip), plus one frame for the clients' frame phases
-/// differing and one for a lost stream datagram or jitter (the next datagram, one frame
-/// later, repeats it). On localhost or a LAN that is 3 frames.
-fn auto_input_delay(rtt_us: u64) -> u16 {
-    const FRAME_US: u64 = 16_667;
-    (rtt_us.div_ceil(FRAME_US) + 2).clamp(2, 60) as u16
+/// Wait until a datagram is queued on the (non-blocking) `socket`, at most `timeout`, so the
+/// relay forwards inputs and ticks as soon as they arrive.
+fn wait_readable(socket: &std::net::UdpSocket, timeout: Duration) {
+    let mut b = [0u8; 1];
+    if socket.set_nonblocking(false).is_ok() && socket.set_read_timeout(Some(timeout)).is_ok() {
+        // Returns as soon as a datagram is queued (on Windows with WSAEMSGSIZE for larger ones).
+        let _ = socket.peek_from(&mut b);
+    } else {
+        std::thread::sleep(timeout);
+    }
+    let _ = socket.set_nonblocking(true);
 }

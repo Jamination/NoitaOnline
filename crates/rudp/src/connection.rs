@@ -233,6 +233,12 @@ impl Connection {
         if self.ack_pending {
             return now;
         }
+        self.next_deadline_deferring_acks(now)
+    }
+
+    /// [`Self::next_deadline`] for a caller that sends a packet of its own soon anyway and
+    /// lets it carry the pending acks.
+    pub fn next_deadline_deferring_acks(&self, now: u64) -> u64 {
         let resend = self.resend_interval();
         let mut at = (self.last_send + self.cfg.keepalive_us).min(self.last_recv + self.cfg.timeout_us + 1);
         for ch in &self.channels {

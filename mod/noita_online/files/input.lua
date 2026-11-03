@@ -80,17 +80,16 @@ function M.decode(s)
   }
 end
 
--- Read what Noita's own input system wrote into an *enabled* ControlsComponent (used on the
--- local input-capture proxy) during the last world update. Returns a state table. A press
--- shorter than a frame leaves mButtonDown* false but stamps mButtonFrame* with that update's
--- frame number (GameGetFrameNum() now), so it counts as held for this frame.
-function M.capture_from(controls)
+-- Read what Noita's own input system wrote into an *enabled* ControlsComponent (the local
+-- input-capture proxy). Returns a state table. `stamp` is the frame number the system
+-- stamped this input's presses with: a press shorter than a frame leaves mButtonDown* false
+-- but stamps mButtonFrame*, so it counts as held for this frame.
+function M.capture_from(controls, stamp)
   local buttons = {}
-  local now = GameGetFrameNum()
   for i = 1, NB do
     local name = M.BUTTONS[i]
     buttons[name] = ComponentGetValue2(controls, "mButtonDown" .. name)
-      or ComponentGetValue2(controls, "mButtonFrame" .. name) == now
+      or ComponentGetValue2(controls, "mButtonFrame" .. name) == stamp
   end
   local mx, my = ComponentGetValue2(controls, "mMousePosition")
   local ax, ay = ComponentGetValue2(controls, "mAimingVector")
@@ -100,6 +99,29 @@ function M.capture_from(controls)
     count_l = ComponentGetValue2(controls, "mButtonCountChangeItemL"),
     mx = mx, my = my, ax = ax, ay = ay,
   }
+end
+
+-- Two consecutive frames' inputs as one input (an input delay change left one frame fewer
+-- to send them in): a button pressed in either counts, and both frames' wheel steps and
+-- inventory edits are kept; the pointer is the later one's.
+function M.merge(a, b)
+  local buttons = {}
+  for k, v in pairs(a.buttons) do buttons[k] = v or nil end
+  for k, v in pairs(b.buttons) do buttons[k] = buttons[k] or v or nil end
+  return {
+    buttons = buttons,
+    count_r = (a.count_r or 0) + (b.count_r or 0),
+    count_l = (a.count_l or 0) + (b.count_l or 0),
+    mx = b.mx, my = b.my, ax = b.ax, ay = b.ay,
+    gamepad = b.gamepad,
+    ops = (a.ops or "") .. (b.ops or ""),
+  }
+end
+
+-- The same input for one more frame (an input delay change left one frame more): held
+-- buttons and the pointer stay, one-off events (wheel steps, inventory edits) do not repeat.
+function M.hold(s)
+  return { buttons = s.buttons, count_r = 0, count_l = 0, mx = s.mx, my = s.my, ax = s.ax, ay = s.ay, gamepad = s.gamepad, ops = "" }
 end
 
 -- The engine's systems run the world update that follows OnWorldPreUpdate(f) as frame f + 1:

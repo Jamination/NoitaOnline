@@ -112,6 +112,13 @@ function M.setup_solo(player)
   register_slots()
 end
 
+-- Diagnostics (init.lua, NOITA_ONLINE_LADDER=proxy): the solo baseline plus an inert input
+-- proxy like a session's, to measure what the proxy costs.
+function M.ladder_proxy(player)
+  local x, y = EntityGetTransform(player)
+  make_proxy_inert(EntityLoad("data/entities/player.xml", x, y))
+end
+
 function M.local_slot()
   return M.by_id[M.local_id]
 end
@@ -176,13 +183,18 @@ function M.update_reticle()
 end
 
 -- Real input of this client, as captured by the engine into the proxy's ControlsComponent.
--- `mouse` ({x, y}, optional): the pointer in world coordinates under this client's render
--- camera. The proxy's mMousePosition is converted with the shared simulation camera, which
--- is another player's view on every client but the first.
+-- The client runtime normally updates the proxy with this frame's input before
+-- OnWorldPreUpdate (earlyinput.rs: presses stamped for the coming update, the mouse mapped to
+-- the world through this client's render camera). Without that update the proxy holds the
+-- last update's input, whose mouse went through the shared simulation camera (another
+-- player's view on every client but the first); then `mouse` ({x, y}: the pointer under the
+-- render camera, taken after the last update) replaces it.
 function M.capture_local(mouse)
   if not M.proxy_controls then return Input.NEUTRAL end
-  local s = Input.capture_from(M.proxy_controls)
-  if mouse then s.mx, s.my = mouse[1], mouse[2] end
+  local now = GameGetFrameNum()
+  local fresh = NO.lib.no_input_fresh() == 1
+  local s = Input.capture_from(M.proxy_controls, fresh and Input.press_frame(now) or now)
+  if not fresh and mouse then s.mx, s.my = mouse[1], mouse[2] end
   -- With a gamepad the proxy's aim is Noita's stick aim; with the mouse the aim follows from
   -- the mouse position when the input is applied (Input.apply), as in Noita's ControlsSystem.
   s.gamepad = GameGetIsGamepadConnected()

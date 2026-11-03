@@ -5,7 +5,9 @@
 //! 512x512 entries (one per 512x512-pixel chunk); a non-null entry points at a struct whose
 //! first dword is `Cell*[512*512]`; Cell+0x14 = CellData* (material). Materials are a
 //! contiguous table of 0x290-byte CellData starting at materials_begin =
-//! *(CellFactory+0x18), CellFactory = *(GameGlobal+0x18).
+//! *(CellFactory+0x18), CellFactory = *(GameGlobal+0x18). ChunkMap+0x10..+0x1c = the
+//! bounding box of the loaded chunks (x0, y0, x1, y1 in chunks, inclusive), which vanilla's
+//! streaming (`FUN_00743990`) scans instead of the whole table.
 
 pub const GAME_GLOBAL_PTR: usize = 0x0122_374c;
 pub const CHUNKS_PER_AXIS: usize = 512;
@@ -15,6 +17,8 @@ pub const CHUNK_CELLS: usize = 512 * 512;
 pub struct WorldPtrs {
     pub chunk_table: *const usize,
     pub materials_begin: usize,
+    /// ChunkMap bounding box of the loaded chunks: x0, y0, x1, y1 (chunks, inclusive).
+    pub bbox: [i32; 4],
 }
 
 /// Locate the chunk table. Returns None while the world does not exist yet.
@@ -34,13 +38,15 @@ pub unsafe fn world_ptrs() -> Option<WorldPtrs> {
     if grid_world == 0 {
         return None;
     }
-    let chunk_table = *((grid_world + 0x500 + 0x08) as *const usize) as *const usize;
+    let chunk_map = grid_world + 0x500;
+    let chunk_table = *((chunk_map + 0x08) as *const usize) as *const usize;
     let cell_factory = *((gg + 0x18) as *const usize);
     if chunk_table.is_null() || cell_factory == 0 {
         return None;
     }
     let materials_begin = *((cell_factory + 0x18) as *const usize);
-    Some(WorldPtrs { chunk_table, materials_begin })
+    let bbox = *((chunk_map + 0x10) as *const [i32; 4]);
+    Some(WorldPtrs { chunk_table, materials_begin, bbox })
 }
 
 /// 64-bit mixing hash step (splitmix-style finalizer over an accumulator).
@@ -94,13 +100,17 @@ pub unsafe fn for_each_chunk(w: &WorldPtrs, f: impl FnMut(u32, *const usize)) {
     for_each_chunk_strided(w, 0, 1, f)
 }
 
-/// Visit the loaded chunks with table index `first`, `first + step`, ... (the staggered
-/// hash visits 1/60 of the 1 MiB table per frame instead of all of it).
+/// Visit the loaded chunks with table index `first`, `first + step`, ... in ascending index
+/// order. Only the table entries inside the ChunkMap's bounding box of loaded chunks are read
+/// (the whole 1 MiB table if the box is implausible).
 ///
 /// # Safety
 /// See [`world_ptrs`].
 pub unsafe fn for_each_chunk_strided(w: &WorldPtrs, first: usize, step: usize, mut f: impl FnMut(u32, *const usize)) {
-    for idx in (first..CHUNKS_PER_AXIS * CHUNKS_PER_AXIS).step_by(step.max(1)) {
+    let step = step.max(1);
+    let n = CHUNKS_PER_AXIS as i32;
+    let [x0, y0, x1, y1] = w.bbox;
+    let mut visit = |idx: usize| {
         let chunk = *w.chunk_table.add(idx);
         if chunk != 0 {
             let cells = *(chunk as *const usize) as *const usize;
@@ -108,6 +118,26 @@ pub unsafe fn for_each_chunk_strided(w: &WorldPtrs, first: usize, step: usize, m
                 f(idx as u32, cells);
             }
         }
+    };
+    if !(x0 <= x1 && y0 <= y1 && (x1 as i64 - x0 as i64) < n as i64 && (y1 as i64 - y0 as i64) < n as i64) {
+        for idx in (first..CHUNKS_PER_AXIS * CHUNKS_PER_AXIS).step_by(step) {
+            visit(idx);
+        }
+        return;
+    }
+    let mut idxs: Vec<usize> = Vec::with_capacity(64);
+    for y in y0..=y1 {
+        let row = ((y + 256) & (n - 1)) as usize * CHUNKS_PER_AXIS;
+        for x in x0..=x1 {
+            let idx = row + ((x + 256) & (n - 1)) as usize;
+            if idx >= first && (idx - first) % step == 0 {
+                idxs.push(idx);
+            }
+        }
+    }
+    idxs.sort_unstable();
+    for idx in idxs {
+        visit(idx);
     }
 }
 

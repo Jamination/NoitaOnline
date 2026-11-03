@@ -5,6 +5,11 @@
 //! client renders. Cells only change inside the simulation window, so the worker sees
 //! exactly the state the step left. [`join`] runs at the next window entry, before anything
 //! can modify the world again.
+//!
+//! With the buffer-swap hook installed (`cell_emitters`), the worker starts at the swap
+//! ([`release`]) rather than at the window exit: during the swap the game thread waits on
+//! the driver and the pool workers are idle, while hashing during the grid render competed
+//! with the render tiles for the core (about 0.1 ms per frame).
 
 use crate::net::Shared;
 use crate::world;
@@ -30,6 +35,8 @@ static QUEUE: Mutex<Option<Sender<Job>>> = Mutex::new(None);
 static PENDING: Mutex<u32> = Mutex::new(0);
 static SENT: Condvar = Condvar::new();
 static LAST_HASH_US: AtomicU32 = AtomicU32::new(0);
+/// The report waiting for the next buffer swap ([`release`]).
+static DEFERRED: Mutex<Option<Job>> = Mutex::new(None);
 
 /// Queue a report for the worker (started on first use; without a worker it runs here).
 /// Reports without chunks (most frames of the staggered hash) are sent here directly.
@@ -42,7 +49,28 @@ pub unsafe fn submit(job: Job) {
         join(); // reports go out in frame order
         return send(job, Vec::new());
     }
+    release(); // an earlier report not yet started goes first
     *PENDING.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+    if crate::cosmetic::swap_hooked() {
+        *DEFERRED.lock().unwrap_or_else(|p| p.into_inner()) = Some(job);
+    } else {
+        start(job);
+    }
+}
+
+/// Hand the deferred report (if any) to the worker: the buffer swap, or anything that needs
+/// it sent.
+///
+/// # Safety
+/// Game thread, between the report's window exit and the next window entry.
+pub unsafe fn release() {
+    let job = DEFERRED.lock().unwrap_or_else(|p| p.into_inner()).take();
+    if let Some(job) = job {
+        start(job);
+    }
+}
+
+unsafe fn start(job: Job) {
     let mut queue = QUEUE.lock().unwrap_or_else(|p| p.into_inner());
     if queue.is_none() {
         let (tx, rx) = channel::<Job>();
@@ -80,8 +108,10 @@ fn send(job: Job, chunks: Vec<protocol::ChunkHash>) {
     job.shared.send(CH_RELIABLE, &msg);
 }
 
-/// Wait until every submitted report has been hashed and sent.
+/// Wait until every submitted report has been hashed and sent (a deferred one starts now).
 pub fn join() {
+    // SAFETY: callers run on the game thread before the world can change again.
+    unsafe { release() };
     let mut pending = PENDING.lock().unwrap_or_else(|p| p.into_inner());
     while *pending > 0 {
         pending = SENT.wait(pending).unwrap_or_else(|p| p.into_inner());

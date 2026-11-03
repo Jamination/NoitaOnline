@@ -37,9 +37,11 @@ pub struct State {
     pub start: Option<StartInfo>,
     /// Lockstep input/tick streams (exists once the session started).
     pub stream: Option<ClientStream>,
+    /// The session's current input delay (frames; the server may change it).
+    pub input_delay: u16,
     /// Set by the game thread when it queued new input; the net thread sends promptly.
     pub input_dirty: bool,
-    /// The game thread is blocked waiting for a tick: the net thread watches the socket.
+    /// The game thread is blocked waiting for a tick.
     pub game_waiting: bool,
     /// Human-readable events for the Lua side (lobby changes, kicks, departures).
     pub events: VecDeque<String>,
@@ -235,10 +237,11 @@ pub fn spawn(shared: Arc<Shared>, p: ConnectParams) -> std::io::Result<std::thre
     std::thread::Builder::new().name("noita-online-net".into()).spawn(move || run(shared, client, p))
 }
 
-/// During the session the thread wakes once per frame, when the game queues its input: it
-/// reads what arrived (ticks, acks), then sends one packet with the input stream, the tick
-/// and packet acks and the queued messages (the last frame's state report). Datagrams wake
-/// it only while the game waits for a tick (or before the session).
+/// During the session the thread sends once per frame, when the game queues its input: one
+/// packet with the input stream, the tick and packet acks and the queued messages (the last
+/// frame's state report). Datagrams wake it at once (ticks are in the stream before the game
+/// asks for them, and the measured tick margins are true); a wake that only received sends
+/// nothing while the game runs, its acks ride on the next input.
 fn run(shared: Arc<Shared>, mut client: Client, p: ConnectParams) {
     let mut said_hello = false;
     let mut last_ping = Instant::now();
@@ -257,6 +260,21 @@ fn run(shared: Arc<Shared>, mut client: Client, p: ConnectParams) {
         // Datagrams first, so this round's packet carries their acks and the newest tick ack.
         client.poll();
         let mut wake_game = receive(&shared, &mut client);
+        let receive_only = {
+            let s = shared.state.lock().unwrap();
+            s.stream.as_ref().is_some_and(|st| {
+                let resend_due = st.has_unacked_inputs() && last_stream_send.elapsed() >= STREAM_RESEND_RUNNING;
+                let timer_due = client.next_deadline_us_deferring_acks().is_none_or(|at| at <= client.now_us());
+                !s.input_dirty && !s.game_waiting && !resend_due && !timer_due
+            })
+        };
+        if receive_only {
+            if wake_game {
+                shared.game_cond.notify_all();
+            }
+            sleep(&shared, &client, sock_event.as_ref(), said_hello, last_ping, last_stream_send);
+            continue;
+        }
         // Queue game-thread messages and, when due, the redundant input stream.
         {
             let mut s = shared.state.lock().unwrap();
@@ -311,28 +329,41 @@ fn run(shared: Arc<Shared>, mut client: Client, p: ConnectParams) {
         if wake_game {
             shared.game_cond.notify_all();
         }
-        // Sleep until the game queues its input (or, before the session, any message), a
-        // datagram arrives while the socket is watched, or timed work is due (input stream
-        // resend, ping, rudp ack/resend/keepalive).
-        let s = shared.state.lock().unwrap();
-        if !s.input_dirty && (s.stream.is_some() || s.outgoing.is_empty()) {
-            let now = Instant::now();
-            let mut until = now + MAX_SLEEP;
-            if said_hello && s.stream.is_none() {
-                // (During the session the probe goes out with the next input.)
-                until = until.min(last_ping + PING_EVERY);
-            }
-            if s.stream.as_ref().is_some_and(|st| st.has_unacked_inputs()) {
-                until = until.min(last_stream_send + if s.game_waiting { STREAM_RESEND } else { STREAM_RESEND_RUNNING });
-            }
-            until = until.min(match client.next_deadline_us() {
-                Some(at) => now + Duration::from_micros(at.saturating_sub(client.now_us())),
-                None => now + Duration::from_millis(1),
-            });
-            let watch_socket = s.stream.is_none() || s.game_waiting;
-            shared.net_wake.wait(s, sock_event.as_ref(), watch_socket, until.saturating_duration_since(now));
-        }
+        sleep(&shared, &client, sock_event.as_ref(), said_hello, last_ping, last_stream_send);
     }
+}
+
+/// Sleep until the game queues its input (or, before the session, any message), a datagram
+/// arrives, or timed work is due (input stream resend, ping, rudp resend/keepalive; pending
+/// acks only while no input packet is coming, i.e. outside the session or while the game waits).
+fn sleep(
+    shared: &Shared,
+    client: &Client,
+    sock_event: Option<&SocketEvent>,
+    said_hello: bool,
+    last_ping: Instant,
+    last_stream_send: Instant,
+) {
+    let s = shared.state.lock().unwrap();
+    if s.input_dirty || (s.stream.is_none() && !s.outgoing.is_empty()) {
+        return;
+    }
+    let now = Instant::now();
+    let mut until = now + MAX_SLEEP;
+    if said_hello && s.stream.is_none() {
+        // (During the session the probe goes out with the next input.)
+        until = until.min(last_ping + PING_EVERY);
+    }
+    if s.stream.as_ref().is_some_and(|st| st.has_unacked_inputs()) {
+        until = until.min(last_stream_send + if s.game_waiting { STREAM_RESEND } else { STREAM_RESEND_RUNNING });
+    }
+    let running = s.stream.is_some() && !s.game_waiting;
+    let deadline = if running { client.next_deadline_us_deferring_acks() } else { client.next_deadline_us() };
+    until = until.min(match deadline {
+        Some(at) => now + Duration::from_micros(at.saturating_sub(client.now_us())),
+        None => now + Duration::from_millis(1),
+    });
+    shared.net_wake.wait(s, sock_event, true, until.saturating_duration_since(now));
 }
 
 /// Handle the server messages the client has received. Returns whether the game thread
@@ -356,9 +387,14 @@ fn receive(shared: &Shared, client: &mut Client) -> bool {
                 let params = String::from_utf8_lossy(&params).into_owned();
                 s.start = Some(StartInfo { seed, player, input_delay, session_id, players: players.clone(), params });
                 s.stream = Some(ClientStream::new(input_delay as u32));
+                s.input_delay = input_delay;
                 s.status = Some(Status::Started);
                 s.events.push_back(format!("start: seed={seed} delay={input_delay} players={players:?}"));
                 wake_game = true;
+            }
+            ServerMsg::InputDelay { delay } => {
+                s.input_delay = delay;
+                s.events.push_back(format!("input delay: {delay}"));
             }
             ServerMsg::Ticks { input_ack, first, ticks } => {
                 // The tick ack goes out with the next input.

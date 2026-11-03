@@ -15,7 +15,7 @@ pub const CH_RELIABLE: u8 = 0;
 pub const CH_UNRELIABLE: u8 = 1;
 
 /// Bumped whenever the message format or lockstep rules change; server and clients must match.
-pub const GAME_PROTOCOL_VERSION: u32 = 3;
+pub const GAME_PROTOCOL_VERSION: u32 = 4;
 
 /// Budget for one unreliable lockstep datagram's payload (fits rudp's unreliable limit).
 pub const STREAM_BUDGET: usize = 1100;
@@ -57,8 +57,11 @@ pub enum ClientMsg {
     /// State at the end of simulation frame `frame`: hashes of the chunks scheduled for this
     /// frame and, on entity checkpoints, the entity digest plus tracked positions.
     StateHash { frame: u32, entities: Option<u64>, chunks: Vec<ChunkHash>, positions: Vec<EntityPos> },
-    /// Periodic client-side performance report.
-    Perf { frames: u32, avg_frame_us: u32, p99_frame_us: u32, max_frame_us: u32, wait_us: u32 },
+    /// Periodic client-side performance report. `wait_us`: time blocked waiting for ticks;
+    /// `stalls`: frames whose tick had not arrived when the game needed it (waits over 1 ms);
+    /// `margin_min_us`: over the other frames, the shortest time between a tick's arrival
+    /// and the game needing it (`u32::MAX`: no such frame).
+    Perf { frames: u32, avg_frame_us: u32, p99_frame_us: u32, max_frame_us: u32, wait_us: u32, stalls: u32, margin_min_us: u32 },
     /// Free-form log line forwarded to the server log.
     Log { text: String },
     Ping { t: u64 },
@@ -76,6 +79,9 @@ pub enum ServerMsg {
     PlayerLeft { player: u8 },
     Pong { t: u64 },
     Kick { reason: String },
+    /// New input delay: from its next frame on, each client sends its input for frame
+    /// f + `delay` while simulating f (the server adapts the delay to the measured margins).
+    InputDelay { delay: u16 },
 }
 
 impl ClientMsg {
@@ -111,13 +117,15 @@ impl ClientMsg {
                     w.varint(p.id as u64).u8(p.kind).u32(p.x_bits).u32(p.y_bits);
                 }
             }
-            ClientMsg::Perf { frames, avg_frame_us, p99_frame_us, max_frame_us, wait_us } => {
+            ClientMsg::Perf { frames, avg_frame_us, p99_frame_us, max_frame_us, wait_us, stalls, margin_min_us } => {
                 w.u8(4)
                     .varint(*frames as u64)
                     .varint(*avg_frame_us as u64)
                     .varint(*p99_frame_us as u64)
                     .varint(*max_frame_us as u64)
-                    .varint(*wait_us as u64);
+                    .varint(*wait_us as u64)
+                    .varint(*stalls as u64)
+                    .varint(*margin_min_us as u64);
             }
             ClientMsg::Log { text } => {
                 w.u8(5).str(text);
@@ -185,6 +193,8 @@ impl ClientMsg {
                 p99_frame_us: r.varint()? as u32,
                 max_frame_us: r.varint()? as u32,
                 wait_us: r.varint()? as u32,
+                stalls: r.varint()? as u32,
+                margin_min_us: r.varint()? as u32,
             },
             5 => ClientMsg::Log { text: r.str()?.to_owned() },
             6 => ClientMsg::Ping { t: r.u64()? },
@@ -304,6 +314,9 @@ impl ServerMsg {
             ServerMsg::Kick { reason } => {
                 w.u8(7).str(reason);
             }
+            ServerMsg::InputDelay { delay } => {
+                w.u8(8).u16(*delay);
+            }
         }
         w.finish()
     }
@@ -350,6 +363,7 @@ impl ServerMsg {
             5 => ServerMsg::PlayerLeft { player: r.u8()? },
             6 => ServerMsg::Pong { t: r.u64()? },
             7 => ServerMsg::Kick { reason: r.str()?.to_owned() },
+            8 => ServerMsg::InputDelay { delay: r.u16()? },
             _ => return Err(DecodeError),
         };
         if !r.is_empty() {
@@ -375,7 +389,7 @@ mod tests {
                 positions: vec![EntityPos { id: 7, kind: 1, x_bits: 1.5f32.to_bits(), y_bits: 0 }],
             },
             ClientMsg::StateHash { frame: 61, entities: None, chunks: vec![], positions: vec![] },
-            ClientMsg::Perf { frames: 60, avg_frame_us: 16666, p99_frame_us: 20000, max_frame_us: 30000, wait_us: 5 },
+            ClientMsg::Perf { frames: 60, avg_frame_us: 16666, p99_frame_us: 20000, max_frame_us: 30000, wait_us: 5, stalls: 2, margin_min_us: u32::MAX },
             ClientMsg::Log { text: "hi".into() },
             ClientMsg::Ping { t: 5 },
         ];
@@ -394,6 +408,7 @@ mod tests {
             ServerMsg::PlayerLeft { player: 2 },
             ServerMsg::Pong { t: 8 },
             ServerMsg::Kick { reason: "x".into() },
+            ServerMsg::InputDelay { delay: 2 },
         ];
         for m in msgs {
             assert_eq!(ServerMsg::decode(&m.encode()).unwrap(), m);

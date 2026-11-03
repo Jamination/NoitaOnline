@@ -28,8 +28,19 @@ sequenceDiagram
   S->>S: compare all clients' hashes for f
 ```
 
-* **Input delay** `D` frames hides the round trip (client → server → clients). The server
-  derives it from measured RTT at session start (`--input-delay auto`).
+* **Input delay** `D` frames hides the input's trip client → server → clients: the input a
+  client captures while simulating frame *f* is simulated by every client in frame *f + D*.
+  The server starts the session with the fewest frames that cover the slowest link's lobby
+  round trip plus 2 ms (1 frame on a LAN, `--input-delay auto`) and then adapts it: the
+  clients report, per ~60 frames, how many frames waited for their tick and how early the
+  other ticks arrived. When even the client that waited least (the slowest client, which
+  the others wait for in any case) waited for 3+ ticks, `D` grows by one frame; after 10
+  report rounds (doubled after every growth, up to 160) in which its ticks all arrived over
+  a frame + 2 ms early, `D` shrinks by one, never below 1. The server announces the new
+  value (`InputDelay`); a client switching to a longer delay sends its current input for
+  one more frame (held buttons only), one switching to a shorter delay merges two frames'
+  inputs into one (buttons pressed in either, both frames' wheel steps and inventory edits).
+  Switches cannot desync: every client simulates the ticks the server relays.
 * **Redundant streams**: each client datagram repeats all inputs the server has not
   acknowledged; each server datagram repeats all ticks the client has not acknowledged. A
   lost datagram costs one frame interval, not a resend round trip, and there is no
@@ -65,7 +76,11 @@ sequenceDiagram
   frame, in the same order, so all entity ids match. Slots are driven only by tick inputs
   (their `ControlsComponent` is disabled and written by the mod). The engine's own spawned
   player becomes an inert *input proxy*: Noita's input system keeps writing this client's
-  keyboard/mouse/gamepad state into it, the mod reads it and sends it to the server.
+  keyboard/mouse/gamepad state into it, the mod reads it and sends it to the server. The
+  engine writes it during the world update; the client runtime runs that write for the
+  proxy just before `OnWorldPreUpdate` instead (`early_input`), so the capture in
+  `OnWorldPreUpdate` gets the input the engine polled for this frame, as vanilla's player
+  uses it in this frame's update, with the mouse mapped through this client's render camera.
 * **Simulation window**: between `OnWorldPreUpdate` and `OnWorldPostUpdate` the engine
   RNGs run on a shared "simulation" stream and the camera is set to an identical
   simulation position; outside the window (rendering, GUI) each client uses its own RNG
@@ -74,22 +89,45 @@ sequenceDiagram
   client) instead of around each client's own camera; a deterministic eviction replaces
   the engine's wall-clock one (vanilla's rule, applied per player).
 * Deaths do not end the run: a player at 0 HP becomes an invulnerable spectator.
-* **Off the game thread**: during the session the network thread wakes once per frame,
-  when the game queues its input: it reads the datagrams that arrived (ticks, acks) and
-  sends one packet with the input stream, the acks and the queued messages (state report,
-  logs). Datagrams wake it only while the game waits for a tick (before the session:
-  always, on Windows); transport timers too. State-report chunk hashes are computed on a
-  worker thread while the client renders; cells only change inside the window, and the
-  next window entry waits for the worker.
+* **Off the game thread**: during the session the network thread sends once per frame,
+  when the game queues its input: one packet with the input stream, the acks and the
+  queued messages (state report, logs). Datagrams wake it at once (ticks are in the
+  stream before the game asks for them); while the game runs, such a wake only receives,
+  its acks go out with the next input. Transport timers wake it too. State-report chunk
+  hashes are computed on a worker thread started at the client's buffer swap (the game
+  thread waits on the driver there and the pool workers are idle); cells only change inside
+  the window, and the next window entry waits for the worker.
 
 ## Server
 
 * Lobby until `--players` clients said hello (same protocol version, game build and mod
   list), then `Start{seed, players, input_delay, params}`.
 * Lockstep relay: per frame, one tick containing every active player's input, emitted in
-  order once complete; departed players are dropped from subsequent ticks.
+  order once complete; departed players are dropped from subsequent ticks. The server waits
+  on its socket (at most 1 ms, for timers), so a datagram is relayed as soon as it arrives.
+* Input delay: start value from the lobby round trips, then adapted to the clients' tick
+  reports (`delay.rs`, see above).
 * Verification: per checkpoint frame, every chunk loaded on ≥ 2 clients and every tracked
   entity position (players, enemies) is compared exactly; results go to `hashes.jsonl`
   and `summary.json`.
 * Metrics: per-client bandwidth (1 s windows), process CPU time, client frame-time
   reports.
+
+## Input latency
+
+From the frame whose input poll first sees a key press (vanilla's player reacts in that
+frame's world update) to the update in which every client's copy of the player reacts:
+
+| Stage | Frames |
+|---|---|
+| Noita polls input, then runs DeathMatch::Update; the ControlsSystem update of the input proxy runs before the `OnWorldPreUpdate` dispatch (`early_input`) | 0 |
+| `OnWorldPreUpdate(f)`: the mod captures the proxy and queues the input for frame f + D; the network thread sends it at once | 0 |
+| Server: tick f + D is complete when the last player's input for it arrived; sent at once | — |
+| Clients: the tick arrives (network thread, at once); `OnWorldPreUpdate(f + D)` applies it to the player slots' ControlsComponents | D |
+| The world update of frame f + D: the character walks, fires, ... | D |
+
+So an input takes effect D frames after vanilla would apply it: 1 frame (17 ms at 60 fps) on
+a LAN. Only Noita's inventory GUI (number keys, the inventory screen) takes one frame more:
+it has to run after the world update (it draws the updated HUD), so its edits go out with
+the next frame's input. `harness/latency.py` measures every stage from the
+`NOITA_ONLINE_LATPROBE=1` probe log (vanilla: the same probe without a session).

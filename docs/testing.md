@@ -98,7 +98,30 @@ Use at least 3 pairs; more pairs narrow the solo median.
 * `NOITA_ONLINE_PROF=1`: `prof_<id>.txt` (time of every job-pool submit call site, i.e. of the
   jobs that run inline) and `sections_<id>.txt` (main-thread time per frame of
   DeathMatch::Update and its children, the Lua dispatches, the world draw and the buffer
-  swap; also in `--solo` runs). `harness/prof_sections.py DIR...` compares runs side by side.
+  swap; also in `--solo` runs), one block per `NOITA_ONLINE_PROF_WINDOW` frames (default 600).
+  `harness/prof_sections.py [-r FROM:TO] DIR...` compares runs side by side (windows 2.. by
+  default; with `-r` the windows inside that frame range).
 * `NOITA_ONLINE_SAMPLE=1` (with `PROF`): samples the game thread's EIP and EBP chain every
   ~1 ms into `samples_<id>.txt` (with a module map for non-game addresses);
   `harness/prof_samples.py DIR` aggregates them per function through the Ghidra query server.
+  The sampler itself costs about 2 ms per frame: compare sampled runs only with sampled runs.
+
+### Cost ladder (diagnostics)
+
+What a 1-player session costs over the solo baseline is measured piece by piece, in a
+window of frames where both runs follow the same trajectory (seed 98765432: frames 300 to
+about 750; up to 1500 when only session runs are compared, which replay one trajectory), with
+`PROF` sections and repeated, alternating runs. These switches are diagnostics only and never
+set in normal play:
+
+* `NOITA_ONLINE_LADDER=flag,...` (`init.lua`):
+  * session runs: `noreport` (no state reports: no entity digest, no chunk hashes),
+    `nolocal` (no presentation input for the own player: raw mouse for the camera, reticle,
+    render-camera mouse), `norendercam` (the view stays at the simulation camera);
+    `nudge<N>` (one extra frame of "Right" for the bot at frame N: a different, still
+    deterministic trajectory, to sample session runs over several trajectories the way solo
+    runs spread on their own);
+  * `--solo` runs: `proxy` (an inert input proxy entity as in a session), `freecam` (the
+    session's free camera, set every frame to the player's camera target).
+* `NOITA_ONLINE_PATCH_OFF=name,...` removes engine patches (a 1-player session cannot
+  desync; the trajectory may change).

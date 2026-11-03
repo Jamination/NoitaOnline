@@ -75,6 +75,8 @@ else
   SRV_ARGS=(--bind "127.0.0.1:$PORT" --players "$PLAYERS" --log-dir "$OUT" --exit-when-empty --scenario "$SCENARIO"
             --game-build "noita-2025-01-25-6794ee3c")
   [[ -n "$NETSIM" ]] && SRV_ARGS+=(--netsim "$NETSIM")
+  # INPUT_DELAY=N: fixed lockstep input delay (default: auto, adapted during the session).
+  [[ -n "${INPUT_DELAY:-}" ]] && SRV_ARGS+=(--input-delay "$INPUT_DELAY")
   [[ -n "$SEED" ]] && SRV_ARGS+=(--seed "$SEED")
   "$ROOT/target/release/noita-online-server" "${SRV_ARGS[@]}" >"$OUT/server.out" 2>&1 &
   SRV=$!

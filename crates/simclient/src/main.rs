@@ -104,6 +104,9 @@ fn main() {
                             s.on_ticks(input_ack, first, ticks);
                         }
                     }
+                    // A shorter delay pauses submitting until the simulation catches up; a
+                    // longer one submits further ahead (the inputs stay contiguous).
+                    Ok(ServerMsg::InputDelay { delay }) => b.delay = delay as u32,
                     Ok(ServerMsg::Kick { reason }) => {
                         eprintln!("bot{i} kicked: {reason}");
                         std::process::exit(1);

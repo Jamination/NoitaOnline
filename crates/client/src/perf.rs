@@ -4,7 +4,6 @@
 
 use std::time::{Duration, Instant};
 
-#[derive(Default)]
 pub struct FrameTimer {
     last: Option<Instant>,
     /// Every recorded frame interval (µs) since the timer started.
@@ -12,9 +11,31 @@ pub struct FrameTimer {
     window: Vec<u32>,
     /// Time spent blocked waiting for lockstep ticks during the current window (µs).
     pub window_wait_us: u64,
+    /// Frames of the current window whose tick had not arrived when the game needed it.
+    window_stalls: u32,
+    /// Shortest time between a tick's arrival and the game needing it, over the window's
+    /// other frames (µs; `u32::MAX`: none).
+    window_margin_min_us: u32,
     /// Minimum frame interval (frame-rate cap); None = uncapped.
     pub min_interval: Option<Duration>,
 }
+
+impl Default for FrameTimer {
+    fn default() -> Self {
+        Self {
+            last: None,
+            all: Vec::new(),
+            window: Vec::new(),
+            window_wait_us: 0,
+            window_stalls: 0,
+            window_margin_min_us: u32::MAX,
+            min_interval: None,
+        }
+    }
+}
+
+/// A wait for a tick longer than this is a stall (shorter ones are thread hand-offs).
+const STALL_US: u64 = 1000;
 
 pub struct WindowStats {
     pub frames: u32,
@@ -22,9 +43,23 @@ pub struct WindowStats {
     pub p99_us: u32,
     pub max_us: u32,
     pub wait_us: u32,
+    pub stalls: u32,
+    pub margin_min_us: u32,
 }
 
 impl FrameTimer {
+    /// Record the game getting its frame's tick after waiting `waited_us`; `margin`: the tick
+    /// was already there, it had arrived that long before.
+    pub fn tick_taken(&mut self, waited_us: u64, margin: Option<Duration>) {
+        self.window_wait_us += waited_us;
+        if waited_us > STALL_US {
+            self.window_stalls += 1;
+        }
+        if let Some(m) = margin {
+            self.window_margin_min_us = self.window_margin_min_us.min(m.as_micros().min(u32::MAX as u128 - 1) as u32);
+        }
+    }
+
     /// Mark the start of a frame: first hold the frame until the cap's interval since the
     /// previous frame start has elapsed, then record the interval.
     pub fn mark(&mut self) -> Option<u32> {
@@ -73,6 +108,8 @@ impl FrameTimer {
             p99_us: p99,
             max_us: *w.last().unwrap(),
             wait_us: wait.min(u32::MAX as u64) as u32,
+            stalls: std::mem::take(&mut self.window_stalls),
+            margin_min_us: std::mem::replace(&mut self.window_margin_min_us, u32::MAX),
         })
     }
 }

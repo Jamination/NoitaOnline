@@ -21,6 +21,8 @@ int32_t no_wait_started(uint32_t timeout_ms);
 int32_t no_start_info(no_start_info_t* out);
 int32_t no_send_input(uint32_t frame, const uint8_t* data, uint32_t len);
 int32_t no_wait_tick(uint32_t frame, uint32_t timeout_ms, uint8_t* out, uint32_t cap);
+int32_t no_input_delay(void);
+int32_t no_input_fresh(void);
 int32_t no_report_state(uint32_t frame, uint32_t chunk_period, uint32_t has_entities, uint64_t entity_hash, const no_entity_pos_t* positions, uint32_t n);
 uint32_t no_frame_mark(void);
 void no_set_frame_cap(uint32_t fps);

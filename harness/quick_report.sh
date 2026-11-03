@@ -26,5 +26,26 @@ for f in sorted(glob.glob(os.path.join(d, "frames_*.txt"))):
         continue
     s2 = sorted(v)
     print(os.path.basename(f), "avg_fps=%.1f low1=%.1f max_ms=%.0f frames=%d" % (1e6 * len(v) / sum(v), 1e6 / s2[int(len(s2) * .99)], s2[-1] / 1000, len(v)))
+# Lockstep tick waits per client (perf.jsonl windows after the first 5, i.e. after loading):
+# time blocked per frame, frames that waited over 1 ms, and the shortest arrival-to-use
+# margin of the others.
+p = os.path.join(d, "perf.jsonl")
+per = {}
+for l in open(p) if os.path.exists(p) else []:
+    j = json.loads(l)
+    if "stalls" in j:
+        per.setdefault(j["player"], []).append(j)
+for pl, w in sorted(per.items()):
+    w = w[5:]
+    fr = sum(x["frames"] for x in w)
+    if not fr:
+        continue
+    m = [x["margin_min_us"] for x in w if x["margin_min_us"] >= 0]
+    print("ticks player %d: wait %.0f us/frame, stalls %d/%d frames, min margin %s ms" % (
+        pl, sum(x["wait_us"] for x in w) / fr, sum(x["stalls"] for x in w), fr, "%.1f" % (min(m) / 1000) if m else "n/a"))
+ev = os.path.join(d, "events.log")
+for l in open(ev) if os.path.exists(ev) else []:
+    if "input delay" in l or "started:" in l:
+        print(l.strip()[:160])
 EOF
 grep -h -E 'chunk-hash|chunk generation wait|stopped|FATAL' "$D"/client_*.log 2>/dev/null | tail -6

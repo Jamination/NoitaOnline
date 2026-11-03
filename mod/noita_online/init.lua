@@ -20,7 +20,25 @@ local function log(msg)
   if logf then logf:write(line, "\n") logf:flush() end
 end
 
+local LatProbe = dofile_once(ROOT .. "latprobe.lua")
+if LatProbe.on then LatProbe.open(cfg.lat_path) end
+
 if not cfg.enabled then
+  if LatProbe.on then
+    -- Vanilla latency reference (no session, no patches): the probe watches the engine's own
+    -- player, at the same frame cap as the test sessions.
+    log("latency probe on vanilla play")
+    local NO = dofile_once(ROOT .. "native.lua")
+    if cfg.fps_cap then NO.lib.no_set_frame_cap(cfg.fps_cap) end
+    function OnWorldPreUpdate()
+      NO.lib.no_frame_mark()
+      LatProbe.pre(GameGetFrameNum())
+    end
+    function OnWorldPostUpdate()
+      LatProbe.post((EntityGetWithTag("player_unit") or {})[1])
+    end
+    return
+  end
   log("disabled (no server configured)")
   return
 end
@@ -37,6 +55,15 @@ Bot.log = log
 local session = nil   -- { seed, input_delay, player, players, scenario }
 local solo = cfg.solo
 local finished = false
+
+-- Diagnostics only (docs/testing.md, "Cost ladder"): NOITA_ONLINE_LADDER=flag,... removes a
+-- piece of the session from a 1-player run, or adds one to the solo baseline, to measure its
+-- frame cost. Never set in normal play.
+local LADDER = {}
+for w in (os.getenv("NOITA_ONLINE_LADDER") or ""):gmatch("[%w_]+") do
+  LADDER[w] = true
+  if w:match("^nudge%d+$") then LADDER.nudge = tonumber(w:sub(6)) end
+end
 
 -- In a session the vanilla scripts' "near the camera" tests answer for every player's view
 -- (camera_bounds.lua, answered by the `lua_camera_bounds` patch); the radar perk marks
@@ -152,6 +179,8 @@ function OnPlayerSpawned(player)
   if ready then return end
   if solo then
     Players.setup_solo(player)
+    if LADDER.proxy then Players.ladder_proxy(player) end
+    if LADDER.freecam then GameSetCameraFree(true) end
   else
     Players.setup(player, session.players, session.player)
     -- The camera is driven by us from now on (sim camera inside the window, own outside).
@@ -161,8 +190,9 @@ function OnPlayerSpawned(player)
   log("players ready at frame " .. GameGetFrameNum())
 end
 
--- The mouse in world coordinates as this client sees it: the engine maps the mouse to the
--- world inside the simulation window, i.e. through the simulation camera (first player),
+-- The mouse in world coordinates as this client sees it, for a frame without the client
+-- runtime's early input update (Players.capture_local): the engine then mapped the mouse to
+-- the world inside the simulation window, i.e. through the simulation camera (first player),
 -- so it is mapped again through the render camera (OnWorldPostUpdate).
 local render_mouse = nil
 
@@ -172,12 +202,51 @@ local function local_input(f)
     local slot = Players.local_slot()
     local px, py = 0, 0
     if slot and EntityGetIsAlive(slot.entity) then px, py = EntityGetTransform(slot.entity) end
-    return Players.bot_ops(Bot.input(session.player, f, px, py))
+    local s = Players.bot_ops(Bot.input(session.player, f, px, py))
+    -- Diagnostics (LADDER nudge<N>): one extra frame of "Right" at frame N sends the bot down
+    -- another trajectory (deterministic per N), to sample session trajectories like the solo
+    -- baseline's run-to-run ones.
+    if f == LADDER.nudge then s.buttons.Right = true end
+    return s
   end
   return Players.capture_local(render_mouse)
 end
 
 local lockstep_alive = true
+
+-- The input captured while simulating frame f goes out for frame f + delay. The server may
+-- change the delay during the session (it follows the measured network margins): a longer
+-- delay leaves one frame without an input, which gets the current input held one more frame;
+-- a shorter one finds this frame's slot already sent, so the input waits and is merged into
+-- the next frame's. Either way every frame gets exactly one input and nothing pressed is lost.
+local last_sent = nil -- last frame an input was sent for
+local carry = nil     -- input held back by a shorter delay
+local delay_now = nil
+
+-- Returns the input and the frame it was sent for (nil: held back).
+local function send_local_input(f)
+  local s = local_input(f)
+  if carry then s, carry = Input.merge(carry, s), nil end
+  local d = NO.lib.no_input_delay()
+  if d < 0 then d = session.input_delay end
+  if d ~= delay_now then
+    if delay_now then log(string.format("input delay %d -> %d at frame %d", delay_now, d, f)) end
+    delay_now = d
+  end
+  local target = f + d
+  last_sent = last_sent or (session.input_delay - 1)
+  if target <= last_sent then
+    carry = s
+    return s, nil
+  end
+  for g = last_sent + 1, target - 1 do
+    NO.send_input(g, Input.encode(s))
+    s = Input.hold(s)
+  end
+  NO.send_input(target, Input.encode(s))
+  last_sent = target
+  return s, target
+end
 
 -- Focus rectangles (one per player slot, slot order): chunks there stay loaded and simulated;
 -- chunks far from every player are unloaded as vanilla's streaming does (no_evict_chunks).
@@ -256,7 +325,9 @@ function OnWorldPreUpdate()
     return
   end
   if not lockstep_alive then return end
-  NO.send_input(f + session.input_delay, Input.encode(local_input(f)))
+  LatProbe.pre(f)
+  local s, target = send_local_input(f)
+  if target then LatProbe.sent(target, s, render_mouse) end
   local tick, err
   repeat
     tick, err = NO.wait_tick(f, 1000)
@@ -281,7 +352,7 @@ function OnWorldPreUpdate()
       log(string.format("prelog f=%d p0=%.6f,%.6f cam=%.4f,%.4f", f, x, y, cx, cy))
     end
     Players.apply_tick(f, tick)
-    Players.feed_local_camera()
+    if not LADDER.nolocal then Players.feed_local_camera() end
     for i, r in ipairs(foci) do
       NO.lib.no_stream_focus(r[1], r[2], r[3], r[4])
       for k = 1, 4 do foci_buf[(i - 1) * 4 + k - 1] = r[k] end
@@ -305,6 +376,10 @@ function OnWorldPostUpdate()
   local f = GameGetFrameNum()
   if in_sim_window then
     if ready then douse_free_camera_light() end
+    if LatProbe.on then
+      local slot = Players.local_slot()
+      LatProbe.post(slot and slot.entity)
+    end
     if ready and PCLOG then
       -- Diagnostics: every slot's PlayerCollision and CharacterData state, every frame.
       for i, slot in ipairs(Players.slots) do
@@ -328,7 +403,7 @@ function OnWorldPostUpdate()
     -- spike) or, in "full" mode, every loaded chunk at once on the 60-frame checkpoint.
     local dense = cfg.dense_from and f >= cfg.dense_from and f <= cfg.dense_to
     local checkpoint = f % 60 == 0
-    if ready and (checkpoint or dense or not cfg.full_hash) then
+    if ready and not LADDER.noreport and (checkpoint or dense or not cfg.full_hash) then
       local h, positions = 0, {}
       if checkpoint or dense then h, positions = State.collect(Players.proxy, dense) end
       local period = (cfg.full_hash or dense) and 0 or 60
@@ -373,11 +448,17 @@ function OnWorldPostUpdate()
     NO.lib.no_sim_leave()
     in_sim_window = false
     if ready then
-      set_render_camera()
-      Players.update_reticle()
-      render_mouse = { DEBUG_GetMouseWorld() }
+      if not LADDER.norendercam then set_render_camera() end
+      if not LADDER.nolocal then
+        Players.update_reticle()
+        render_mouse = { DEBUG_GetMouseWorld() }
+      end
       Players.gui_update()
     end
+  end
+  if solo and ready and LADDER.freecam then
+    douse_free_camera_light()
+    set_render_camera()
   end
   if f % 600 == 0 then drain_events() end
   if cfg.debug and ready and f % 60 == 0 then

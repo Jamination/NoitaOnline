@@ -208,7 +208,7 @@ extern "C" fn exit(i: u32) {
         return;
     }
     s.frames += 1;
-    if s.frames < 600 {
+    if s.frames < *PROF_WINDOW {
         return;
     }
     let wall = s.window_start.map_or(Duration::ZERO, |t| now.duration_since(t));
@@ -262,6 +262,9 @@ extern "C" fn exit(i: u32) {
 }
 
 static PROF_ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("NOITA_ONLINE_PROF").is_some());
+/// `NOITA_ONLINE_PROF_WINDOW=n`: frames per `sections_<id>.txt` window (default 600).
+static PROF_WINDOW: LazyLock<u32> =
+    LazyLock::new(|| std::env::var("NOITA_ONLINE_PROF_WINDOW").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(600));
 
 /// `NOITA_ONLINE_STEPLOG=from-to`: (from, to, `step_<instance>.txt`).
 #[allow(clippy::type_complexity)]
