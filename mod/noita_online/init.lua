@@ -248,8 +248,9 @@ local function send_local_input(f)
   return s, target
 end
 
--- Focus rectangles (one per player slot, slot order): chunks there stay loaded and simulated;
--- chunks far from every player are unloaded as vanilla's streaming does (no_evict_chunks).
+-- Focus rectangles (one per player slot, slot order): chunks there are never unloaded; chunks
+-- far from every player are unloaded as vanilla's streaming does (no_evict_chunks). Chunks
+-- load as vanilla's camera loads them, around every player's view (no_stream_views).
 local FOCUS_HW, FOCUS_HH = 400, 300
 local ffi = require("ffi")
 local foci_buf = ffi.new("int32_t[128]")
@@ -353,21 +354,23 @@ function OnWorldPreUpdate()
     end
     Players.apply_tick(f, tick)
     if not LADDER.nolocal then Players.feed_local_camera() end
-    for i, r in ipairs(foci) do
-      NO.lib.no_stream_focus(r[1], r[2], r[3], r[4])
-      for k = 1, 4 do foci_buf[(i - 1) * 4 + k - 1] = r[k] end
-    end
-    NO.lib.no_evict_chunks(foci_buf, #foci, f)
     local own = -1
     for i, r in ipairs(foci) do
+      for k = 1, 4 do foci_buf[(i - 1) * 4 + k - 1] = r[k] end
       centre_buf[2 * (i - 1)] = r.x
       centre_buf[2 * (i - 1) + 1] = r.y
       if r.own then own = i - 1 end
     end
     NO.lib.no_focus_freeze(centre_buf, #foci)
+    -- Chunks load as vanilla's camera loads them, for every player's view; far ones unload.
+    NO.lib.no_stream_views()
+    NO.lib.no_evict_chunks(foci_buf, #foci, f)
     NO.lib.no_local_view(own)
     if session.scenario == "bot" then Bot.world_events(f, Players.slots)
     elseif session.scenario == "items" then Bot.items_events(f, Players.slots) end
+  else
+    -- Before the players exist: the camera's loads (world creation's start camera).
+    NO.lib.no_stream_views()
   end
 end
 

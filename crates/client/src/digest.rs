@@ -126,3 +126,35 @@ pub unsafe fn snapshot(proxy: u32, out: &mut [EntityRec]) -> usize {
     }
     count
 }
+
+/// Diagnostics (`NOITA_ONLINE_PROF` counters): live entities, those tagged `enemy`,
+/// `projectile`, `item_pickup`, and the position of the first `player_unit` (0, 0 if none).
+///
+/// # Safety
+/// Game thread, world initialised.
+pub unsafe fn census() -> ([u64; 4], (f32, f32)) {
+    let mgr = rd(ENTITY_MANAGER);
+    if mgr == 0 {
+        return ([0; 4], (0.0, 0.0));
+    }
+    let tags = [tag_bits(b"enemy\0"), tag_bits(b"projectile\0"), tag_bits(b"item_pickup\0")];
+    let player = tag_bits(b"player_unit\0");
+    let (begin, end) = (rd(mgr + 0x14), rd(mgr + 0x18));
+    let n = if begin > end { 0 } else { (end - begin + 3) >> 2 };
+    let mut counts = [0u64; 4];
+    let mut pos = None;
+    for i in 0..n {
+        let e = rd(begin + 4 * i);
+        if e == 0 || (rd(e + ENTITY_DEAD) as i32) > 0 {
+            continue;
+        }
+        counts[0] += 1;
+        for (c, t) in counts[1..].iter_mut().zip(&tags) {
+            *c += has_tag(e, t) as u64;
+        }
+        if pos.is_none() && has_tag(e, &player) {
+            pos = Some((*((e + ENTITY_X) as *const f32), *((e + ENTITY_X + 4) as *const f32)));
+        }
+    }
+    (counts, pos.unwrap_or((0.0, 0.0)))
+}

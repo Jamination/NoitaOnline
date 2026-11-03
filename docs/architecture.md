@@ -21,7 +21,7 @@ sequenceDiagram
   S->>S: tick f complete when every active player's input for f arrived
   S->>C: Ticks{f.., input_ack} (unreliable, repeated until acked)
   S->>O: Ticks{...}
-  C->>C: OnWorldPreUpdate(f): wait for tick f, enter simulation window,<br/>apply all players' inputs, stream foci
+  C->>C: OnWorldPreUpdate(f): wait for tick f, enter simulation window,<br/>apply all players' inputs, load chunks around every view
   C->>C: engine simulates frame f
   C->>C: OnWorldPostUpdate(f): every 60 frames hash world + entities
   C->>S: StateHash{f} (reliable)
@@ -85,9 +85,10 @@ sequenceDiagram
   RNGs run on a shared "simulation" stream and the camera is set to an identical
   simulation position; outside the window (rendering, GUI) each client uses its own RNG
   stream and its own camera following its own player.
-* **Foci**: chunks are loaded and simulated around every player (identically on every
-  client) instead of around each client's own camera; a deterministic eviction replaces
-  the engine's wall-clock one (vanilla's rule, applied per player).
+* **Foci**: chunks are loaded around every player's view (vanilla's camera loads, per
+  player) and simulated around every player (identically on every client) instead of around
+  each client's own camera; a deterministic eviction replaces the engine's wall-clock one
+  (vanilla's rule, applied per player).
 * Deaths do not end the run: a player at 0 HP becomes an invulnerable spectator.
 * **Off the game thread**: during the session the network thread sends once per frame,
   when the game queues its input: one packet with the input stream, the acks and the

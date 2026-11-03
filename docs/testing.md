@@ -99,6 +99,12 @@ Use at least 3 pairs; more pairs narrow the solo median.
   jobs that run inline) and `sections_<id>.txt` (main-thread time per frame of
   DeathMatch::Update and its children, the Lua dispatches, the world draw and the buffer
   swap; also in `--solo` runs), one block per `NOITA_ONLINE_PROF_WINDOW` frames (default 600).
+  Each block has a `counters:` line (window means, sampled every 10th frame, every frame for
+  windows under 10 frames): DrawGrid rects, camera size and centre, particle list lengths,
+  active/deferred grid tiles, Box2D bodies, loaded chunks, live entities and those tagged
+  `enemy` / `projectile` / `item_pickup`, the first `player_unit`'s position; and a
+  `chunkset:` line (the loaded chunks at the window's end), to compare the workload of a
+  session and the baseline, not just their time.
   `harness/prof_sections.py [-r FROM:TO] DIR...` compares runs side by side (windows 2.. by
   default; with `-r` the windows inside that frame range).
 * `NOITA_ONLINE_SAMPLE=1` (with `PROF`): samples the game thread's EIP and EBP chain every

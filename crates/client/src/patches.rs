@@ -1263,7 +1263,7 @@ const PATCHES: &[(&str, PatchFn)] = &[
     ("inline_group", |_| unsafe { patch_inline_group() }),
     ("inline_async", |_| unsafe { patch_inline_async() }),
     ("particle_init", |_| unsafe { patch_particle_init() }),
-    ("camera_loads", |_| unsafe { patch_camera_loads() }),
+    ("camera_loads", |ex| unsafe { patch_camera_loads(ex) }),
     ("fixed_dt", patch_fixed_dt),
     ("focus_freeze", patch_focus_freeze),
     ("particle_views", |ex| unsafe { crate::cosmetic::patch_particle_views(ex) }),
@@ -1378,11 +1378,20 @@ const PARTICLE_RNG: u32 = 0x0122_2388;
 /// uninitialised heap bits (they pick the collision world); clear them fully instead.
 const PARTICLE_CTOR_AND_6A: u32 = 0x0071_213e;
 const PARTICLE_CTOR_AND_6C: u32 = 0x0071_2144;
-/// Camera-driven GridWorld::RequestLoad calls (camera rect + look-ahead).
+/// The camera's chunk loads: FUN_00720130 (GridWorld, the camera's int rect {x, y, w, h}),
+/// called by the camera's SetRect (FUN_006f2d20) whenever its int rect changes and once at
+/// world creation (FUN_007184d0 @0x00718712). Unless GridWorld+0x5cc is set, it snaps the
+/// rect toward zero to 64 px, grows it by 64 px on every side and, if that differs from the
+/// last one (GridWorld+0x4a8..+0x4b4), requests it and a look-ahead copy moved by 4 × the
+/// snapped motion (clamped to ±512 px per axis), then stores it. These are its two
+/// RequestLoad calls.
 const CAMERA_LOAD_CALLS: [u32; 2] = [0x0072_0210, 0x0072_0290];
-/// GridWorld::RequestLoad (thiscall ECX = GridWorld, ChunkMap*, int rect[4] {x, y, w, h}):
-/// the load the vanilla camera requests every frame (`CAMERA_LOAD_CALLS`).
+/// GridWorld::RequestLoad (thiscall ECX = GridWorld, ChunkMap*, int rect[4] {x, y, w, h};
+/// `ret 8`): queues every unloaded chunk the rect touches (edges inclusive).
 const REQUEST_LOAD_FN: u32 = 0x0073_dab0;
+/// GridWorld: the last camera load rect ({x, y, w, h}) and the camera loads' off switch.
+const GW_CAMERA_LOAD_RECT: u32 = 0x4a8;
+const GW_CAMERA_LOADS_OFF: u32 = 0x5cc;
 /// The streaming keep-alive list (std::vector of 0x18-byte entries: +0 expiry frame, +0x10 /
 /// +0x14 pointers to the chunk's x / y; written by `FUN_0073aa70`, e.g. for the player's
 /// StreamingKeepAliveComponent), which vanilla's eviction leaves alone.
@@ -1423,18 +1432,35 @@ unsafe fn patch_analog_fly_rng() -> Result<(), PatchError> {
     write_code(ANALOG_FLY_LCG_WRITE + 1, &own)
 }
 
-/// Chunks are loaded around every player (identically on all clients) instead of around
-/// each client's own camera.
-unsafe fn patch_camera_loads() -> Result<(), PatchError> {
+/// Flag byte of the camera-load stub (1: the vanilla loads go through), 0 without the patch.
+static CAMERA_LOADS_FLAG: AtomicU32 = AtomicU32::new(0);
+
+/// The camera loads follow the camera, and outside the simulation window that is each
+/// client's own render camera. Before the first window (world creation: the start camera's
+/// loads, identical everywhere) they stay vanilla; from the first window entry the vanilla
+/// calls are skipped and [`stream_views`] makes the same loads for every player's view,
+/// inside the window.
+unsafe fn patch_camera_loads(ex: &mut Exec) -> Result<(), PatchError> {
     for site in CAMERA_LOAD_CALLS {
-        if *(site as *const u8) != 0xE8 {
-            return Err(PatchError(format!("camera load call at {site:08x} not found")));
-        }
+        expect(site, &[0xE8])?;
+        expect(site + 1, &rel32(site + 5, REQUEST_LOAD_FN))?;
     }
+    let flag = ex.alloc_data(4);
+    *(flag as *mut u8) = 1;
+    // cmp byte [flag],0; je skip; jmp RequestLoad; skip: ret 8
+    let at = ex.base + ex.used;
+    let f = flag.to_le_bytes();
+    let mut stub = vec![0x80, 0x3D, f[0], f[1], f[2], f[3], 0x00, 0x74, 0x05, 0xE9];
+    stub.extend_from_slice(&rel32(at + stub.len() as u32 + 4, REQUEST_LOAD_FN));
+    stub.extend_from_slice(&[0xC2, 0x08, 0x00]);
+    let stub_at = ex.put(&stub);
+    debug_assert_eq!(stub_at, at);
     for site in CAMERA_LOAD_CALLS {
-        // call RequestLoad (cdecl, 2 args) -> add esp,8; nop; nop
-        write_code(site, &[0x83, 0xC4, 0x08, 0x90, 0x90])?;
+        let mut call = vec![0xE8];
+        call.extend_from_slice(&rel32(site + 5, stub_at));
+        write_code(site, &call)?;
     }
+    CAMERA_LOADS_FLAG.store(flag, Ordering::Relaxed);
     Ok(())
 }
 
@@ -1451,20 +1477,75 @@ unsafe fn patch_fixed_dt(ex: &mut Exec) -> Result<(), PatchError> {
     write_code(DEATHMATCH_UPDATE, &jmp)
 }
 
-/// Request loading of the chunks of a focus rectangle this frame, as vanilla's camera does.
-///
-/// # Safety
-/// Game thread, inside the simulation window, world initialised.
-pub unsafe fn stream_focus(x0: i32, y0: i32, x1: i32, y1: i32) {
+/// Per view (slot order): the last camera load rect, as GridWorld+0x4a8 holds the camera's.
+/// `start` is the rect world creation left there, read at the first window entry, which
+/// every view starts from (each player's own vanilla game starts with that camera).
+struct ViewLoads {
+    start: Option<[i32; 4]>,
+    last: Vec<[i32; 4]>,
+}
+static VIEW_LOADS: std::sync::Mutex<ViewLoads> = std::sync::Mutex::new(ViewLoads { start: None, last: Vec::new() });
+
+/// First window entry (`camera_loads`): the vanilla camera loads stop, the views start from
+/// the camera load rect world creation left.
+unsafe fn camera_loads_window_entry() {
+    let flag = CAMERA_LOADS_FLAG.load(Ordering::Relaxed);
+    if flag == 0 || *(flag as *const u8) == 0 {
+        return;
+    }
+    *(flag as *mut u8) = 0;
     let gg = rd(GAME_GLOBAL_PTR);
     let world_data = if gg != 0 { rd(gg + 0x0c) } else { 0 };
     let grid_world = if world_data != 0 { rd(world_data + 0x44) } else { 0 };
-    if grid_world == 0 {
+    if grid_world != 0 {
+        let r = |i: u32| rd(grid_world + GW_CAMERA_LOAD_RECT + 4 * i) as i32;
+        VIEW_LOADS.lock().unwrap_or_else(|p| p.into_inner()).start = Some([r(0), r(1), r(2), r(3)]);
+    }
+}
+
+/// The vanilla camera's chunk loads (FUN_00720130, see [`CAMERA_LOAD_CALLS`]) for every
+/// player's view, in slot order: view 0 is the simulation camera itself, view k the camera's
+/// rect moved by its centre's offset from view 0's (as `rain_views`); without views (before
+/// the players are set up) the camera alone. Each view keeps its own last rect, so the
+/// look-ahead follows that player's motion. Call once per window, after the simulation
+/// camera and the views are set.
+///
+/// # Safety
+/// Game thread, inside the simulation window, world initialised.
+pub unsafe fn stream_views() {
+    let gg = rd(GAME_GLOBAL_PTR);
+    let world_data = if gg != 0 { rd(gg + 0x0c) } else { 0 };
+    let grid_world = if world_data != 0 { rd(world_data + 0x44) } else { 0 };
+    if grid_world == 0 || CAMERA_LOADS_FLAG.load(Ordering::Relaxed) == 0 || *((grid_world + GW_CAMERA_LOADS_OFF) as *const u8) != 0 {
         return;
     }
-    let rect = [x0, y0, x1 - x0, y1 - y0];
-    let f: extern "thiscall" fn(u32, u32, *const i32) = std::mem::transmute(REQUEST_LOAD_FN as usize);
-    f(grid_world, grid_world + 0x500, rect.as_ptr());
+    let mut st = VIEW_LOADS.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(start) = st.start else { return };
+    // The camera's float rect (GG+0xc: x, y, w, h).
+    let cam = |i: u32| *((world_data + 4 * i) as *const f32);
+    let n = crate::views::count().max(1);
+    st.last.resize(n, start);
+    let request: extern "thiscall" fn(u32, u32, *const i32) = std::mem::transmute(REQUEST_LOAD_FN as usize);
+    for k in 0..n {
+        let (dx, dy) = if k == 0 {
+            (0.0, 0.0)
+        } else {
+            let ((x0, y0), (xk, yk)) = (crate::views::centre(0), crate::views::centre(k));
+            (xk - x0, yk - y0)
+        };
+        // SetRect's int rect (cvttss2si), then FUN_00720130's snapping toward zero.
+        let (x, y) = ((cam(0) + dx) as i32, (cam(1) + dy) as i32);
+        let rect = [x / 64 * 64 - 64, y / 64 * 64 - 64, (cam(2) as i32).wrapping_add(128), (cam(3) as i32).wrapping_add(128)];
+        let last = st.last[k];
+        if rect == last {
+            continue;
+        }
+        request(grid_world, grid_world + 0x500, rect.as_ptr());
+        let ahead = |a: i32, b: i32| a.wrapping_sub(b).wrapping_mul(4).clamp(-512, 512);
+        let next = [rect[0] + ahead(rect[0], last[0]), rect[1] + ahead(rect[1], last[1]), rect[2], rect[3]];
+        request(grid_world, grid_world + 0x500, next.as_ptr());
+        st.last[k] = rect;
+    }
 }
 
 /// Eviction schedule: (next frame, current interval in frames); see [`evict_chunks`].
@@ -1481,8 +1562,9 @@ static EVICT: std::sync::Mutex<(u32, f64)> = std::sync::Mutex::new((0, 0.0));
 /// the target: each loaded chunk belongs to the player whose focus centre (`foci`, focus
 /// rects in slot order) is nearest (lowest slot on ties), and a player with more than the
 /// target loses its farthest; the schedule counts frames (seconds × 60). A chunk overlapping
-/// a focus rect stays (the focus streamer would load it again). With one player this is
-/// vanilla's rule with the player as the camera. Returns how many chunks were unloaded.
+/// a focus rect (around the player, larger than its camera load rect) stays: vanilla's
+/// farthest-first choice never reaches the screen either. With one player this is vanilla's
+/// rule with the player as the camera. Returns how many chunks were unloaded.
 ///
 /// # Safety
 /// Game thread, inside the simulation window, world initialised.
@@ -1670,6 +1752,7 @@ pub unsafe fn sim_rng_enter() {
         }
     });
     sync_platform_frame();
+    camera_loads_window_entry();
     rng_log('<');
     {
         let gg = rd(GAME_GLOBAL_PTR);

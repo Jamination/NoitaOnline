@@ -593,16 +593,14 @@ pub extern "C" fn no_fix_seeds(seed: u32) {
     let _ = seed;
 }
 
-/// Load the chunks of a focus rectangle (call once per player per frame, in slot order,
-/// inside the simulation window).
+/// The vanilla camera's chunk loads for every player's view (`patches::stream_views`): call
+/// once per window, after the simulation camera and the views (`no_focus_freeze`) are set.
 #[no_mangle]
-pub extern "C" fn no_stream_focus(x0: i32, y0: i32, x1: i32, y1: i32) {
+pub extern "C" fn no_stream_views() {
     #[cfg(all(windows, target_arch = "x86"))]
     unsafe {
-        patches::stream_focus(x0, y0, x1, y1)
+        patches::stream_views()
     };
-    #[cfg(not(all(windows, target_arch = "x86")))]
-    let _ = (x0, y0, x1, y1);
 }
 
 /// Unload far chunks as vanilla's streaming does, per player (`patches::evict_chunks`):
