@@ -37,7 +37,7 @@ void no_set_session_time(int64_t unix_secs);
 int32_t no_last_error(uint8_t* out, uint32_t cap);
 int32_t no_start_params(uint8_t* out, uint32_t cap);
 void no_stream_focus(int32_t x0, int32_t y0, int32_t x1, int32_t y1);
-uint32_t no_unload_far(const int32_t* foci, uint32_t n, int32_t margin, uint32_t max);
+uint32_t no_evict_chunks(const int32_t* foci, uint32_t n, uint32_t frame);
 void no_sim_enter(void);
 void no_sim_leave(void);
 uint32_t no_chunk_prewait(void);

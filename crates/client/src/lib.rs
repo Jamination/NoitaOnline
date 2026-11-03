@@ -210,6 +210,7 @@ pub unsafe extern "C" fn no_wait_tick(frame: u32, timeout_ms: u32, out: *mut u8,
     let mut s = shared.state.lock().unwrap();
     loop {
         if let Some(mut inputs) = s.stream.as_mut().and_then(|st| st.take_tick(frame)) {
+            s.game_waiting = false;
             drop(s);
             let waited = started.elapsed().as_micros() as u64;
             with_rt((), |rt| rt.timer.window_wait_us += waited);
@@ -238,11 +239,19 @@ pub unsafe extern "C" fn no_wait_tick(frame: u32, timeout_ms: u32, out: *mut u8,
             return buf.len() as i32;
         }
         if s.status == Some(Status::Disconnected) {
+            s.game_waiting = false;
             return -2;
         }
         let now = Instant::now();
         if now >= deadline {
+            s.game_waiting = false;
             return -1;
+        }
+        if !s.game_waiting {
+            // The network thread reads datagrams only with the next input or while the
+            // game waits: have it watch the socket now.
+            s.game_waiting = true;
+            shared.net_wake.notify();
         }
         s = shared.game_cond.wait_timeout(s, deadline - now).unwrap().0;
     }
@@ -529,8 +538,8 @@ pub extern "C" fn no_fix_seeds(seed: u32) {
     let _ = seed;
 }
 
-/// Keep the chunks around a focus rectangle loaded/simulated this frame (call once per
-/// player per frame, in slot order, inside the simulation window).
+/// Load the chunks of a focus rectangle (call once per player per frame, in slot order,
+/// inside the simulation window).
 #[no_mangle]
 pub extern "C" fn no_stream_focus(x0: i32, y0: i32, x1: i32, y1: i32) {
     #[cfg(all(windows, target_arch = "x86"))]
@@ -541,13 +550,15 @@ pub extern "C" fn no_stream_focus(x0: i32, y0: i32, x1: i32, y1: i32) {
     let _ = (x0, y0, x1, y1);
 }
 
-/// Unload up to `max` chunks outside every focus rect (`foci`: n × {x0,y0,x1,y1}) grown
-/// by `margin`. Deterministic replacement for the engine's wall-clock unloader.
+/// Unload far chunks as vanilla's streaming does, per player (`patches::evict_chunks`):
+/// `foci` = n × {x0,y0,x1,y1} focus rects in slot order. Call every frame inside the window;
+/// it acts on its own schedule. Deterministic replacement for the engine's wall-clock
+/// unloader. Returns how many chunks were unloaded.
 ///
 /// # Safety
 /// `foci` must point at `4 * n` readable i32.
 #[no_mangle]
-pub unsafe extern "C" fn no_unload_far(foci: *const i32, n: u32, margin: i32, max: u32) -> u32 {
+pub unsafe extern "C" fn no_evict_chunks(foci: *const i32, n: u32, frame: u32) -> u32 {
     #[cfg(all(windows, target_arch = "x86"))]
     {
         let rects: Vec<[i32; 4]> = (0..n as usize)
@@ -556,11 +567,11 @@ pub unsafe extern "C" fn no_unload_far(foci: *const i32, n: u32, margin: i32, ma
                 [*p, *p.add(1), *p.add(2), *p.add(3)]
             })
             .collect();
-        patches::unload_far_chunks(&rects, margin, max)
+        patches::evict_chunks(&rects, frame)
     }
     #[cfg(not(all(windows, target_arch = "x86")))]
     {
-        let _ = (foci, n, margin, max);
+        let _ = (foci, n, frame);
         0
     }
 }

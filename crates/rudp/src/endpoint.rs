@@ -508,6 +508,13 @@ impl Client {
         self.flush_now(now);
     }
 
+    /// Read the datagrams that arrived (like [`Self::update`], but sends nothing), so the
+    /// caller can answer them in the same packet as its own messages.
+    pub fn poll(&mut self) {
+        let now = self.now_us();
+        self.receive_now(now);
+    }
+
     pub fn flush(&mut self) {
         let now = self.now_us();
         self.flush_now(now);

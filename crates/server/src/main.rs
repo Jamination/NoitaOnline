@@ -92,8 +92,11 @@ struct Player {
     last_stream_send: Instant,
 }
 
-/// While a client lacks ticks (or an input ack is news), repeat the stream this often.
-const STREAM_RESEND: Duration = Duration::from_millis(16);
+/// While a client lacks ticks (or an input ack is news), repeat the stream this often. Every
+/// new tick already repeats all the ticks a client lacks, and clients acknowledge ticks only
+/// with their next input (once per frame), so this only matters when the stream pauses; a
+/// shorter interval would resend every frame to clients below 60 fps.
+const STREAM_RESEND: Duration = Duration::from_millis(50);
 
 #[derive(Default)]
 struct PerfAgg {

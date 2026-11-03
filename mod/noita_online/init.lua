@@ -179,9 +179,9 @@ end
 
 local lockstep_alive = true
 
--- Focus rectangles (one per player slot, slot order): chunks there stay loaded and simulated.
+-- Focus rectangles (one per player slot, slot order): chunks there stay loaded and simulated;
+-- chunks far from every player are unloaded as vanilla's streaming does (no_evict_chunks).
 local FOCUS_HW, FOCUS_HH = 400, 300
-local UNLOAD_MARGIN, UNLOAD_EVERY, UNLOAD_MAX = 512, 30, 2
 local ffi = require("ffi")
 local foci_buf = ffi.new("int32_t[128]")
 local centre_buf = ffi.new("float[64]")
@@ -282,7 +282,11 @@ function OnWorldPreUpdate()
     end
     Players.apply_tick(f, tick)
     Players.feed_local_camera()
-    for _, r in ipairs(foci) do NO.lib.no_stream_focus(r[1], r[2], r[3], r[4]) end
+    for i, r in ipairs(foci) do
+      NO.lib.no_stream_focus(r[1], r[2], r[3], r[4])
+      for k = 1, 4 do foci_buf[(i - 1) * 4 + k - 1] = r[k] end
+    end
+    NO.lib.no_evict_chunks(foci_buf, #foci, f)
     local own = -1
     for i, r in ipairs(foci) do
       centre_buf[2 * (i - 1)] = r.x
@@ -318,13 +322,6 @@ function OnWorldPostUpdate()
           log(table.concat(parts, " "))
         end
       end
-    end
-    if ready and f % UNLOAD_EVERY == 0 then
-      local foci = current_foci()
-      for i, r in ipairs(foci) do
-        for k = 1, 4 do foci_buf[(i - 1) * 4 + k - 1] = r[k] end
-      end
-      NO.lib.no_unload_far(foci_buf, #foci, UNLOAD_MARGIN, UNLOAD_MAX)
     end
     -- State reports: entity digest + tracked positions every 60 frames; chunk hashes either
     -- staggered (each loaded chunk hashed once per 60 frames, a few per frame: no frame-time

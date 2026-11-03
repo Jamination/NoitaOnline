@@ -1378,8 +1378,17 @@ const PARTICLE_CTOR_AND_6A: u32 = 0x0071_213e;
 const PARTICLE_CTOR_AND_6C: u32 = 0x0071_2144;
 /// Camera-driven GridWorld::RequestLoad calls (camera rect + look-ahead).
 const CAMERA_LOAD_CALLS: [u32; 2] = [0x0072_0210, 0x0072_0290];
-/// StreamingKeepAlive: RequestLoad(rect) + keep chunks in rect±256 loaded for 10 frames.
-const KEEP_ALIVE_RECT_FN: u32 = 0x0073_e080;
+/// GridWorld::RequestLoad (thiscall ECX = GridWorld, ChunkMap*, int rect[4] {x, y, w, h}):
+/// the load the vanilla camera requests every frame (`CAMERA_LOAD_CALLS`).
+const REQUEST_LOAD_FN: u32 = 0x0073_dab0;
+/// The streaming keep-alive list (std::vector of 0x18-byte entries: +0 expiry frame, +0x10 /
+/// +0x14 pointers to the chunk's x / y; written by `FUN_0073aa70`, e.g. for the player's
+/// StreamingKeepAliveComponent), which vanilla's eviction leaves alone.
+const KEEP_ALIVE_BEGIN: u32 = 0x0120_7fe4;
+const KEEP_ALIVE_END: u32 = 0x0120_7fe8;
+/// Magic numbers STREAMING_CHUNK_TARGET (i32) and STREAMING_FREQUENCY (f64, seconds).
+const STREAMING_CHUNK_TARGET: u32 = 0x0115_3294;
+const STREAMING_FREQUENCY: u32 = 0x0115_2700;
 /// Unload one chunk: fastcall(ecx = ChunkMap*, edx = int[3]{cx, cy, index}, stack: 1).
 const UNLOAD_CHUNK_FN: u32 = 0x0074_0e70;
 /// DeathMatch::Update(this, float dt): dt is wall-clock time and feeds the simulation.
@@ -1440,36 +1449,99 @@ unsafe fn patch_fixed_dt(ex: &mut Exec) -> Result<(), PatchError> {
     write_code(DEATHMATCH_UPDATE, &jmp)
 }
 
-/// Request loading of (and keep alive) the chunks around a focus rectangle this frame.
+/// Request loading of the chunks of a focus rectangle this frame, as vanilla's camera does.
 ///
 /// # Safety
 /// Game thread, inside the simulation window, world initialised.
 pub unsafe fn stream_focus(x0: i32, y0: i32, x1: i32, y1: i32) {
-    let rect = [x0, y0, x1, y1];
-    let f: extern "fastcall" fn(*const i32) = std::mem::transmute(KEEP_ALIVE_RECT_FN as usize);
-    f(rect.as_ptr());
+    let gg = rd(GAME_GLOBAL_PTR);
+    let world_data = if gg != 0 { rd(gg + 0x0c) } else { 0 };
+    let grid_world = if world_data != 0 { rd(world_data + 0x44) } else { 0 };
+    if grid_world == 0 {
+        return;
+    }
+    let rect = [x0, y0, x1 - x0, y1 - y0];
+    let f: extern "thiscall" fn(u32, u32, *const i32) = std::mem::transmute(REQUEST_LOAD_FN as usize);
+    f(grid_world, grid_world + 0x500, rect.as_ptr());
 }
 
-/// Deterministic replacement for the wall-clock streaming unloader: unload up to `max`
-/// loaded chunks (ascending table index) that lie outside every focus rect grown by
-/// `margin`. Returns how many were unloaded.
+/// Eviction schedule: (next frame, current interval in frames); see [`evict_chunks`].
+static EVICT: std::sync::Mutex<(u32, f64)> = std::sync::Mutex::new((0, 0.0));
+
+/// Deterministic stand-in for the engine's chunk eviction (`FUN_00743990`, which sessions
+/// switch off with STREAMING_ENABLED=0 because it runs on wall-clock time around the local
+/// camera). Vanilla, once every STREAMING_FREQUENCY seconds while more than
+/// STREAMING_CHUNK_TARGET chunks are loaded, unloads the loaded chunk farthest from the
+/// camera (squared distance in whole chunks from the camera centre's chunk, more than 0; the
+/// first in row order on ties) that is not on the streaming keep-alive list: one per tick,
+/// or all above three times the target; the interval halves while twice the target are
+/// loaded and returns to the setting once at most the target are. Here every player keeps
+/// the target: each loaded chunk belongs to the player whose focus centre (`foci`, focus
+/// rects in slot order) is nearest (lowest slot on ties), and a player with more than the
+/// target loses its farthest; the schedule counts frames (seconds × 60). A chunk overlapping
+/// a focus rect stays (the focus streamer would load it again). With one player this is
+/// vanilla's rule with the player as the camera. Returns how many chunks were unloaded.
 ///
 /// # Safety
 /// Game thread, inside the simulation window, world initialised.
-pub unsafe fn unload_far_chunks(foci: &[[i32; 4]], margin: i32, max: u32) -> u32 {
+pub unsafe fn evict_chunks(foci: &[[i32; 4]], frame: u32) -> u32 {
     let gg = rd(GAME_GLOBAL_PTR);
-    if gg == 0 {
-        return 0;
-    }
-    let world_data = rd(gg + 0x0c);
+    let world_data = if gg != 0 { rd(gg + 0x0c) } else { 0 };
     let grid_world = if world_data != 0 { rd(world_data + 0x44) } else { 0 };
-    if grid_world == 0 {
+    if grid_world == 0 || foci.is_empty() {
         return 0;
     }
     let chunk_map = grid_world + 0x500;
     let table = rd(chunk_map + 8) as *const u32;
     if table.is_null() {
         return 0;
+    }
+    let target = (rd(STREAMING_CHUNK_TARGET) as i32).max(1) as usize;
+    let base = (*(STREAMING_FREQUENCY as *const f64) * 60.0).max(1.0);
+    let mut schedule = EVICT.lock().unwrap_or_else(|p| p.into_inner());
+    if schedule.1 <= 0.0 {
+        schedule.1 = base;
+    }
+    if frame < schedule.0 {
+        return 0;
+    }
+    schedule.0 = frame + schedule.1.round().max(1.0) as u32;
+    // Focus centres in chunks, as vanilla's camera centre (`>> 9`).
+    let centres: Vec<(i32, i32)> = foci.iter().map(|r| ((r[0] + r[2]).div_euclid(2) >> 9, (r[1] + r[3]).div_euclid(2) >> 9)).collect();
+    // Loaded chunks in row order (y, then x, ascending): (cx, cy, table index, owner, d²).
+    let mut chunks: Vec<(i32, i32, u32, usize, i64)> = Vec::new();
+    for idx in 0..512 * 512u32 {
+        if *table.add(idx as usize) == 0 {
+            continue;
+        }
+        let (cx, cy) = ((idx % 512) as i32 - 256, (idx / 512) as i32 - 256);
+        let mut owner = (0, i64::MAX);
+        for (i, &(px, py)) in centres.iter().enumerate() {
+            let d2 = ((cx - px) as i64).pow(2) + ((cy - py) as i64).pow(2);
+            if d2 < owner.1 {
+                owner = (i, d2);
+            }
+        }
+        chunks.push((cx, cy, idx, owner.0, owner.1));
+    }
+    chunks.sort_by_key(|c| (c.1, c.0));
+    let most = (0..foci.len()).map(|p| chunks.iter().filter(|c| c.3 == p).count()).max().unwrap_or(0);
+    if most <= target {
+        schedule.1 = base;
+        return 0;
+    }
+    if most >= 2 * target {
+        schedule.1 *= 0.5;
+    }
+    drop(schedule);
+    // Chunks on the keep-alive list (entries not yet expired).
+    let mut kept: Vec<(i32, i32)> = Vec::new();
+    let (mut e, end) = (rd(KEEP_ALIVE_BEGIN), rd(KEEP_ALIVE_END));
+    while e != 0 && e < end {
+        if rd(e) as i32 > rd(gg) as i32 {
+            kept.push((rd(rd(e + 0x10)) as i32, rd(rd(e + 0x14)) as i32));
+        }
+        e += 0x18;
     }
     // FUN_00740e70 takes (ecx, edx, one stack arg) but returns with a plain `ret`: the caller
     // pops the stack argument (vanilla call sites `add esp,4`), which no Rust ABI expresses.
@@ -1484,22 +1556,29 @@ pub unsafe fn unload_far_chunks(foci: &[[i32; 4]], margin: i32, max: u32) -> u32
             clobber_abi("C"),
         );
     };
+    let in_focus = |cx: i32, cy: i32| {
+        let (x0, y0) = (cx * 512, cy * 512);
+        foci.iter().any(|r| x0 < r[2] && x0 + 512 > r[0] && y0 < r[3] && y0 + 512 > r[1])
+    };
     let mut n = 0;
-    for idx in 0..512 * 512u32 {
-        if n >= max {
-            break;
-        }
-        if *table.add(idx as usize) == 0 {
+    for p in 0..foci.len() {
+        let count = chunks.iter().filter(|c| c.3 == p).count();
+        if count <= target {
             continue;
         }
-        let cx = (idx % 512) as i32 - 256;
-        let cy = (idx / 512) as i32 - 256;
-        let (x0, y0) = (cx * 512, cy * 512);
-        let keep = foci.iter().any(|r| {
-            x0 < r[2] + margin && x0 + 512 > r[0] - margin && y0 < r[3] + margin && y0 + 512 > r[1] - margin
-        });
-        if !keep {
-            let coords = [cx, cy, idx as i32];
+        let mut owned: Vec<&(i32, i32, u32, usize, i64)> =
+            chunks.iter().filter(|c| c.3 == p && c.4 > 0 && !in_focus(c.0, c.1) && !kept.contains(&(c.0, c.1))).collect();
+        let evict = if count > 3 * target { count - 3 * target } else { 1 };
+        for _ in 0..evict {
+            // The farthest, the first in row order on ties.
+            let Some(k) = (0..owned.len()).fold(None, |best: Option<usize>, k| match best {
+                Some(b) if owned[b].4 >= owned[k].4 => Some(b),
+                _ => Some(k),
+            }) else {
+                break;
+            };
+            let c = owned.remove(k);
+            let coords = [c.0, c.1, c.2 as i32];
             unload(chunk_map, coords.as_ptr());
             n += 1;
         }

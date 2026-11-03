@@ -34,6 +34,8 @@ sequenceDiagram
   acknowledged; each server datagram repeats all ticks the client has not acknowledged. A
   lost datagram costs one frame interval, not a resend round trip, and there is no
   head-of-line blocking. Session control, state hashes and logs use the reliable channel.
+  The client acknowledges ticks with its next input; the server repeats the stream on its
+  own only after 50 ms without a new tick for a client that lacks ticks.
 * A client that cannot get tick *f* blocks in `OnWorldPreUpdate` (the game pauses); all
   clients therefore stay on the same frame within `D`.
 
@@ -46,8 +48,9 @@ sequenceDiagram
   to 33 packets). A packet carrying messages is acked by the receiver's next packet, sent
   at once if nothing else is due; message-less packets (acks, keepalives) are not acked.
 * Reliable-ordered channels: 16-bit message ids, windowed send buffer, resend after
-  `max(rtt + 4·rttvar, 20 ms)` until a packet carrying the message is acked, in-order
-  delivery, fragmentation of large messages into MTU-sized pieces reassembled on receipt.
+  `max(rtt + 4·rttvar, 20 ms)` (the game client: 100 ms) until a packet carrying the message
+  is acked, in-order delivery, fragmentation of large messages into MTU-sized pieces
+  reassembled on receipt.
 * Unreliable channel: single-datagram messages.
 * Timeout after 10 s of silence; keepalives every 100 ms.
 * `LinkConditions` injects loss/latency/jitter/duplication on both directions of an
@@ -68,13 +71,16 @@ sequenceDiagram
   simulation position; outside the window (rendering, GUI) each client uses its own RNG
   stream and its own camera following its own player.
 * **Foci**: chunks are loaded and simulated around every player (identically on every
-  client) instead of around each client's own camera; a deterministic unloader replaces
-  the engine's wall-clock one.
+  client) instead of around each client's own camera; a deterministic eviction replaces
+  the engine's wall-clock one (vanilla's rule, applied per player).
 * Deaths do not end the run: a player at 0 HP becomes an invulnerable spectator.
-* **Off the game thread**: the network thread sleeps until the game queues data, a
-  datagram arrives (on Windows) or a transport timer is due. State-report chunk hashes are
-  computed on a worker thread while the client renders; cells only change inside the
-  window, and the next window entry waits for the worker.
+* **Off the game thread**: during the session the network thread wakes once per frame,
+  when the game queues its input: it reads the datagrams that arrived (ticks, acks) and
+  sends one packet with the input stream, the acks and the queued messages (state report,
+  logs). Datagrams wake it only while the game waits for a tick (before the session:
+  always, on Windows); transport timers too. State-report chunk hashes are computed on a
+  worker thread while the client renders; cells only change inside the window, and the
+  next window entry waits for the worker.
 
 ## Server
 
