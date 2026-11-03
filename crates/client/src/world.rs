@@ -124,15 +124,20 @@ pub unsafe fn loaded_chunks(first: usize, step: usize) -> (Vec<(u32, usize)>, us
     (chunks, w.materials_begin)
 }
 
-/// Hash chunks listed by [`loaded_chunks`], spread over a few threads.
+/// Hash chunks listed by [`loaded_chunks`]. A few chunks (the staggered report's 0-2 per
+/// frame) are hashed on the calling thread, the report worker; only big batches (every
+/// loaded chunk at once, `NOITA_ONLINE_HASH=full`) are spread over a few threads, since
+/// spawning threads costs more than a chunk (under Wine every new thread is a round of
+/// wineserver calls and DLL thread notifications).
 ///
 /// # Safety
 /// The chunks must still be loaded and their cells unchanged since they were listed, i.e.
 /// no simulation step may run until this returns.
 pub unsafe fn hash_chunks(chunks: &[(u32, usize)], materials_begin: usize) -> Vec<protocol::ChunkHash> {
+    const SPAWN_FROM: usize = 8;
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 4);
     let mut out: Vec<protocol::ChunkHash> = Vec::with_capacity(chunks.len());
-    if threads == 1 || chunks.len() < 2 {
+    if threads == 1 || chunks.len() < SPAWN_FROM {
         for &(index, cells) in chunks {
             out.push(protocol::ChunkHash { index, hash: hash_cells(cells as *const usize, materials_begin) });
         }

@@ -106,6 +106,9 @@ struct State {
     entities: Duration,
     frames: u32,
     window_start: Option<Instant>,
+    /// Sums over the window, sampled every 10th frame at `render_tiles` exit: see [`COUNTERS`].
+    counts: [u64; NC],
+    samples: u32,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
@@ -116,7 +119,43 @@ static STATE: Mutex<State> = Mutex::new(State {
     entities: Duration::ZERO,
     frames: 0,
     window_start: None,
+    counts: [0; NC],
+    samples: 0,
 });
+
+const RENDER_TILES: usize = 25;
+const COUNTERS: [&str; 10] =
+    ["drawgrid rects", "cam w", "cam h", "particles a", "particles b", "particles c", "active tiles", "deferred tiles", "bodies", "chunks"];
+const NC: usize = COUNTERS.len();
+
+/// Workload counters for [`State::counts`] (game thread, after the render tiles dispatch).
+unsafe fn counters() -> [u64; NC] {
+    use crate::patches::{rd, GAME_GLOBAL_PTR};
+    let gg = rd(GAME_GLOBAL_PTR);
+    let wd = if gg != 0 { rd(gg + 0x0c) } else { 0 };
+    let gw = if wd != 0 { rd(wd + 0x44) } else { 0 };
+    if gw == 0 {
+        return [0; NC];
+    }
+    let gp = rd(gw + 0x540);
+    let len = |o: u32| if gp != 0 { (rd(gp + o + 4).wrapping_sub(rd(gp + o)) / 0x70) as u64 } else { 0 };
+    // Camera int rect: +0x498 x, +0x49c y, +0x4a0 width, +0x4a4 height (cells).
+    let (w, h) = (rd(gw + 0x4a0) as i32, rd(gw + 0x4a4) as i32);
+    let imp = rd(gw + 0x5d0);
+    let (tiles, deferred) = if imp != 0 { (rd(imp) as u64, rd(imp + 0x30) as u64) } else { (0, 0) };
+    let b2 = rd(gw + 0x530);
+    let mut bodies = 0u64;
+    let mut body = if b2 != 0 { rd(b2 + 0x1922c) } else { 0 };
+    while body != 0 && bodies < 100_000 {
+        bodies += 1;
+        body = rd(body + 0xb8);
+    }
+    let mut chunks = 0u64;
+    if let Some(wp) = crate::world::world_ptrs() {
+        crate::world::for_each_chunk(&wp, |_, _| chunks += 1);
+    }
+    [rd(0x0120_7008) as u64, w.max(0) as u64, h.max(0) as u64, len(0x34), len(0x40), len(0x4c), tiles, deferred, bodies, chunks]
+}
 
 extern "C" fn enter(i: u32) {
     let now = Instant::now();
@@ -152,6 +191,13 @@ extern "C" fn exit(i: u32) {
         s.calls[i] += 1;
     }
     s.last_exit[i] = Some(now);
+    if i == RENDER_TILES && *PROF_ON && s.frames % 10 == 0 {
+        let c = unsafe { counters() };
+        for (a, b) in s.counts.iter_mut().zip(c) {
+            *a += b;
+        }
+        s.samples += 1;
+    }
     if i != DM_UPDATE {
         return;
     }
@@ -170,6 +216,11 @@ extern "C" fn exit(i: u32) {
     let per = |d: Duration| d.as_secs_f64() * 1000.0 / n;
     let wait = Duration::from_micros(WAIT_US.swap(0, Ordering::Relaxed));
     let mut out = format!("{} frames: wall {:.2} ms/frame, tick wait {:.2}, entities (world exit -> marker) {:.2}\n", s.frames, per(wall), per(wait), per(s.entities));
+    let k = s.samples.max(1) as f64;
+    let line: Vec<String> = COUNTERS.iter().zip(s.counts).map(|(name, c)| format!("{name} {:.1}", c as f64 / k)).collect();
+    out.push_str(&format!("  counters: {}\n", line.join(", ")));
+    s.counts = [0; NC];
+    s.samples = 0;
     for (k, (name, _)) in SECTIONS.iter().enumerate() {
         out.push_str(&format!("  {name:<44} {:>7.3} ms/frame  {:>6.2} calls/frame\n", per(s.total[k]), s.calls[k] as f64 / n));
     }
