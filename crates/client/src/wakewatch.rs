@@ -170,9 +170,6 @@ unsafe extern "system" fn handler(info: *mut u32) -> i32 {
 /// # Safety
 /// Game thread, world initialised.
 pub unsafe fn on_window_entry(b2_world: u32) {
-    if std::env::var_os("NOITA_ONLINE_WAKEWATCH").is_none() {
-        return;
-    }
     let Some(log) = LOG.as_ref() else { return };
     let f = frame();
     if f < log.from || f > log.to || b2_world == 0 {

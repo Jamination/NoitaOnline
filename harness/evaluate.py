@@ -3,14 +3,17 @@
 
 Usage:
   harness/evaluate.py --run run/e2e/full --netsim-run run/e2e/netsim \
-                      --fps-run run/e2e/fps_mp1 --baseline run/e2e/fps_solo1 [--info-baseline run/e2e/solo4]
-                      [--frames 36000] [--players 4] [--skip-build] [--skip-tests]
+                      --fps-run run/e2e/fps_mp1_{1,2,3} --baseline run/e2e/fps_solo1_{1,2,3} \
+                      [--info-baseline run/e2e/solo4] [--frames 36000] [--players 4] [--skip-build] [--skip-tests]
+  harness/evaluate.py --fps-only --fps-run ... --baseline ...    # the FPS criterion alone
 
 FPS criterion (agreed with the user): every lockstep client simulates every player, so the
 4-player workload is inherently larger than single-player. The criterion therefore measures
-the mod's own overhead at equal workload: a 1-player session (patches, networking, lockstep)
-vs the vanilla single-player baseline, same scenario, seed and CPU pinning. The 4-player
-session's FPS against --info-baseline is reported for information only.
+the mod's own overhead at equal workload: 1-player sessions (patches, networking, lockstep)
+vs vanilla single-player baseline runs, same scenario, seed and CPU pinning, run alternately
+(harness/fps_pairs.sh). Vanilla is not deterministic, so its runs follow different
+trajectories; each side is the median over its runs. The 4-player session's FPS against
+--info-baseline is reported for information only.
 
 Exit status 0 only if every criterion passes. Prints one PASS/FAIL line per criterion.
 """
@@ -92,19 +95,31 @@ def client_ids(run):
     return sorted(ids)
 
 
+def median(v):
+    s = sorted(v)
+    return (s[(len(s) - 1) // 2] + s[len(s) // 2]) / 2
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run", required=True)
-    ap.add_argument("--baseline", required=True, help="vanilla solo run (--solo --players 1 --pin)")
-    ap.add_argument("--fps-run", required=True, help="1-player MP run (--players 1 --pin), same seed")
+    ap.add_argument("--run")
+    ap.add_argument("--baseline", required=True, nargs="+",
+                    help="vanilla solo runs (--solo --players 1 --pin), interleaved with --fps-run")
+    ap.add_argument("--fps-run", required=True, nargs="+",
+                    help="1-player MP runs (--players 1 --pin), same seed, interleaved with --baseline")
     ap.add_argument("--info-baseline", help="solo run with as many instances as --run (informational)")
-    ap.add_argument("--netsim-run", required=True)
+    ap.add_argument("--netsim-run")
     ap.add_argument("--frames", type=int, default=36000)
     ap.add_argument("--players", type=int, default=4)
     ap.add_argument("--warmup", type=int, default=600)
     ap.add_argument("--skip-build", action="store_true")
     ap.add_argument("--skip-tests", action="store_true")
+    ap.add_argument("--fps-only", action="store_true", help="only the FPS overhead criterion")
     a = ap.parse_args()
+    if a.fps_only:
+        a.skip_build = a.skip_tests = True
+    elif not a.run or not a.netsim_run:
+        ap.error("--run and --netsim-run are required (unless --fps-only)")
 
     # 1. Builds.
     if not a.skip_build:
@@ -127,7 +142,7 @@ def main():
                f"cargo test exit={r.returncode} passed={passed} failed={failed} key_tests_present={have}")
 
     # 2-4. Main session.
-    s = check_session("session", a.run, a.frames, a.players)
+    s = None if a.fps_only else check_session("session", a.run, a.frames, a.players)
 
     # 5. FPS: mod overhead at equal workload (1-player session vs vanilla solo).
     def fps_compare(run, base, n):
@@ -148,27 +163,52 @@ def main():
                 ok = False
         return ok, "; ".join(lines)
 
-    ok, detail = fps_compare(a.fps_run, a.baseline, 1)
+    # Vanilla's simulation is not deterministic (thread timing, wall-clock budgets), so
+    # identical solo runs drift onto different trajectories with different workloads, while
+    # the lockstep session replays one trajectory. Each side is therefore summarised by the
+    # median over its runs (interleaved MP/solo on the same cores, see docs/testing.md).
+    def side(runs):
+        st = []
+        for r in runs:
+            ids = client_ids(r)
+            x = frame_stats(os.path.join(r, f"frames_{ids[0]}.txt"), a.warmup) if ids else None
+            if x:
+                st.append(x)
+        return st
+
+    mp, solo = side(a.fps_run), side(a.baseline)
+    if len(mp) == len(a.fps_run) and len(solo) == len(a.baseline):
+        m_avg, m_low = median([x["avg_fps"] for x in mp]), median([x["low1_fps"] for x in mp])
+        b_avg, b_low = median([x["avg_fps"] for x in solo]), median([x["low1_fps"] for x in solo])
+        da, dl = 1 - m_avg / b_avg, 1 - m_low / b_low
+        ok = da <= 0.05 and dl <= 0.05
+        runs = lambda st: " ".join(f"{x['avg_fps']:.1f}/{x['low1_fps']:.1f}" for x in st)
+        detail = (f"median of {len(mp)} MP / {len(solo)} solo runs: avg {m_avg:.1f} vs {b_avg:.1f} ({da*100:+.1f}% drop), "
+                  f"1%low {m_low:.1f} vs {b_low:.1f} ({dl*100:+.1f}% drop); runs avg/1%low MP [{runs(mp)}] solo [{runs(solo)}]")
+    else:
+        ok, detail = False, "missing frames_<id>.txt in an --fps-run or --baseline run"
     record("FPS overhead <= 5% vs single-player baseline at equal workload (avg and 1% low)", ok, detail)
-    if a.info_baseline:
-        _, detail = fps_compare(a.run, a.info_baseline, a.players)
-        print(f"INFO  {a.players}-player session vs {a.players} solo instances: {detail}")
 
-    # 6. Bandwidth and server CPU.
-    bw = [(c["player"], c["avg_out_Bps"], c["avg_in_Bps"], c["peak_out_Bps"], c["peak_in_Bps"]) for c in s["clients"]]
-    ok = bool(bw) and all(o < 100_000 and i < 100_000 for _, o, i, _, _ in bw)
-    record("bandwidth < 100 KB/s per client", ok,
-           ", ".join(f"p{p}: avg out {o/1000:.1f} in {i/1000:.1f} (peak {po/1000:.1f}/{pi/1000:.1f}) KB/s" for p, o, i, po, pi in bw))
-    cpu = s["server_cpu"]
-    record("headless server uses < 1 CPU core", cpu["avg_cores"] < 1.0 and cpu["peak_cores_1s"] < 1.0,
-           f"avg {cpu['avg_cores']:.4f} cores, peak(1s) {cpu['peak_cores_1s']:.4f} cores")
+    if not a.fps_only:
+        if a.info_baseline:
+            _, detail = fps_compare(a.run, a.info_baseline, a.players)
+            print(f"INFO  {a.players}-player session vs {a.players} solo instances: {detail}")
 
-    # 7. Under 5% loss + 100 ms latency.
-    check_session("netsim 5% loss + 100 ms", a.netsim_run, a.frames, a.players)
-    ns = events(a.netsim_run)
-    m = re.search(r"netsim=Some\(LinkConditions \{ loss: ([0-9.]+), latency_us: (\d+)", ns)
-    record("netsim run used >= 5% loss and >= 100 ms latency", bool(m) and float(m.group(1)) >= 0.05 and int(m.group(2)) >= 100_000,
-           m.group(0) if m else "netsim settings not found in events.log")
+        # 6. Bandwidth and server CPU.
+        bw = [(c["player"], c["avg_out_Bps"], c["avg_in_Bps"], c["peak_out_Bps"], c["peak_in_Bps"]) for c in s["clients"]]
+        ok = bool(bw) and all(o < 100_000 and i < 100_000 for _, o, i, _, _ in bw)
+        record("bandwidth < 100 KB/s per client", ok,
+               ", ".join(f"p{p}: avg out {o/1000:.1f} in {i/1000:.1f} (peak {po/1000:.1f}/{pi/1000:.1f}) KB/s" for p, o, i, po, pi in bw))
+        cpu = s["server_cpu"]
+        record("headless server uses < 1 CPU core", cpu["avg_cores"] < 1.0 and cpu["peak_cores_1s"] < 1.0,
+               f"avg {cpu['avg_cores']:.4f} cores, peak(1s) {cpu['peak_cores_1s']:.4f} cores")
+
+        # 7. Under 5% loss + 100 ms latency.
+        check_session("netsim 5% loss + 100 ms", a.netsim_run, a.frames, a.players)
+        ns = events(a.netsim_run)
+        m = re.search(r"netsim=Some\(LinkConditions \{ loss: ([0-9.]+), latency_us: (\d+)", ns)
+        record("netsim run used >= 5% loss and >= 100 ms latency", bool(m) and float(m.group(1)) >= 0.05 and int(m.group(2)) >= 100_000,
+               m.group(0) if m else "netsim settings not found in events.log")
 
     failed = [n for n, ok in results if not ok]
     print(f"\n{len(results) - len(failed)}/{len(results)} criteria passed")

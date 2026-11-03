@@ -299,6 +299,15 @@ function M.gui_open()
   return gui ~= nil and (M.swap_open or ComponentGetValue2(gui, "mActive"))
 end
 
+-- The ControlsComponent fields the inventory GUI reads (every button but the wheel).
+local GUI_FIELDS = {}
+for _, b in ipairs(Input.BUTTONS) do
+  if b ~= "ChangeItemR" and b ~= "ChangeItemL" then
+    GUI_FIELDS[#GUI_FIELDS + 1] = "mButtonDown" .. b
+    GUI_FIELDS[#GUI_FIELDS + 1] = "mButtonFrame" .. b
+  end
+end
+
 -- Run Noita's inventory GUI (HUD, quick bar, tooltips, inventory screen) for this client's
 -- own player, after the simulation window. Its inventory edits do not happen here: the
 -- client runtime records them as ops, sent with the next input and applied by every client
@@ -322,20 +331,13 @@ function M.gui_update()
   end
   local inv = EntityGetFirstComponentIncludingDisabled(slot.entity, "Inventory2Component")
   local refresh = inv and ComponentGetValue2(inv, "mForceRefresh")
-  local fields = {}
-  for _, b in ipairs(Input.BUTTONS) do
-    if b ~= "ChangeItemR" and b ~= "ChangeItemL" then
-      fields[#fields + 1] = "mButtonDown" .. b
-      fields[#fields + 1] = "mButtonFrame" .. b
-    end
-  end
   local kept = {}
-  for i, f in ipairs(fields) do
+  for i, f in ipairs(GUI_FIELDS) do
     kept[i] = ComponentGetValue2(slot.controls, f)
     ComponentSetValue2(slot.controls, f, ComponentGetValue2(M.proxy_controls, f))
   end
   NO.lib.no_gui_update()
-  for i, f in ipairs(fields) do ComponentSetValue2(slot.controls, f, kept[i]) end
+  for i, f in ipairs(GUI_FIELDS) do ComponentSetValue2(slot.controls, f, kept[i]) end
   for _, s in ipairs(saved) do
     ComponentSetValue2(s[1], "inventory_slot", s[2], s[3])
     ComponentSetValue2(s[1], "uses_remaining", s[4])

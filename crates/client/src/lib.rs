@@ -292,7 +292,8 @@ fn dump_rect() -> Option<[i32; 4]> {
 /// `<frame>e` is the state the step reported as `<frame + 1>` starts from.
 #[cfg(all(windows, target_arch = "x86"))]
 pub(crate) unsafe fn dump_window_entry(frame: u32) {
-    if std::env::var_os("NOITA_ONLINE_DUMP_ENTRY").is_none() {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("NOITA_ONLINE_DUMP_ENTRY").is_some());
+    if !*ON {
         return;
     }
     let (Some(path), Some([x0, y0, x1, y1])) = (dump_path(frame), dump_rect()) else { return };
@@ -844,7 +845,10 @@ pub extern "C" fn no_rtt_us() -> u64 {
 #[no_mangle]
 pub extern "C" fn no_shutdown() {
     #[cfg(all(windows, target_arch = "x86"))]
-    report::join();
+    {
+        report::join();
+        cosmetic::join_cell_emitters();
+    }
     let handle = with_rt(None, |rt| {
         rt.shared.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         rt.shared.game_cond.notify_all();

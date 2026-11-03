@@ -238,6 +238,7 @@ local function douse_free_camera_light()
 end
 
 local ENTLOG = os.getenv("NOITA_ONLINE_ENTLOG")
+local PCLOG = os.getenv("NOITA_ONLINE_PCLOG")
 
 local in_sim_window = false
 
@@ -300,7 +301,7 @@ function OnWorldPostUpdate()
   local f = GameGetFrameNum()
   if in_sim_window then
     if ready then douse_free_camera_light() end
-    if ready and os.getenv("NOITA_ONLINE_PCLOG") then
+    if ready and PCLOG then
       -- Diagnostics: every slot's PlayerCollision and CharacterData state, every frame.
       for i, slot in ipairs(Players.slots) do
         if EntityGetIsAlive(slot.entity) then

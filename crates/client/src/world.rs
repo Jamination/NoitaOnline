@@ -79,7 +79,7 @@ pub unsafe fn hash_cells(cells: *const usize, materials_begin: usize) -> u64 {
 }
 
 #[inline(always)]
-unsafe fn prefetch(p: *const u8) {
+pub(crate) unsafe fn prefetch(p: *const u8) {
     #[cfg(target_arch = "x86")]
     core::arch::x86::_mm_prefetch(p as *const i8, core::arch::x86::_MM_HINT_T0);
     #[cfg(target_arch = "x86_64")]

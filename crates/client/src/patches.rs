@@ -925,7 +925,8 @@ static PROF_WINDOW: std::sync::Mutex<(u32, std::time::Duration, Option<std::time
 
 unsafe fn prof_window(enter: bool) {
     use std::io::Write;
-    if std::env::var_os("NOITA_ONLINE_PROF").is_none() {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("NOITA_ONLINE_PROF").is_some());
+    if !*ON {
         return;
     }
     let mut w = PROF_WINDOW.lock().unwrap_or_else(|p| p.into_inner());
@@ -1647,6 +1648,8 @@ pub unsafe fn sim_rng_leave() {
         // The render shows this client's own player's damage flash (`local_presentation`).
         crate::slots::flash_render_enter();
     }
+    // Next entry's material particle effects, found while this client draws.
+    crate::cosmetic::arm_cell_emitters();
 }
 
 /// DeathMatch::Update, right before the `OnWorldPreUpdate` dispatch loop over every mod's Lua
@@ -1741,7 +1744,8 @@ pub unsafe fn set_camera_pos(x: f32, y: f32) {
 /// Diagnostics (`NOITA_ONLINE_RNGWATCH`, [`crate::rngwatch`]): watch the simulation RNGs for
 /// writes from other threads while the window is open.
 unsafe fn rng_watch(enter: bool) {
-    if std::env::var_os("NOITA_ONLINE_RNGWATCH").is_none() {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("NOITA_ONLINE_RNGWATCH").is_some());
+    if !*ON {
         return;
     }
     let gg = rd(GAME_GLOBAL_PTR);

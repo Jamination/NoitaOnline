@@ -17,7 +17,8 @@
 //! belongs to each client's own render, and the render runs outside the window. The patches
 //! here make them per player: "on screen" means inside some player's view ([`views`]), the
 //! snapshot lookup reads the world as the snapshot shows it, the emitters are found by
-//! scanning the world at window entry, and rain falls around every player.
+//! scanning the world between window exit and the next entry, and rain falls around every
+//! player.
 
 use crate::patches::{expect, in_window, rd, rel32, write_code, Exec, PatchError, GAME_GLOBAL_PTR};
 use crate::views;
@@ -292,17 +293,50 @@ const MATERIAL_EFFECT: u32 = 0x28c;
 
 static EMITTERS_ON: AtomicBool = AtomicBool::new(false);
 
+/// The graphics device's buffer swap (`FUN_00dd9450`, fastcall `this`: SDL_GL_SwapWindow of
+/// the device's window), a vtable slot.
+const SWAP_SLOT: u32 = 0x0105_3238;
+const SWAP_FN: u32 = 0x00dd_9450;
+
 /// Material particle effects come from the surface cells of every player's view, scanned
-/// from the world at window entry, instead of from the grid render (this client's view,
-/// outside the window). The render no longer queues emitters.
-pub(crate) unsafe fn patch_cell_emitters(_: &mut Exec) -> Result<(), PatchError> {
+/// from the world between window exit and the next entry, instead of from the grid render
+/// (this client's view, outside the window). The render no longer queues emitters.
+pub(crate) unsafe fn patch_cell_emitters(ex: &mut Exec) -> Result<(), PatchError> {
     expect(RENDER_EMITTER_JZ - 14, &[0x83, 0xB8, 0x8C, 0x02, 0x00, 0x00, 0x00])?;
     expect(RENDER_EMITTER_JZ, &[0x0F, 0x84, 0x7F, 0x01, 0x00, 0x00])?;
+    expect(SWAP_SLOT, &SWAP_FN.to_le_bytes())?;
     // jz rel32 -> jmp rel32; nop
     let rel = rel32(RENDER_EMITTER_JZ + 5, RENDER_EMITTER_JZ + 6 + 0x17f);
     write_code(RENDER_EMITTER_JZ, &[0xE9, rel[0], rel[1], rel[2], rel[3], 0x90])?;
+    // The swap starts the scan: xmm save; pushad; call swap_start; popad; xmm restore; jmp swap.
+    let base = ex.alloc_data(160);
+    let f = ((swap_start as extern "C" fn()) as u32).to_le_bytes();
+    let mut c = xmm_save();
+    c.extend_from_slice(&[0x60, 0xB8, f[0], f[1], f[2], f[3], 0xFF, 0xD0, 0x61]);
+    c.extend(xmm_restore());
+    jump(&mut c, base, &[0xE9], SWAP_FN);
+    assert!(c.len() <= 160);
+    std::ptr::copy_nonoverlapping(c.as_ptr(), base as *mut u8, c.len());
+    write_code(SWAP_SLOT, &base.to_le_bytes())?;
     EMITTERS_ON.store(true, Ordering::Relaxed);
     Ok(())
+}
+
+/// Set at window exit, taken by the next buffer swap ([`swap_start`]).
+static SCAN_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// Window exit: the next buffer swap starts the emitter scan ([`scan_cell_emitters`]). The
+/// swap is when this client's pool workers are idle (the render tiles are joined), so the
+/// scan does not compete with them; it must finish by the next window entry either way.
+pub fn arm_cell_emitters() {
+    SCAN_ARMED.store(EMITTERS_ON.load(Ordering::Relaxed), Ordering::Relaxed);
+}
+
+extern "C" fn swap_start() {
+    if SCAN_ARMED.swap(false, Ordering::Relaxed) {
+        // SAFETY: game thread, between window exit and the next entry.
+        unsafe { scan_cell_emitters() };
+    }
 }
 
 /// Surface cells with a material particle effect in the union of every player's view, in
@@ -319,9 +353,19 @@ unsafe fn find_emitters(table: u32, rects: &[[i32; 4]], out: &mut Vec<(i32, i32,
                 let end = x1.min((x & !511) + 512);
                 let chunk = rd(table + 4 * (cy * 512 + (((x >> 9) + 256) & 511) as u32));
                 if chunk != 0 {
-                    let row = rd(chunk) + 4 * (((y & 511) as u32) << 9);
-                    for px in x..end {
-                        let cell = rd(row + 4 * (px & 511) as u32);
+                    let row = (rd(chunk) + 4 * (((y & 511) as u32) << 9)) as *const u32;
+                    let (i0, i1) = ((x & 511) as usize, ((end - 1) & 511) as usize + 1);
+                    for i in i0..i1 {
+                        // Cells are scattered heap objects: fetch the ones ahead while this
+                        // one is tested (as `world::hash_cells`).
+                        const AHEAD: usize = 24;
+                        if i + AHEAD < i1 {
+                            let next = *row.add(i + AHEAD);
+                            if next != 0 {
+                                crate::world::prefetch((next + 0x14) as *const u8);
+                            }
+                        }
+                        let cell = *row.add(i);
                         if cell == 0 {
                             continue;
                         }
@@ -329,6 +373,7 @@ unsafe fn find_emitters(table: u32, rects: &[[i32; 4]], out: &mut Vec<(i32, i32,
                         if effect == 0 || cell_call(cell, 0x10) == 4 {
                             continue;
                         }
+                        let px = (x & !511) + i as i32;
                         if snapshot_value(cell_at(table, px, y - 1)) <= 0 {
                             out.push((px, y, effect));
                         }
@@ -340,6 +385,91 @@ unsafe fn find_emitters(table: u32, rects: &[[i32; 4]], out: &mut Vec<(i32, i32,
     });
 }
 
+/// The emitter scan runs on a worker thread between window exit ([`scan_cell_emitters`])
+/// and the next window entry ([`emit_cell_particles`]), while this client renders. Cells
+/// only change inside the simulation window (see [`crate::report`]), so the scan sees
+/// exactly the world the entry would have seen, and the views it uses are the ones the
+/// entry would use (they are republished only after the entry).
+struct Scan {
+    /// A scan is on the worker.
+    running: bool,
+    /// `found` holds the scan started at the last window exit.
+    ready: bool,
+    found: Vec<(i32, i32, u32)>,
+}
+
+type ScanJob = (u32, Vec<[i32; 4]>, Vec<(i32, i32, u32)>);
+
+static SCAN: std::sync::Mutex<Scan> = std::sync::Mutex::new(Scan { running: false, ready: false, found: Vec::new() });
+static SCAN_DONE: std::sync::Condvar = std::sync::Condvar::new();
+static SCAN_QUEUE: std::sync::Mutex<Option<std::sync::mpsc::Sender<ScanJob>>> = std::sync::Mutex::new(None);
+
+fn scan_state() -> std::sync::MutexGuard<'static, Scan> {
+    SCAN.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Wait for the scan started since the last window exit.
+fn join_scan() -> std::sync::MutexGuard<'static, Scan> {
+    let mut state = scan_state();
+    while state.running {
+        state = SCAN_DONE.wait(state).unwrap_or_else(|p| p.into_inner());
+    }
+    state
+}
+
+/// Wait for a running emitter scan (shutdown: the world may be torn down next).
+pub fn join_cell_emitters() {
+    drop(join_scan());
+}
+
+/// Start scanning for the next window entry's emitters on the worker (buffer swap after a
+/// window exit; without a worker the scan runs here).
+///
+/// # Safety
+/// Game thread, between window exit and the next entry.
+unsafe fn scan_cell_emitters() {
+    if !EMITTERS_ON.load(Ordering::Relaxed) || views::count() == 0 {
+        return;
+    }
+    let table = chunk_table();
+    if table == 0 {
+        return;
+    }
+    let mut state = join_scan();
+    let mut queue = SCAN_QUEUE.lock().unwrap_or_else(|p| p.into_inner());
+    if queue.is_none() {
+        let (tx, rx) = std::sync::mpsc::channel::<ScanJob>();
+        let worker = std::thread::Builder::new().name("noita-online-emitters".into()).spawn(move || {
+            for (table, rects, mut found) in rx {
+                found.clear();
+                // SAFETY: the world does not change before the next window entry joins this.
+                unsafe { find_emitters(table, &rects, &mut found) };
+                let mut state = scan_state();
+                state.found = found;
+                state.running = false;
+                SCAN_DONE.notify_all();
+            }
+        });
+        if worker.is_ok() {
+            *queue = Some(tx);
+        }
+    }
+    state.ready = true;
+    let job = (table, views::rects(), std::mem::take(&mut state.found));
+    let sent = match queue.as_ref() {
+        Some(tx) => tx.send(job).map_err(|e| e.0),
+        None => Err(job),
+    };
+    match sent {
+        Ok(()) => state.running = true,
+        Err((table, rects, mut found)) => {
+            found.clear();
+            find_emitters(table, &rects, &mut found);
+            state.found = found;
+        }
+    }
+}
+
 /// Emit this frame's material particle effects (window entry, simulation RNG bank loaded):
 /// what the grid render of every player's view would have queued at the end of the last
 /// frame, in a fixed order.
@@ -347,6 +477,10 @@ unsafe fn find_emitters(table: u32, rects: &[[i32; 4]], out: &mut Vec<(i32, i32,
 /// # Safety
 /// Game thread, inside the window, before the world update.
 pub unsafe fn emit_cell_particles() {
+    // A window exit not followed by a swap: the scan runs below instead.
+    SCAN_ARMED.store(false, Ordering::Relaxed);
+    let mut state = join_scan();
+    let ready = std::mem::replace(&mut state.ready, false);
     if !EMITTERS_ON.load(Ordering::Relaxed) || views::count() == 0 {
         return;
     }
@@ -355,21 +489,18 @@ pub unsafe fn emit_cell_particles() {
     if gg == 0 || table == 0 || rd(gg + 0x14) == 0 {
         return;
     }
-    thread_local! {
-        static FOUND: std::cell::RefCell<Vec<(i32, i32, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+    if !ready {
+        // No scan since the last window entry (the first window): scan here.
+        state.found.clear();
+        find_emitters(table, &views::rects(), &mut state.found);
     }
-    FOUND.with(|found| {
-        let mut found = found.borrow_mut();
-        found.clear();
-        find_emitters(table, &views::rects(), &mut found);
-        let emit: extern "thiscall" fn(u32, *const f32, u32) = std::mem::transmute(EMIT_EFFECT_FN as usize);
-        let this = rd(gg + 0x14);
-        for &(x, y, effect) in found.iter() {
-            // FUN_00724480: pos = (x - 0.0f, y - 1.0f)
-            let pos = [x as f32 - 0.0, y as f32 - 1.0];
-            emit(this, pos.as_ptr(), effect);
-        }
-    });
+    let emit: extern "thiscall" fn(u32, *const f32, u32) = std::mem::transmute(EMIT_EFFECT_FN as usize);
+    let this = rd(gg + 0x14);
+    for &(x, y, effect) in state.found.iter() {
+        // FUN_00724480: pos = (x - 0.0f, y - 1.0f)
+        let pos = [x as f32 - 0.0, y as f32 - 1.0];
+        emit(this, pos.as_ptr(), effect);
+    }
 }
 
 // --- rain and snow ------------------------------------------------------------------------
