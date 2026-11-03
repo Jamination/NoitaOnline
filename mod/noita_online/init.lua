@@ -364,12 +364,12 @@ function OnWorldPostUpdate()
         end
       end
       if f % 600 == 0 or us > 8000 then
-        local st = ffi.new("uint32_t[3]")
+        local st = ffi.new("uint32_t[6]")
         NO.lib.no_chunk_stats(st)
         local mem = ffi.new("uint32_t[2]")
         NO.lib.no_mem_stats(mem)
-        log(string.format("state report f=%d chunk-hash %.2f ms; chunk waits %d (%d ms), in-lock fallbacks %d; mem %d MiB, %d chunks loaded",
-          f, us / 1000, st[0], st[1], st[2], mem[0], mem[1]))
+        log(string.format("state report f=%d chunk-hash %.2f ms; chunk waits %d (%d ms), in-lock fallbacks %d (longest %d ms, last f=%d, timed out %d); mem %d MiB, %d chunks loaded",
+          f, us / 1000, st[0], st[1], st[2], st[3], st[4], st[5], mem[0], mem[1]))
       end
     end
     NO.lib.no_sim_leave()

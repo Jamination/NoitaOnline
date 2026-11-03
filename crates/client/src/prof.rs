@@ -211,9 +211,29 @@ static STEPLOG: LazyLock<Option<(u32, u32, Mutex<std::io::BufWriter<std::fs::Fil
 /// ...` lines) at the window entry and at the grid update's entry and exit.
 static STEPLOG_TILES: LazyLock<bool> = LazyLock::new(|| std::env::var_os("NOITA_ONLINE_STEPLOG_TILES").is_some());
 
+/// `NOITA_ONLINE_STEPLOG_LITE=1`: instead of one line per point, one `L <frame> <point>:<hash>
+/// ...` line per frame with [`crate::patches::step_hash`] at every point (cheap enough for a
+/// whole run; the full state of a differing point then needs a STEPLOG rerun).
+static STEPLOG_LITE: LazyLock<bool> = LazyLock::new(|| std::env::var_os("NOITA_ONLINE_STEPLOG_LITE").is_some());
+/// The LITE line being collected: (frame, text).
+static LITE_LINE: Mutex<(u32, String)> = Mutex::new((0, String::new()));
+
 /// Log the step state at `point` (`NOITA_ONLINE_STEPLOG`; no-op outside its frame range).
 pub(crate) fn step_mark(point: &str) {
     let Some((a, b, log)) = STEPLOG.as_ref() else { return };
+    if *STEPLOG_LITE {
+        if let Some((frame, h)) = unsafe { crate::patches::step_hash(*a, *b) } {
+            let mut line = LITE_LINE.lock().unwrap_or_else(|p| p.into_inner());
+            if line.0 != frame && !line.1.is_empty() {
+                let mut log = log.lock().unwrap_or_else(|p| p.into_inner());
+                let _ = writeln!(log, "L {}{}", line.0, line.1);
+                line.1.clear();
+            }
+            line.0 = frame;
+            line.1.push_str(&format!(" {point}:{h:08x}"));
+        }
+        return;
+    }
     if let Some((frame, state)) = unsafe { crate::patches::step_state(*a, *b) } {
         let mut log = log.lock().unwrap_or_else(|p| p.into_inner());
         let _ = writeln!(log, "{frame} {point} {state}");

@@ -35,7 +35,7 @@ Inside the window:
 |---|---|---|
 | `rand` | msvcr120 `rand` keeps per-thread state, and `srand(time)` seeds it. | Imports are replaced with one process-wide LCG; `srand` is ignored. |
 | `streamclock` | The streaming throttle runs on wall-clock time. | Uses game time (`frame / 60`). |
-| `chunkwait` | Generated chunks are integrated as soon as their worker job finishes, which depends on timing. | Gate integrated with a delay of 8 frames: a job is integrated exactly 8 frames after submission; the frame waits for it if needed. |
+| `chunkwait` | Generated chunks are integrated as soon as their worker job finishes, which depends on timing. | Gate integrated with a delay of 8 frames: a job is integrated exactly 8 frames after submission; the frame waits for it if needed. The wait happens at the start of the frame, outside any engine lock (`chunk_prewait`, judged by the frame the world update will run as, f + 1). A bounded in-lock wait inside the integration only catches jobs nothing pre-waited. If such a job is still unfinished after 5 s, it is integrated whenever it finishes; the state report counts these cases (`timed out`). |
 | `threaded_chunkgen` | (performance) Chunk generation costs 17–36 ms per chunk. | Stays on worker threads through an unpatched copy of the async submit. Its global-LCG write (the cell constructor's store) is removed; its cell RNG draws are `chunk_rng`'s. |
 | `chunk_rng` | Chunk jobs (`FUN_0073b040`: generation, or loading a chunk from the save) build cells with the real GridWorld, and the gas, fire and lifetime-liquid constructors (`FUN_0070a4a0`, `FUN_00709ef0`, `FUN_0070ae10`) draw the GridWorld's RNG (+4) for flags and lifetimes, on a worker thread, while the simulation draws the same RNG on the game thread. Which values each side got depended on thread timing, so reloaded gas, fire and liquid cells got client-specific flags and lifetimes (invisible to the material hash until they moved or expired differently) and the simulation's cells got client-specific values (seed 98765432 apart scene: a player returning home at f=2700 reloaded its chunks; first bad chunk at f=2893). | The chunk job runs through a wrapper that gives the thread its own LCG stream for the job, seeded from the session seed and the chunk's coordinates; the four constructor draws use it while a chunk job runs on their thread and the world's RNG everywhere else (game thread, grid tiles with their own RNG). |
 | `chunk_frame` | In the same chunk jobs, the fire and lifetime-liquid constructors (`FUN_00709ef0` @0x00709f6e, `FUN_0070ae10` @0x0070ae99) read the creation frame through the world's vtable+0x10, i.e. the GridWorld frame counter (+0x4fc) that the game thread increments at the start of every grid update. On a worker thread that is whatever frame the job happened to reach the cell in, so a generated or reloaded fire cell's age and a liquid's lifetime start (hence when it burns out or expires) depended on thread timing. Latent: no failing run traced to it. | The submit stub records the grid frame of each chunk job at submission (game thread, `CHUNKGEN_SUBMIT_CALL`); the job wrapper hands it to its thread, and the two constructor reads return it while a chunk job runs on their thread, the world's counter everywhere else. |
@@ -171,7 +171,11 @@ Diagnostics used to find the root causes above, enabled by environment variables
   window (a worker thread before `chunk_rng`). The `B` line (Box2D body motion hash) also
   carries `sleep=`, a hash of every body's awake/active flags and sleep time;
   `NOITA_ONLINE_RNGLOG_BODIES=1` adds one `b` line per body (hash, position, type `t`,
-  flags `f`, sleep time `s`).
+  flags `f`, sleep time `s`). The `G` line summarises the falling-sand state: the active
+  tile list (count, deferred count, order hash), a hash of every tile's RNG, the GridWorld
+  frame counter, the pending chunk jobs, and per GridParticles list its length and a hash
+  of the particles' positions and velocities. `run/fork9/rngcmp.py` finds the first
+  differing window edge and field.
 - `NOITA_ONLINE_WAKEWATCH=a-b`: hardware write watchpoints on the awake flag of up to four
   sleeping dynamic bodies (the same bodies on every client); every change is logged with the
   writing code's return-address chain and whether it happened inside the window, to
@@ -182,7 +186,11 @@ Diagnostics used to find the root causes above, enabled by environment variables
   (`s<i>`, RTTI names in `N` lines) and at window entry/exit. `NOITA_ONLINE_STEPLOG_TILES=1`
   adds, at window entry and around the grid update, the active tile list and every tile's
   RNG, material hash, rects and wake flags (`T` lines). `run/fork7/stepcmp.py` and
-  `tilecmp.py` find the first differing stage.
+  `tilecmp.py` find the first differing stage. With `NOITA_ONLINE_STEPLOG_LITE=1` each
+  frame is one `L` line of `point:hash` pairs (RNGs, GridWorld RNG, body count, particle
+  list lengths; no body motion hash), cheap enough for a whole run (`run/fork9/litecmp.py`).
+  Points outside the window hash this client's render RNG bank, so differences there are
+  expected.
 - `NOITA_ONLINE_RNGWATCH=a-b`: hardware write watchpoints on the global LCG, particle RNG,
   GridWorld RNG and `rand` state in every thread but the game thread while the window is
   open; each write is logged with its code chain (`rngwatch_<inst>.txt`, with a positive
@@ -209,4 +217,15 @@ Diagnostics used to find the root causes above, enabled by environment variables
 - `NOITA_ONLINE_CHUNKJOB_DELAY=<instance>:<ms>`: delays the start of every chunk job on that
   instance, as a stand-in for a slower or busier machine, so a race between chunk jobs and
   the simulation shows up on every run instead of now and then.
+- `NOITA_ONLINE_TILE_REVERSE=<instance>,...`: on those instances, a checkerboard pass's
+  pooled tiles are not submitted to the workers but run on the game thread at the end of
+  the pass's dispatch, in reverse order. Any dependence of a tile's result on the other
+  tiles of its pass then diverges from the other clients on every run.
+- `NOITA_ONLINE_HEAP_PAD=<instance>,...`: on those instances every `malloc` and `operator
+  new` allocates a pseudo-random 0–112 bytes more, so the relative order of heap addresses
+  differs from the other clients' far more often; simulation code ordered by pointer then
+  diverges on most runs.
+- The client log's `state report` lines carry the chunk gate's statistics: frames whose
+  prewait waited, in-lock fallback waits (longest wait, frame of the last one, and how many
+  were still unfinished after the 5 s bound, i.e. integrated at a timing-dependent frame).
 - `NOITA_ONLINE_PROF` / `NOITA_ONLINE_SAMPLE`: profilers.

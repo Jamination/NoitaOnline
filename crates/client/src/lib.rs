@@ -756,10 +756,11 @@ pub extern "C" fn no_chunk_prewait() -> u32 {
     0
 }
 
-/// Chunk-gate statistics: [frames that waited, total wait ms, in-lock fallback waits].
+/// Chunk-gate statistics: [frames that waited, total wait ms, in-lock fallback waits, longest
+/// fallback wait ms, frame of the last fallback, fallbacks that timed out].
 ///
 /// # Safety
-/// `out` must point at 3 writable u32.
+/// `out` must point at 6 writable u32.
 #[no_mangle]
 pub unsafe extern "C" fn no_chunk_stats(out: *mut u32) {
     #[cfg(all(windows, target_arch = "x86"))]
@@ -768,9 +769,12 @@ pub unsafe extern "C" fn no_chunk_stats(out: *mut u32) {
         *out = patches::CHUNK_WAITS.load(Relaxed);
         *out.add(1) = patches::CHUNK_WAIT_MS.load(Relaxed);
         *out.add(2) = patches::CHUNK_GATE_FALLBACKS.load(Relaxed);
+        *out.add(3) = patches::CHUNK_GATE_FALLBACK_MAX_MS.load(Relaxed);
+        *out.add(4) = patches::CHUNK_GATE_FALLBACK_FRAME.load(Relaxed);
+        *out.add(5) = patches::CHUNK_GATE_TIMEOUTS.load(Relaxed);
     }
     #[cfg(not(all(windows, target_arch = "x86")))]
-    std::ptr::write_bytes(out, 0, 3);
+    std::ptr::write_bytes(out, 0, 6);
 }
 
 static LAST_ERROR: Mutex<String> = Mutex::new(String::new());

@@ -205,7 +205,9 @@ pub unsafe fn chunk_prewait() -> u32 {
     if gg == 0 {
         return 0;
     }
-    let frame = rd(gg);
+    // The world update after `OnWorldPreUpdate(f)` runs as frame f + 1, and that is the
+    // frame [`chunk_gate_pre`] judges a job's age by.
+    let frame = rd(gg).wrapping_add(1);
     let jobs = chunk_jobs();
     let g = CHUNK_GATE.lock().unwrap_or_else(|p| p.into_inner());
     let Some(gate) = g.as_ref() else { return 0 };
@@ -253,6 +255,12 @@ extern "C" fn chunk_gate_pre() {
                         Sleep(1);
                     }
                     CHUNK_GATE_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                    CHUNK_GATE_FALLBACK_MAX_MS.fetch_max(t0.elapsed().as_millis() as u32, Ordering::Relaxed);
+                    CHUNK_GATE_FALLBACK_FRAME.store(frame, Ordering::Relaxed);
+                    if !job_done(job) {
+                        // Integrated whenever it finishes: a timing-dependent frame.
+                        CHUNK_GATE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 allowed.push(job);
             }
@@ -262,6 +270,11 @@ extern "C" fn chunk_gate_pre() {
 }
 
 pub static CHUNK_GATE_FALLBACKS: AtomicU32 = AtomicU32::new(0);
+/// The longest in-lock fallback wait (ms), the frame of the last fallback, and the fallbacks
+/// whose job was still unfinished after the 5 s bound.
+pub static CHUNK_GATE_FALLBACK_MAX_MS: AtomicU32 = AtomicU32::new(0);
+pub static CHUNK_GATE_FALLBACK_FRAME: AtomicU32 = AtomicU32::new(0);
+pub static CHUNK_GATE_TIMEOUTS: AtomicU32 = AtomicU32::new(0);
 
 /// After integration: integration is ungated again.
 extern "C" fn chunk_gate_post() {
@@ -617,7 +630,68 @@ unsafe fn patch_threaded_grid(ex: &mut Exec) -> Result<(), PatchError> {
     for site in GRID_TILE_SUBMIT_CALLS {
         redirect_call(site, POOL_GROUP_FN, copy)?;
     }
+    if tile_reverse_here() {
+        patch_tile_reverse(ex, copy)?;
+    }
     Ok(())
+}
+
+/// The checkerboard pass's pooled tile dispatch (`GRID_TILE_SUBMIT_CALLS[2]`): `call` with
+/// ECX = job group and the tile lambda (vtable `0x00ff97dc`, +4 = tile, invoke =
+/// `FUN_0072a150(tile)`) as the second stack argument; the callee pops 8 bytes.
+const GRID_PASS_SUBMIT_CALL: u32 = 0x0072_82b5;
+/// End of a pass's dispatch loop, before the join: `mov edi,[ebp-0x88]` (the job group).
+const GRID_PASS_JOIN: u32 = 0x0072_82fb;
+const GRID_PASS_JOIN_ORIG: [u8; 6] = [0x8B, 0xBD, 0x78, 0xFF, 0xFF, 0xFF];
+/// The tile update (thiscall, ECX = tile, no stack arguments).
+const TILE_UPDATE_FN: u32 = 0x0072_a150;
+
+/// Diagnostics: `NOITA_ONLINE_TILE_REVERSE=<instance>,...`: on those instances the pass's
+/// pooled tiles are not submitted but run on the game thread at the end of the pass's
+/// dispatch, in reverse order (after the tiles the pass runs inline anyway). That is a
+/// fixed, very different order of the tiles of one pass, so any dependence of a tile's
+/// result on what other tiles of its pass did shows up as a divergence from the other
+/// clients on every run, instead of now and then through thread timing.
+fn tile_reverse_here() -> bool {
+    let (Ok(v), Ok(inst)) = (std::env::var("NOITA_ONLINE_TILE_REVERSE"), std::env::var("NOITA_ONLINE_INSTANCE")) else {
+        return false;
+    };
+    v.split(',').any(|s| s.trim() == inst)
+}
+
+static DEFERRED_TILES: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// [`GRID_PASS_SUBMIT_CALL`] under `NOITA_ONLINE_TILE_REVERSE`: keep the tile for
+/// [`run_deferred_tiles`].
+unsafe extern "thiscall" fn defer_tile(_group: u32, _arg: u32, functor: u32) {
+    DEFERRED_TILES.lock().unwrap_or_else(|p| p.into_inner()).push(rd(functor + 4));
+}
+
+/// [`GRID_PASS_JOIN`] under `NOITA_ONLINE_TILE_REVERSE`: the deferred tiles, last first.
+extern "C" fn run_deferred_tiles() {
+    let tiles = std::mem::take(&mut *DEFERRED_TILES.lock().unwrap_or_else(|p| p.into_inner()));
+    unsafe {
+        let update: unsafe extern "thiscall" fn(u32) = std::mem::transmute(TILE_UPDATE_FN as usize);
+        for &tile in tiles.iter().rev() {
+            update(tile);
+        }
+    }
+}
+
+unsafe fn patch_tile_reverse(ex: &mut Exec, copy: u32) -> Result<(), PatchError> {
+    expect(GRID_PASS_JOIN, &GRID_PASS_JOIN_ORIG)?;
+    let defer: unsafe extern "thiscall" fn(u32, u32, u32) = defer_tile;
+    redirect_call(GRID_PASS_SUBMIT_CALL, copy, defer as usize as u32)?;
+    // pushad; mov eax,run_deferred_tiles; call eax; popad; mov edi,[ebp-0x88]; ret
+    let f = ((run_deferred_tiles as extern "C" fn()) as u32).to_le_bytes();
+    let mut stub = vec![0x60, 0xB8, f[0], f[1], f[2], f[3], 0xFF, 0xD0, 0x61];
+    stub.extend_from_slice(&GRID_PASS_JOIN_ORIG);
+    stub.push(0xC3);
+    let at = ex.put(&stub);
+    let mut call = vec![0xE8];
+    call.extend_from_slice(&rel32(GRID_PASS_JOIN + 5, at));
+    call.push(0x90);
+    write_code(GRID_PASS_JOIN, &call)
 }
 
 /// GridWorld::RenderTiles (FUN_00723650, called by FUN_00722ef0 after `OnWorldPostUpdate`,
@@ -719,8 +793,63 @@ pub unsafe fn apply_all() -> Result<u32, PatchError> {
         install_job_profiler(&mut ex)?;
     }
     crate::explosions::install_log()?;
+    install_heap_pad()?;
     APPLIED.store(count + 1, Ordering::Relaxed);
     Ok(count)
+}
+
+/// msvcr120 imports `malloc` and `operator new` (`??2@YAPAXI@Z`; it allocates inside
+/// msvcr120, not through the `malloc` import).
+const IAT_MALLOC: u32 = 0x00f0_74f0;
+const IAT_NEW: u32 = 0x00f0_7500;
+static ORIG_MALLOC: AtomicU32 = AtomicU32::new(0);
+static ORIG_NEW: AtomicU32 = AtomicU32::new(0);
+static HEAP_PAD_STATE: AtomicU32 = AtomicU32::new(0x9e37_79b9);
+
+/// 0-112 bytes (a pseudo-random multiple of 16) to add to an allocation.
+fn heap_pad() -> usize {
+    let next = |mut y: u32| {
+        y ^= y << 13;
+        y ^= y >> 17;
+        y ^ (y << 5)
+    };
+    let mut x = HEAP_PAD_STATE.load(Ordering::Relaxed);
+    loop {
+        match HEAP_PAD_STATE.compare_exchange_weak(x, next(x), Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return ((next(x) >> 8) & 7) as usize * 16,
+            Err(v) => x = v,
+        }
+    }
+}
+
+/// [`install_heap_pad`]'s `malloc` and `operator new`: more than asked for, so blocks land
+/// elsewhere relative to each other than on the other clients.
+extern "C" fn padded_malloc(size: usize) -> *mut u8 {
+    let f: extern "C" fn(usize) -> *mut u8 = unsafe { std::mem::transmute(ORIG_MALLOC.load(Ordering::Relaxed) as usize) };
+    f(size.saturating_add(heap_pad()))
+}
+extern "C" fn padded_new(size: usize) -> *mut u8 {
+    let f: extern "C" fn(usize) -> *mut u8 = unsafe { std::mem::transmute(ORIG_NEW.load(Ordering::Relaxed) as usize) };
+    f(size.saturating_add(heap_pad()))
+}
+
+/// Diagnostics: `NOITA_ONLINE_HEAP_PAD=<instance>,...`: on those instances every `malloc`
+/// and `operator new` after the patches are installed allocates a pseudo-random amount more
+/// ([`padded_malloc`]). The heap layout, and so the relative order of heap addresses, then
+/// differs from the other clients' far more often than through their own allocation
+/// histories, so simulation code that orders anything by pointer (a `std::map` keyed by
+/// pointer, a sort by address) diverges on most runs instead of now and then.
+unsafe fn install_heap_pad() -> Result<(), PatchError> {
+    let (Ok(v), Ok(inst)) = (std::env::var("NOITA_ONLINE_HEAP_PAD"), std::env::var("NOITA_ONLINE_INSTANCE")) else {
+        return Ok(());
+    };
+    if !v.split(',').any(|s| s.trim() == inst) {
+        return Ok(());
+    }
+    ORIG_MALLOC.store(rd(IAT_MALLOC), Ordering::Relaxed);
+    ORIG_NEW.store(rd(IAT_NEW), Ordering::Relaxed);
+    write_code(IAT_MALLOC, &((padded_malloc as extern "C" fn(usize) -> *mut u8) as u32).to_le_bytes())?;
+    write_code(IAT_NEW, &((padded_new as extern "C" fn(usize) -> *mut u8) as u32).to_le_bytes())
 }
 
 /// Job-pool submit routines profiled by [`install_job_profiler`]: (entry, 6-byte prologue,
@@ -1696,6 +1825,7 @@ unsafe fn rng_log(tag: char) {
             );
             let _ = writeln!(f, "V {frame} {tag} {}", crate::camreaders::debug_line());
             let _ = f.write_all(body_hash_lines(frame, tag, grid_world).as_bytes());
+            let _ = writeln!(f, "G {frame} {tag} {}", grid_summary(grid_world));
         }
         if tag == '<' && std::env::var_os("NOITA_ONLINE_RNGLOG_TILES").is_some() {
             let _ = f.write_all(grid_tiles_dump(frame).as_bytes());
@@ -1722,6 +1852,52 @@ unsafe fn body_hash_lines(frame: u32, tag: char, grid_world: u32) -> String {
         }
     });
     let _ = writeln!(out, "B {frame} {tag} {n} {all:08x} sleep={sleep:08x}");
+    out
+}
+
+/// Diagnostics for [`rng_log`]: a cheap summary of the falling-sand state that diverges before
+/// the global RNGs do: the active tile list (count, deferred count, order hash), a hash of
+/// every tile's RNG (tile map in key order), the GridWorld frame counter, and per GridParticles
+/// list (+0x34/+0x40/+0x4c, 0x70 bytes each) its length and a hash of the particles' positions
+/// and velocities (dwords 7..10).
+unsafe fn grid_summary(grid_world: u32) -> String {
+    use std::fmt::Write;
+    let fnv = |h: u32, v: u32| (h ^ v).wrapping_mul(0x0100_0193);
+    let mut out = String::new();
+    let imp = rd(grid_world + 0x5d0);
+    if imp != 0 {
+        let tile_id = |t: u32| ((rd(t + 0x540) & 0xffff) << 16) | (rd(t + 0x544) & 0xffff);
+        let (count, deferred) = (rd(imp), rd(imp + 0x30));
+        let mut order = 0x811c_9dc5u32;
+        for i in 0..count.min(65536) {
+            order = fnv(order, tile_id(rd(rd(imp + 4) + 4 * i)));
+        }
+        let (mut tiles, mut rng) = (0u32, 0x811c_9dc5u32);
+        for_each_tile(imp, |tile| {
+            tiles += 1;
+            rng = fnv(fnv(rng, tile_id(tile)), rd(tile + 4));
+        });
+        let _ = write!(out, "act={count} def={deferred} order={order:08x} tiles={tiles} trng={rng:08x}");
+    }
+    // Chunk jobs pending in the engine's map (submitted, not yet integrated).
+    let _ = write!(out, " gf={} jobs={}", rd(grid_world + 0x4fc), chunk_jobs().len());
+    let gp = rd(grid_world + 0x540);
+    if gp != 0 {
+        for list in [0x34u32, 0x40, 0x4c] {
+            let (b, e) = (rd(gp + list), rd(gp + list + 4));
+            let mut h = 0x811c_9dc5u32;
+            let mut n = 0u32;
+            let mut p = b;
+            while p < e && n < 1_000_000 {
+                for k in 7..11 {
+                    h = fnv(h, rd(p + 4 * k));
+                }
+                n += 1;
+                p += 0x70;
+            }
+            let _ = write!(out, " p{list:x}={n}/{h:08x}");
+        }
+    }
     out
 }
 
@@ -1778,6 +1954,44 @@ pub(crate) unsafe fn step_state(from: u32, to: u32) -> Option<(u32, String)> {
         if gw != 0 { rd(gw + 4) } else { 0 }
     );
     Some((frame, line))
+}
+
+/// Diagnostics for `NOITA_ONLINE_STEPLOG_LITE` ([`crate::prof`]): like [`step_state`], but one
+/// FNV hash of the window flag, every RNG, the GridWorld RNG, the Box2D body count and the
+/// three GridParticles list lengths (no body motion hash: cheap enough for a whole run).
+pub(crate) unsafe fn step_hash(from: u32, to: u32) -> Option<(u32, u32)> {
+    let gg = rd(GAME_GLOBAL_PTR);
+    let frame = if gg != 0 { rd(gg) } else { 0 };
+    if gg == 0 || frame < from || frame > to {
+        return None;
+    }
+    let fnv = |h: u32, v: u32| (h ^ v).wrapping_mul(0x0100_0193);
+    let s = RngBank::capture();
+    let wd = rd(gg + 0x0c);
+    let gw = if wd != 0 { rd(wd + 0x44) } else { 0 };
+    let mut h = 0x811c_9dc5u32;
+    let (pm, part) = (s.pm.to_bits(), s.particle.to_bits());
+    for v in [in_window() as u32, s.lcg, s.plat_a0, s.plat_a4, pm as u32, (pm >> 32) as u32, part as u32, (part >> 32) as u32, s.rand] {
+        h = fnv(h, v);
+    }
+    if gw != 0 {
+        h = fnv(h, rd(gw + 4));
+        let b2 = rd(gw + GW_B2WORLD);
+        let mut n = 0u32;
+        let mut body = if b2 != 0 { rd(b2 + 0x1922c) } else { 0 };
+        while body != 0 && n < 100_000 {
+            n += 1;
+            body = rd(body + 0xb8);
+        }
+        h = fnv(h, n);
+        let gp = rd(gw + 0x540);
+        if gp != 0 {
+            for list in [0x34u32, 0x40, 0x4c] {
+                h = fnv(h, rd(gp + list + 4).wrapping_sub(rd(gp + list)) / 0x70);
+            }
+        }
+    }
+    Some((frame, h))
 }
 
 /// Diagnostics: every 64x64 grid tile (tile map in key order) as `T frame x y rng` and the
