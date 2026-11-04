@@ -98,6 +98,14 @@ sequenceDiagram
   each client's own camera; a deterministic eviction replaces the engine's wall-clock one
   (vanilla's rule, applied per player).
 * Deaths do not end the run: a player at 0 HP becomes an invulnerable spectator.
+* **Robe colours** (`files/robes.lua`): during mod init, once the session's player list is
+  known, every slot after the first gets virtual copies (`mods/noita_online/robes/<k>/`) of
+  the player entity, its robe sprites (body, Lukki body, arm, the unlockable hat's two
+  sprites) and ragdoll images with the robe's three purple shades recoloured (alpha, skin,
+  belt and outlines unchanged), the cape's colours set as an override in the cape's Base,
+  and the sprites' stain UV maps copied to the paths the engine derives from the new image
+  paths (`data/generated/sprite_uv_maps/` + path with `/` → `.`). Slot k is loaded from its
+  copy. Purely visual: shapes, stains, ragdoll bodies and cape physics stay vanilla's.
 * **Off the game thread**: during the session the network thread sends once per frame,
   when the game queues its input: one packet with the input stream, the acks and the
   queued messages (state report, logs). Datagrams wake it at once (ticks are in the

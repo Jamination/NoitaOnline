@@ -8,6 +8,7 @@
 local Input = dofile_once("mods/noita_online/files/input.lua")
 local NO = dofile_once("mods/noita_online/files/native.lua")
 local LocalPrints = dofile_once("mods/noita_online/files/local_prints.lua")
+local Robes = dofile_once("mods/noita_online/files/robes.lua")
 
 local M = {}
 
@@ -71,8 +72,8 @@ function M.setup(proxy, ids, local_id)
   local x, y = EntityGetTransform(proxy)
   make_proxy_inert(proxy)
   M.proxy_controls = EntityGetFirstComponentIncludingDisabled(proxy, "ControlsComponent")
-  for _, id in ipairs(ids) do
-    local e = EntityLoad("data/entities/player.xml", x, y)
+  for i, id in ipairs(ids) do
+    local e = EntityLoad(Robes.entity_file(i), x, y)
     EntityAddTag(e, "noita_online_player")
     local controls = EntityGetFirstComponentIncludingDisabled(e, "ControlsComponent")
     ComponentSetValue2(controls, "enabled", false)

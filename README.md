@@ -63,6 +63,11 @@ Outputs: `target/release/noita-online-server` (Linux),
 All players must run the same Noita build (2025-01-25) and the same set of mods; the server
 rejects mismatches.
 
+Every player wears their own robe colour (body, arm and cape, also with the Lukki
+mutation), the same on every screen, by the player's place in the session: the first player
+keeps Noita's purple, then red, green, blue, yellow, orange, cyan, pink and white (a session
+of more than 9 players repeats them from red).
+
 ## Test
 
 See [docs/testing.md](docs/testing.md). In short:

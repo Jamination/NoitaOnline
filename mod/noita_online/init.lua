@@ -143,6 +143,10 @@ else
   log(string.format("session started: seed=%.0f delay=%d me=%d players=%s", info.seed, info.input_delay, info.player, table.concat(info.players, ",")))
 end
 
+-- Every player slot after the first wears its own robe colour (robes.lua); the files must be
+-- built during mod init, i.e. here, once the session's player list is known.
+if not solo then dofile_once(ROOT .. "robes.lua").install(#session.players, log) end
+
 -- Lockstep sessions stream chunks around every player (foci) with a deterministic unloader
 -- instead of the per-client camera and wall-clock unloader. The grid-update cap stays: it
 -- prefers tiles nearest the camera, which is the shared simulation camera in the window.
