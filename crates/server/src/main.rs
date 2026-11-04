@@ -3,6 +3,12 @@
 //! Hosts one lockstep session: clients connect over reliable UDP, the session starts once
 //! `--players` clients have joined, then the server relays every player's per-frame input
 //! as one ordered `Tick` per simulation frame and cross-checks clients' state hashes.
+//!
+//! A session is a series of runs (worlds). When every player has died at once the game is
+//! over: each client starts a new game and says `NextRun`; the server then drops it from the
+//! old run's ticks (like a departed player: the clients still on the game-over screen keep
+//! simulating the old world in lockstep), and once every client is ready it starts the next
+//! run with a new seed (`Start`, same roster), frames counting from 0 again.
 
 mod delay;
 mod lockstep;
@@ -30,11 +36,16 @@ struct Args {
     game_build: Option<String>,
     /// Session scenario name handed to every client (e.g. "bot" = scripted test session).
     scenario: String,
+    /// Share of a respawning player's gold lost (0..=1, rounded down to whole gold).
+    respawn_gold_loss: f32,
+    /// Number of inventory items (wands, flasks, other items) a respawning player loses.
+    respawn_item_loss: u32,
 }
 
 const USAGE: &str = "noita-online-server [--bind ADDR:PORT] [--players N] [--max-players N] [--seed N]
     [--input-delay FRAMES] [--netsim loss=0.05,latency=100,jitter=0] [--log-dir DIR]
-    [--exit-when-empty] [--game-build STRING] [--scenario NAME]";
+    [--exit-when-empty] [--game-build STRING] [--scenario NAME]
+    [--respawn-gold-loss FRACTION] [--respawn-item-loss N]";
 
 fn parse_args() -> Result<Args, String> {
     let mut a = Args {
@@ -48,6 +59,8 @@ fn parse_args() -> Result<Args, String> {
         exit_when_empty: false,
         game_build: None,
         scenario: String::new(),
+        respawn_gold_loss: 0.5,
+        respawn_item_loss: 1,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -72,6 +85,14 @@ fn parse_args() -> Result<Args, String> {
             "--exit-when-empty" => a.exit_when_empty = true,
             "--game-build" => a.game_build = Some(v()?),
             "--scenario" => a.scenario = v()?,
+            "--respawn-gold-loss" => {
+                let f: f32 = v()?.parse().map_err(|_| "bad --respawn-gold-loss")?;
+                if !(0.0..=1.0).contains(&f) {
+                    return Err("--respawn-gold-loss must be in 0..=1".into());
+                }
+                a.respawn_gold_loss = f;
+            }
+            "--respawn-item-loss" => a.respawn_item_loss = v()?.parse().map_err(|_| "bad --respawn-item-loss")?,
             "-h" | "--help" => return Err(USAGE.into()),
             _ => return Err(format!("unknown argument {k}\n{USAGE}")),
         }
@@ -92,6 +113,9 @@ struct Player {
     /// Input ack last sent to this client (resend promptly when it advances).
     sent_input_ack: u32,
     last_stream_send: Instant,
+    /// The client plays the current run (false: in the lobby, or it left the run and waits
+    /// for the next one).
+    in_run: bool,
 }
 
 /// While a client lacks ticks (or an input ack is news), repeat the stream this often. Every
@@ -147,7 +171,92 @@ fn elapsed_secs() -> f64 {
 
 enum Phase {
     Lobby,
-    Running { relay: lockstep::Relay, delay: delay::Controller, started: Instant, session_id: u64, seed: u32 },
+    Running { relay: lockstep::Relay, delay: delay::Controller, started: Instant, session_id: u64, seed: u32, run: u32 },
+}
+
+/// A finished run, for the summary.
+#[derive(Clone, Copy)]
+struct RunLog {
+    run: u32,
+    seed: u32,
+    frames: u32,
+    seconds: f64,
+}
+
+/// The world seed of run `run`: `--seed` itself for the first run and, for later runs, one
+/// derived from it (reproducible tests); random without `--seed`. Noita parses WORLD_SEED as
+/// a signed 32-bit int: 1..=i32::MAX.
+fn run_seed(fixed: Option<u32>, run: u32) -> u32 {
+    let v = match fixed {
+        Some(s) if run == 0 => return s,
+        Some(s) => {
+            // splitmix64 of (seed, run)
+            let mut x = ((s as u64) << 32 | run as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
+            x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            x ^ (x >> 31)
+        }
+        None => rudp_random(),
+    };
+    (v % i32::MAX as u64) as u32 + 1
+}
+
+/// The largest round trip among `ids` (each link's fastest sample once probed), for the
+/// input delay.
+fn max_rtt_us(server: &Server, ids: &[u8]) -> u64 {
+    ids.iter()
+        .filter_map(|i| server.connection(*i as u16))
+        .map(|c| if c.rtt_samples() > 0 { c.rtt_min_us() } else { c.rtt_us() })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Start run `run` for `ids` (every client that said hello): broadcast `Start` and return the
+/// running phase. `delay`: the run's input delay controller (its current delay is the start
+/// delay).
+#[allow(clippy::too_many_arguments)]
+fn start_run(
+    server: &mut Server,
+    logs: &mut Logs,
+    args: &Args,
+    players: &mut BTreeMap<u8, Player>,
+    ids: Vec<u8>,
+    run: u32,
+    session_id: u64,
+    delay: delay::Controller,
+    max_rtt: u64,
+) -> Phase {
+    let seed = run_seed(args.seed, run);
+    let input_delay = delay.delay();
+    let roster: Vec<(u8, String)> = ids.iter().map(|i| (*i, players[i].name.clone())).collect();
+    // Shared calendar for date/time-dependent content (weather, holidays).
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let params = format!(
+        "scenario={};time={};respawn_gold_loss={};respawn_item_loss={};run={run}",
+        args.scenario, now, args.respawn_gold_loss, args.respawn_item_loss
+    )
+    .into_bytes();
+    let start = ServerMsg::Start { run, seed, players: roster.clone(), input_delay, session_id, params };
+    let _ = server.broadcast(CH_RELIABLE, &start.encode());
+    server.flush();
+    for id in &ids {
+        if let Some(p) = players.get_mut(id) {
+            p.in_run = true;
+            p.tick_ack = 0;
+            p.sent_input_ack = 0;
+        }
+    }
+    logs.event(&format!(
+        "session {session_id:016x} run {run} started: seed={seed} input_delay={input_delay} (max rtt {max_rtt} us) players={roster:?}"
+    ));
+    Phase::Running {
+        relay: lockstep::Relay::new(ids, input_delay as u32),
+        delay,
+        started: Instant::now(),
+        session_id,
+        seed,
+        run,
+    }
 }
 
 fn main() {
@@ -185,6 +294,7 @@ fn run(args: Args) -> std::io::Result<()> {
     let mut players: BTreeMap<u8, Player> = BTreeMap::new();
     let mut departed: Vec<(u8, Player)> = Vec::new();
     let mut phase = Phase::Lobby;
+    let mut runs: Vec<RunLog> = Vec::new();
     let mut perf: BTreeMap<u8, PerfAgg> = BTreeMap::new();
     let cpu_start = metrics::process_cpu_time();
     let wall_start = Instant::now();
@@ -222,6 +332,7 @@ fn run(args: Args) -> std::io::Result<()> {
                             tick_ack: 0,
                             sent_input_ack: 0,
                             last_stream_send: Instant::now(),
+                            in_run: false,
                         },
                     );
                 }
@@ -281,20 +392,28 @@ fn run(args: Args) -> std::io::Result<()> {
                                 players.iter().filter(|(_, p)| p.hello).map(|(i, p)| (*i, p.name.clone())).collect();
                             let _ = server.broadcast(CH_RELIABLE, &ServerMsg::Lobby { players: roster, needed: args.players }.encode());
                         }
-                        ClientMsg::Inputs { tick_ack, first, inputs } => {
-                            if let Phase::Running { relay, .. } = &mut phase {
-                                for (i, data) in inputs.iter().enumerate() {
-                                    relay.submit(id, first + i as u32, data);
-                                }
+                        ClientMsg::Inputs { run, tick_ack, first, inputs } => {
+                            // A late datagram of an earlier run, or one sent before the server
+                            // saw the client leave its run, is ignored.
+                            let Phase::Running { relay, run: current, .. } = &mut phase else { continue };
+                            let Some(p) = players.get_mut(&id) else { continue };
+                            if run != *current || !p.in_run {
+                                continue;
                             }
-                            if let Some(p) = players.get_mut(&id) {
-                                p.tick_ack = p.tick_ack.max(tick_ack);
+                            for (i, data) in inputs.iter().enumerate() {
+                                relay.submit(id, first + i as u32, data);
                             }
+                            p.tick_ack = p.tick_ack.max(tick_ack);
                         }
                         ClientMsg::StateHash { frame, entities, chunks, positions } => {
-                            if let Phase::Running { relay, .. } = &phase {
+                            // Reliable and ordered: a client's reports before its NextRun are
+                            // its run's, after the next Start the next run's.
+                            if let Phase::Running { relay, run, .. } = &phase {
+                                if !players.get(&id).is_some_and(|p| p.in_run) {
+                                    continue;
+                                }
                                 let active = relay.active().to_vec();
-                                for o in verifier.add(frame, id, verify::Report { entities, chunks, positions }, &active) {
+                                for o in verifier.add(*run, frame, id, verify::Report { entities, chunks, positions }, &active) {
                                     if o.chunk_mismatches > 0 || o.position_mismatches > 0 {
                                         logs.event(&format!("MISMATCH {o:?}"));
                                     }
@@ -332,6 +451,22 @@ fn run(args: Args) -> std::io::Result<()> {
                         ClientMsg::Ping { t } => {
                             let _ = server.send(client, CH_UNRELIABLE, &ServerMsg::Pong { t }.encode());
                         }
+                        ClientMsg::NextRun { run: next } => {
+                            // The client left the run (all players dead, it started a new
+                            // game): the run's ticks stop waiting for and carrying it, as for a
+                            // departed player; the next run starts once every client is ready.
+                            let Phase::Running { relay, run, .. } = &mut phase else { continue };
+                            let Some(p) = players.get_mut(&id) else { continue };
+                            if next != *run + 1 || !p.in_run {
+                                logs.event(&format!("client {id}: NextRun({next}) ignored in run {run}"));
+                                continue;
+                            }
+                            p.in_run = false;
+                            p.tick_ack = 0;
+                            p.sent_input_ack = 0;
+                            relay.remove(id);
+                            logs.event(&format!("client {id} left run {run} at frame {}, ready for run {next}", relay.next_frame()));
+                        }
                     }
                 }
             }
@@ -366,45 +501,44 @@ fn run(args: Args) -> std::io::Result<()> {
                     }
                 } else {
                     rtt_settle = None;
-                    // Noita parses WORLD_SEED as a signed 32-bit int: keep it in 1..=i32::MAX.
-                    let seed = args.seed.unwrap_or_else(|| (rudp_random() % i32::MAX as u64) as u32 + 1);
                     let session_id = rudp_random();
-                    let roster: Vec<(u8, String)> = ready.iter().map(|i| (*i, players[i].name.clone())).collect();
-                    let max_rtt = ready
-                        .iter()
-                        .filter_map(|i| server.connection(*i as u16))
-                        .map(|c| if c.rtt_samples() > 0 { c.rtt_min_us() } else { c.rtt_us() })
-                        .max()
-                        .unwrap_or(0);
+                    let max_rtt = max_rtt_us(&server, &ready);
                     let input_delay = args.input_delay.unwrap_or_else(|| delay::initial(max_rtt));
-                    // Shared calendar for date/time-dependent content (weather, holidays).
-                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-                    let params = format!("scenario={};time={}", args.scenario, now).into_bytes();
-                    let start = ServerMsg::Start { seed, players: roster.clone(), input_delay, session_id, params };
-                    let _ = server.broadcast(CH_RELIABLE, &start.encode());
-                    logs.event(&format!(
-                        "session {session_id:016x} started: seed={seed} input_delay={input_delay} (max rtt {} us) players={roster:?}",
-                        max_rtt
-                    ));
-                    phase = Phase::Running {
-                        relay: lockstep::Relay::new(ready, input_delay as u32),
-                        delay: delay::Controller::new(input_delay, args.input_delay.is_none(), max_rtt),
-                        started: Instant::now(),
-                        session_id,
-                        seed,
-                    };
+                    let delay = delay::Controller::new(input_delay, args.input_delay.is_none(), max_rtt);
+                    runs.clear();
+                    phase = start_run(&mut server, &mut logs, &args, &mut players, ready, 0, session_id, delay, max_rtt);
                     had_session = true;
                 }
             }
         }
 
-        if let Phase::Running { relay, .. } = &mut phase {
+        // Next run once every client left the current one (all ready).
+        let all_ready = matches!(phase, Phase::Running { .. })
+            && players.values().any(|p| p.hello)
+            && players.values().filter(|p| p.hello).all(|p| !p.in_run);
+        if all_ready {
+            if let Phase::Running { relay, delay, started, session_id, seed, run } = std::mem::replace(&mut phase, Phase::Lobby) {
+                for o in verifier.end_run(run) {
+                    if o.chunk_mismatches > 0 || o.position_mismatches > 0 {
+                        logs.event(&format!("MISMATCH {o:?}"));
+                    }
+                }
+                runs.push(RunLog { run, seed, frames: relay.next_frame(), seconds: started.elapsed().as_secs_f64() });
+                let ids: Vec<u8> = players.iter().filter(|(_, p)| p.hello).map(|(i, _)| *i).collect();
+                let max_rtt = max_rtt_us(&server, &ids);
+                // The input delay carries over (same network); its adaptation starts afresh.
+                let delay = delay::Controller::new(delay.delay(), args.input_delay.is_none(), max_rtt);
+                phase = start_run(&mut server, &mut logs, &args, &mut players, ids, run + 1, session_id, delay, max_rtt);
+            }
+        }
+
+        if let Phase::Running { relay, run, .. } = &mut phase {
             let emitted = relay.advance();
             ticks_sent += emitted as u64;
             let now = Instant::now();
             let mut sent_any = false;
             for (id, p) in players.iter_mut() {
-                if !relay.active().contains(id) {
+                if !p.in_run || !relay.active().contains(id) {
                     continue;
                 }
                 let input_ack = relay.input_ack(*id);
@@ -416,7 +550,7 @@ fn run(args: Args) -> std::io::Result<()> {
                     continue;
                 }
                 let (first, ticks) = relay.ticks_from(p.tick_ack, protocol::STREAM_BUDGET);
-                let msg = ServerMsg::Ticks { input_ack, first, ticks };
+                let msg = ServerMsg::Ticks { run: *run, input_ack, first, ticks };
                 let _ = server.send(*id as u16, CH_UNRELIABLE, &msg.encode());
                 p.sent_input_ack = input_ack;
                 p.last_stream_send = now;
@@ -453,12 +587,12 @@ fn run(args: Args) -> std::io::Result<()> {
                     );
                 }
             }
-            write_summary(&logs, &args, &phase, &players, &departed, &perf, &verifier, cpu_start, wall_start, cpu_peak, ticks_sent, delay_changes);
+            write_summary(&logs, &args, &phase, &runs, &players, &departed, &perf, &verifier, cpu_start, wall_start, cpu_peak, ticks_sent, delay_changes);
         }
 
         if args.exit_when_empty && had_session && players.is_empty() {
             logs.event("all players left; exiting");
-            write_summary(&logs, &args, &phase, &players, &departed, &perf, &verifier, cpu_start, wall_start, cpu_peak, ticks_sent, delay_changes);
+            write_summary(&logs, &args, &phase, &runs, &players, &departed, &perf, &verifier, cpu_start, wall_start, cpu_peak, ticks_sent, delay_changes);
             return Ok(());
         }
         if players.is_empty() {
@@ -477,6 +611,7 @@ fn write_summary(
     logs: &Logs,
     args: &Args,
     phase: &Phase,
+    runs: &[RunLog],
     players: &BTreeMap<u8, Player>,
     departed: &[(u8, Player)],
     perf: &BTreeMap<u8, PerfAgg>,
@@ -493,21 +628,36 @@ fn write_summary(
     let t = v.totals;
     let mut s = String::new();
     s.push_str("{\n");
-    if let Phase::Running { relay, delay, started, session_id, seed } = phase {
+    // Runs: the finished ones, then the current one.
+    let mut all_runs = runs.to_vec();
+    if let Phase::Running { relay, delay, started, session_id, seed, run } = phase {
         s.push_str(&format!(
-            "  \"session\": {{\"id\": \"{session_id:016x}\", \"seed\": {seed}, \"frame\": {}, \"seconds\": {:.1}, \"input_delay\": {}, \"input_delay_changes\": {delay_changes}}},\n",
+            "  \"session\": {{\"id\": \"{session_id:016x}\", \"run\": {run}, \"seed\": {seed}, \"frame\": {}, \"seconds\": {:.1}, \"input_delay\": {}, \"input_delay_changes\": {delay_changes}}},\n",
             relay.next_frame(),
             started.elapsed().as_secs_f64(),
             delay.delay()
         ));
+        all_runs.push(RunLog { run: *run, seed: *seed, frames: relay.next_frame(), seconds: started.elapsed().as_secs_f64() });
     }
+    s.push_str("  \"runs\": [");
+    for (n, r) in all_runs.iter().enumerate() {
+        let t = v.run_totals.get(&r.run).copied().unwrap_or_default();
+        s.push_str(&format!(
+            "{}\n    {{\"run\": {}, \"seed\": {}, \"frames\": {}, \"seconds\": {:.1}, \"checkpoints\": {}, \"chunk_comparisons\": {}, \"chunk_mismatches\": {}, \"position_comparisons\": {}, \"position_mismatches\": {}, \"entity_hash_mismatches\": {}}}",
+            if n > 0 { "," } else { "" },
+            r.run, r.seed, r.frames, r.seconds, t.checkpoints, t.chunk_comparisons, t.chunk_mismatches, t.position_comparisons,
+            t.position_mismatches, t.entity_hash_mismatches
+        ));
+    }
+    s.push_str("\n  ],\n");
     s.push_str(&format!("  \"players_required\": {},\n", args.players));
     s.push_str(&format!("  \"ticks_sent\": {ticks},\n"));
     s.push_str(&format!(
-        "  \"verification\": {{\"checkpoints\": {}, \"chunk_comparisons\": {}, \"chunk_mismatches\": {}, \"position_comparisons\": {}, \"position_mismatches\": {}, \"entity_hash_mismatches\": {}, \"partial_chunk_sets\": {}, \"first_mismatch_frame\": {}}},\n",
+        "  \"verification\": {{\"checkpoints\": {}, \"chunk_comparisons\": {}, \"chunk_mismatches\": {}, \"position_comparisons\": {}, \"position_mismatches\": {}, \"entity_hash_mismatches\": {}, \"partial_chunk_sets\": {}, \"first_mismatch_run\": {}, \"first_mismatch_frame\": {}}},\n",
         t.checkpoints, t.chunk_comparisons, t.chunk_mismatches, t.position_comparisons, t.position_mismatches,
         t.entity_hash_mismatches, t.partial_chunk_sets,
-        v.first_mismatch().map_or("null".to_string(), |f| f.to_string())
+        v.first_mismatch().map_or("null".to_string(), |(r, _)| r.to_string()),
+        v.first_mismatch().map_or("null".to_string(), |(_, f)| f.to_string())
     ));
     s.push_str(&format!(
         "  \"server_cpu\": {{\"avg_cores\": {:.4}, \"peak_cores_1s\": {:.4}, \"wall_seconds\": {:.1}}},\n",

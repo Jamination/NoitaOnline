@@ -281,6 +281,15 @@ pub fn local_camera() -> Option<Camera> {
     *LOCAL_CAMERA.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// New run (`no_next_run`): no views and no player cameras until the new run's ticks bring
+/// them (the clients left the old run at different frames, so their last decoded cameras
+/// differ).
+pub fn reset_run() {
+    COUNT.store(0, Ordering::Release);
+    *CAMERAS.lock().unwrap_or_else(|p| p.into_inner()) = [None; 128];
+    set_local_camera(None);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -87,8 +87,12 @@ harness/evaluate.py --run run/e2e/full --baseline run/e2e/baseline --netsim-run 
 The goal is the base game's behaviour; these are the deviations multiplayer forces.
 
 - Lockstep: a session starts with all players present; players cannot join mid-session.
-  A player who leaves or dies (also as a polymorphed creature) becomes a frozen spectator
-  instead of ending the run for everyone. Starting a new game ends that client's session
+  A player who leaves becomes a frozen spectator instead of ending the run for everyone.
+  When every player is dead at the same time the game is over for everyone: each player
+  sees vanilla's game-over screen, and its **New game** joins the session's next run, a new
+  world (new seed) in which all players spawn together as at the session start; the run
+  starts once every player pressed New game (the others keep seeing the old world until
+  then). Starting a new game from the pause menu during a run ends that client's session
   (restart Noita to join another).
 - Input latency: your inputs take effect after the session's input delay, the frames an
   input needs to reach every client: 1 frame (17 ms) on a LAN, about the round trip over the

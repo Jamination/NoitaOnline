@@ -98,36 +98,48 @@ local function quit_game(reason)
 end
 
 -- 1. Session setup (before the world exists).
-if NO.lib.no_status() ~= NO.STATUS.idle then
-  -- A new game in the same process (e.g. after a game over): the lockstep session belongs
-  -- to the previous world, which only this client left, so it cannot continue it.
-  log("new game after a session in this process: leaving the session, playing offline")
-  NO.lib.no_shutdown()
-  GamePrint("Noita Online: session ended (new game started); restart Noita to join again")
-  return
+-- init.lua runs again for every new game in this process. After a run in which every player
+-- died (nextrun.lua) the new game is the session's next run, in a new world: the client
+-- runtime resets everything of the old world and tells the server this client is ready
+-- (no_next_run), then the session start below repeats. A new game while the run goes on
+-- (New game from the pause menu) leaves the session: the run's world is still being played
+-- by the others, and this client cannot rejoin it.
+local NextRun = nil
+local next_run = nil
+if not solo and NO.lib.no_status() ~= NO.STATUS.idle then
+  next_run = NO.lib.no_next_run()
+  if next_run < 0 then
+    log("new game during a run: leaving the session, playing offline")
+    NO.lib.no_shutdown()
+    GamePrint("Noita Online: session ended (new game started); restart Noita to join again")
+    return
+  end
+  log("new game after the run ended: ready for run " .. next_run)
 end
 if solo then
   session = { seed = cfg.solo_seed, input_delay = 0, player = 0, players = { 0 }, scenario = cfg.bot and "bot" or "" }
   log("solo baseline mode, seed " .. session.seed)
   NO.lib.no_prof_install()
 else
-  local count = NO.lib.no_apply_patches()
-  if count < 0 then
-    log("FATAL: determinism patches failed: " .. NO.last_error())
-    error("noita_online: " .. NO.last_error())
+  if not next_run then
+    local count = NO.lib.no_apply_patches()
+    if count < 0 then
+      log("FATAL: determinism patches failed: " .. NO.last_error())
+      error("noita_online: " .. NO.last_error())
+    end
+    log(string.format("determinism patches applied (%d)", count))
+    -- Every client must run the same mods (they change the simulation); the server compares this.
+    local mods = ModGetActiveModIDs() or {}
+    table.sort(mods)
+    local mod_hash = 5381
+    for _, ch in ipairs({ string.byte(table.concat(mods, ",") .. "|" .. Config.MOD_VERSION, 1, -1) }) do
+      mod_hash = (mod_hash * 33 + ch) % 4294967296
+    end
+    log("active mods: " .. table.concat(mods, ","))
+    local rc = NO.lib.no_connect(cfg.server, cfg.name, Config.GAME_BUILD, mod_hash, cfg.netsim or "")
+    if rc ~= 0 then error("noita_online: connect failed (" .. rc .. ")") end
+    log("connecting to " .. cfg.server .. " as " .. cfg.name)
   end
-  log(string.format("determinism patches applied (%d)", count))
-  -- Every client must run the same mods (they change the simulation); the server compares this.
-  local mods = ModGetActiveModIDs() or {}
-  table.sort(mods)
-  local mod_hash = 5381
-  for _, ch in ipairs({ string.byte(table.concat(mods, ",") .. "|" .. Config.MOD_VERSION, 1, -1) }) do
-    mod_hash = (mod_hash * 33 + ch) % 4294967296
-  end
-  log("active mods: " .. table.concat(mods, ","))
-  local rc = NO.lib.no_connect(cfg.server, cfg.name, Config.GAME_BUILD, mod_hash, cfg.netsim or "")
-  if rc ~= 0 then error("noita_online: connect failed (" .. rc .. ")") end
-  log("connecting to " .. cfg.server .. " as " .. cfg.name)
   local st = -1
   while st == -1 do
     st = NO.lib.no_wait_started(1000)
@@ -140,12 +152,28 @@ else
   session = info
   -- Scenario comes from the server so every client runs the same world events.
   session.scenario = info.params.scenario or ""
-  log(string.format("session started: seed=%.0f delay=%d me=%d players=%s", info.seed, info.input_delay, info.player, table.concat(info.players, ",")))
+  -- The run (world) of the session: 0 first, then one more after every all-dead game over.
+  session.run = tonumber(info.params.run) or 0
+  log(string.format("session started: run=%d seed=%.0f delay=%d me=%d players=%s", session.run, info.seed, info.input_delay, info.player, table.concat(info.players, ",")))
+  NextRun = dofile_once(ROOT .. "nextrun.lua")
+  NextRun.log = log
 end
 
 -- Every player slot after the first wears its own robe colour (robes.lua); the files must be
 -- built during mod init, i.e. here, once the session's player list is known.
 if not solo then dofile_once(ROOT .. "robes.lua").install(#session.players, log) end
+
+-- Respawn penalty (server options, sent in the Start params: the same for every client) and
+-- the session seed (it draws the lost item). Everyone dead: vanilla's game over for all,
+-- then a new run in a new world (nextrun.lua).
+Players.params = {
+  gold_loss = tonumber(session.params and session.params.respawn_gold_loss) or 0.5,
+  item_loss = tonumber(session.params and session.params.respawn_item_loss) or 1,
+  seed = session.seed,
+}
+if not solo then
+  Players.on_all_dead = function(f) dofile_once(ROOT .. "nextrun.lua").all_dead(f) end
+end
 
 -- Lockstep sessions stream chunks around every player (foci) with a deterministic unloader
 -- instead of the per-client camera and wall-clock unloader. The grid-update cap stays: it
@@ -163,10 +191,12 @@ ModMagicNumbersFileAdd("mods/noita_online/files/session_magic.xml")
 
 function OnMagicNumbersAndWorldSeedInitialized()
   if not solo then NO.lib.no_fix_seeds(session.seed) end
+  log("magic numbers and world seed initialized: world_seed=" .. tostring(StatsGetValue("world_seed")) .. " frame=" .. GameGetFrameNum())
 end
 
 function OnWorldInitialized()
   if not solo then NO.lib.no_fix_seeds(session.seed) end
+  log("world initialized: world_seed=" .. tostring(StatsGetValue("world_seed")) .. " frame=" .. GameGetFrameNum())
 end
 
 function OnPlayerDied(player)
@@ -206,7 +236,10 @@ local function local_input(f)
     local slot = Players.local_slot()
     local px, py = 0, 0
     if slot and EntityGetIsAlive(slot.entity) then px, py = EntityGetTransform(slot.entity) end
-    local s = Players.bot_ops(Bot.input(session.player, f, px, py))
+    local s = Bot.input(session.player, f, px, py)
+    -- A dead bot picks where to respawn as a player would in the picker.
+    if Players.local_dead() then s.respawn = Bot.respawn_choice(f, slot, Players.slots) end
+    s = Players.bot_ops(s)
     -- Diagnostics (LADDER nudge<N>): one extra frame of "Right" at frame N sends the bot down
     -- another trajectory (deterministic per N), to sample session trajectories like the solo
     -- baseline's run-to-run ones.
@@ -261,11 +294,18 @@ local foci_buf = ffi.new("int32_t[128]")
 local centre_buf = ffi.new("float[64]")
 local id_buf = ffi.new("uint8_t[32]")
 
+-- A dead player keeps its view where it died (vanilla's game over leaves the camera there,
+-- and the world around it keeps loading and running), until it respawns.
 local function current_foci()
   local foci = {}
   for _, slot in ipairs(Players.slots) do
-    if EntityGetIsAlive(slot.entity) then
-      local x, y = EntityGetTransform(slot.entity)
+    local x, y
+    if slot.dead then
+      x, y = slot.death_x, slot.death_y
+    elseif EntityGetIsAlive(slot.entity) then
+      x, y = EntityGetTransform(slot.entity)
+    end
+    if x then
       x, y = math.floor(x), math.floor(y)
       foci[#foci + 1] = { x - FOCUS_HW, y - FOCUS_HH, x + FOCUS_HW, y + FOCUS_HH, x = x, y = y, id = slot.id, own = slot.id == Players.local_id }
     end
@@ -325,6 +365,19 @@ local PCLOG = os.getenv("NOITA_ONLINE_PCLOG")
 
 local in_sim_window = false
 
+-- The session scenario's world events (inside the window, every client).
+local function scenario_events(f)
+  local sc = session.scenario
+  if sc == "bot" then Bot.world_events(f, Players.slots)
+  elseif sc == "items" then Bot.items_events(f, Players.slots)
+  elseif sc == "death" then Bot.death_events(f, Players.slots, tonumber(session.params and session.params.run) or 0)
+  elseif sc == "restart" then
+    -- Test of the next run (nextrun.lua): the bot scenario, all dead at a fixed frame of run 0.
+    Bot.world_events(f, Players.slots)
+    NextRun.restart_events(f, session.run)
+  end
+end
+
 function OnWorldPreUpdate()
   if finished then return end
   local f = GameGetFrameNum()
@@ -333,8 +386,7 @@ function OnWorldPreUpdate()
     if ready then
       local s = local_input(f)
       Players.apply_tick(f, { [0] = Input.encode(s) })
-      if session.scenario == "bot" then Bot.world_events(f, Players.slots)
-      elseif session.scenario == "items" then Bot.items_events(f, Players.slots) end
+      scenario_events(f)
     end
     return
   end
@@ -377,19 +429,48 @@ function OnWorldPreUpdate()
     NO.lib.no_stream_views()
     NO.lib.no_evict_chunks(foci_buf, #foci, f)
     NO.lib.no_local_view(own)
-    if session.scenario == "bot" then Bot.world_events(f, Players.slots)
-    elseif session.scenario == "items" then Bot.items_events(f, Players.slots) end
+    scenario_events(f)
   else
     -- Before the players exist: the camera's loads (world creation's start camera).
     NO.lib.no_stream_views()
   end
 end
 
+-- Damage the players took (files/damage_log.lua records it in a world global, identically on
+-- every client), drained at the end of every simulation step and written to the client log
+-- with NOITA_ONLINE_DEBUG=1: "damage slot=<player> f=<frame> e=<entity> amount=<HP>
+-- msg=<damage message> source=<responsible entity's file> projectile=<file> fatal=<bool>
+-- hp=<HP at the callback> hp_after=<HP at the end of the step>".
+local DAMAGE_KEY = "noita_online_damage"
+local function drain_damage_log()
+  local d = GlobalsGetValue(DAMAGE_KEY, "")
+  if d == "" then return end
+  GlobalsSetValue(DAMAGE_KEY, "")
+  if not cfg.debug then return end
+  for line in d:gmatch("[^\n]+") do
+    local f, e, amount, msg, src, proj, fatal, hp = line:match("^(%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+) (%S+)$")
+    e = tonumber(e)
+    local who, after = "?", "-"
+    for _, slot in ipairs(Players.slots) do
+      if slot.entity == e then who = tostring(slot.id) end
+    end
+    if e and EntityGetIsAlive(e) then
+      local dm = EntityGetFirstComponentIncludingDisabled(e, "DamageModelComponent")
+      if dm then after = string.format("%.3f", ComponentGetValue2(dm, "hp") * 25) end
+    end
+    log(string.format("damage slot=%s f=%s e=%s amount=%s msg=%s source=%s projectile=%s fatal=%s hp=%s hp_after=%s",
+      who, tostring(f), tostring(e), tostring(amount), tostring(msg), tostring(src), tostring(proj), tostring(fatal), tostring(hp), after))
+  end
+end
+
+local new_game_pressed = false
+
 function OnWorldPostUpdate()
   if finished then return end
   local f = GameGetFrameNum()
   if in_sim_window then
     if ready then douse_free_camera_light() end
+    if ready then drain_damage_log() end
     if LatProbe.on then
       local slot = Players.local_slot()
       LatProbe.post(slot and slot.entity)
@@ -469,7 +550,21 @@ function OnWorldPostUpdate()
         render_mouse = { DEBUG_GetMouseWorld() }
       end
       Players.gui_update()
+      Players.after_window()
+      -- Death scenario, everyone dead: each bot presses the game-over menu's New game, a few
+      -- seconds apart (nextrun.lua: the next run in a new world).
+      if cfg.bot and session.scenario == "death" and Players.all_dead and not new_game_pressed
+        and f >= Players.all_dead_frame + 120 + 180 * session.player then
+        new_game_pressed = true
+        log("death scenario: pressing New game at frame " .. f)
+        dofile_once(ROOT .. "nextrun.lua").press_new_game()
+      end
+      if cfg.bot and session.scenario == "restart" then NextRun.restart_post(f, session.run, session.player) end
     end
+  end
+  if solo and ready then
+    drain_damage_log()
+    Players.after_window()
   end
   if solo and ready and LADDER.freecam then
     douse_free_camera_light()

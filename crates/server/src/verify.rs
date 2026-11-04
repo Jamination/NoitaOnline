@@ -1,5 +1,7 @@
 //! Cross-client state verification: collects per-frame state-hash reports from every
-//! player and compares world chunks and tracked entity positions exactly.
+//! player and compares world chunks and tracked entity positions exactly. Frames restart at
+//! 0 with every run (a new world after an all-dead game over), so reports are kept per
+//! (run, frame) and totals are also kept per run.
 
 use protocol::{ChunkHash, EntityPos};
 use std::collections::{BTreeMap, HashMap};
@@ -26,14 +28,18 @@ pub struct Totals {
 }
 
 pub struct Verifier {
-    pending: BTreeMap<u32, HashMap<u8, Report>>,
+    /// Reports by (run, frame).
+    pending: BTreeMap<(u32, u32), HashMap<u8, Report>>,
+    /// All runs.
     pub totals: Totals,
+    pub run_totals: BTreeMap<u32, Totals>,
     out: Option<std::fs::File>,
-    first_mismatch: Option<u32>,
+    first_mismatch: Option<(u32, u32)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Outcome {
+    pub run: u32,
     pub frame: u32,
     pub players: usize,
     pub common_chunks: usize,
@@ -49,31 +55,41 @@ pub struct Outcome {
 
 impl Verifier {
     pub fn new(out: Option<std::fs::File>) -> Self {
-        Self { pending: BTreeMap::new(), totals: Totals::default(), out, first_mismatch: None }
+        Self { pending: BTreeMap::new(), totals: Totals::default(), run_totals: BTreeMap::new(), out, first_mismatch: None }
     }
 
-    pub fn first_mismatch(&self) -> Option<u32> {
+    /// (run, frame) of the first checkpoint with a chunk or position mismatch.
+    pub fn first_mismatch(&self) -> Option<(u32, u32)> {
         self.first_mismatch
     }
 
-    /// Record a report; once every player in `active` has reported `frame`, compare and
-    /// return the outcome. Older incomplete frames are evaluated with whoever reported
-    /// (a player that left mid-way must not stall verification).
-    pub fn add(&mut self, frame: u32, player: u8, report: Report, active: &[u8]) -> Vec<Outcome> {
-        self.pending.entry(frame).or_default().insert(player, report);
-        let mut done = Vec::new();
-        let ready: Vec<u32> = self
+    /// Record a report of run `run`; once every player in `active` (the run's players) has
+    /// reported `frame`, compare and return the outcome. Older incomplete frames are evaluated
+    /// with whoever reported (a player that left mid-way must not stall verification).
+    pub fn add(&mut self, run: u32, frame: u32, player: u8, report: Report, active: &[u8]) -> Vec<Outcome> {
+        self.pending.entry((run, frame)).or_default().insert(player, report);
+        let ready: Vec<(u32, u32)> = self
             .pending
             .iter()
-            .filter(|(f, reps)| {
-                active.iter().all(|p| reps.contains_key(p)) || **f + 600 < frame
-            })
-            .map(|(f, _)| *f)
+            .filter(|((r, f), reps)| *r == run && (active.iter().all(|p| reps.contains_key(p)) || *f + 600 < frame))
+            .map(|(k, _)| *k)
             .collect();
-        for f in ready {
-            let reps = self.pending.remove(&f).unwrap();
+        self.evaluate(ready)
+    }
+
+    /// Run `run` is over (every client left it): its incomplete frames are evaluated with
+    /// whoever reported them.
+    pub fn end_run(&mut self, run: u32) -> Vec<Outcome> {
+        let keys: Vec<(u32, u32)> = self.pending.keys().filter(|(r, _)| *r == run).copied().collect();
+        self.evaluate(keys)
+    }
+
+    fn evaluate(&mut self, keys: Vec<(u32, u32)>) -> Vec<Outcome> {
+        let mut done = Vec::new();
+        for (run, f) in keys {
+            let reps = self.pending.remove(&(run, f)).unwrap();
             if reps.len() >= 2 {
-                let o = compare(f, &reps);
+                let o = compare(run, f, &reps);
                 self.record(&o, &reps);
                 done.push(o);
             }
@@ -82,35 +98,36 @@ impl Verifier {
     }
 
     fn record(&mut self, o: &Outcome, reps: &HashMap<u8, Report>) {
-        let t = &mut self.totals;
-        t.checkpoints += 1;
-        t.chunk_comparisons += o.common_chunks as u64;
-        t.chunk_mismatches += o.chunk_mismatches as u64;
-        t.position_comparisons += o.common_positions as u64;
-        t.position_mismatches += o.position_mismatches as u64;
-        if !o.entity_hash_equal {
-            t.entity_hash_mismatches += 1;
-        }
-        if o.partial_chunks > 0 {
-            t.partial_chunk_sets += 1;
+        for t in [&mut self.totals, self.run_totals.entry(o.run).or_default()] {
+            t.checkpoints += 1;
+            t.chunk_comparisons += o.common_chunks as u64;
+            t.chunk_mismatches += o.chunk_mismatches as u64;
+            t.position_comparisons += o.common_positions as u64;
+            t.position_mismatches += o.position_mismatches as u64;
+            if !o.entity_hash_equal {
+                t.entity_hash_mismatches += 1;
+            }
+            if o.partial_chunks > 0 {
+                t.partial_chunk_sets += 1;
+            }
         }
         if (o.chunk_mismatches > 0 || o.position_mismatches > 0) && self.first_mismatch.is_none() {
-            self.first_mismatch = Some(o.frame);
+            self.first_mismatch = Some((o.run, o.frame));
         }
         if let Some(f) = &mut self.out {
             let mut players: Vec<_> = reps.keys().copied().collect();
             players.sort();
             let _ = writeln!(
                 f,
-                "{{\"frame\":{},\"players\":{:?},\"common_chunks\":{},\"chunk_mismatches\":{},\"partial_chunks\":{},\"common_positions\":{},\"position_mismatches\":{},\"entity_hash_equal\":{},\"bad_chunks\":{:?},\"bad_entities\":[{}]}}",
-                o.frame, players, o.common_chunks, o.chunk_mismatches, o.partial_chunks, o.common_positions, o.position_mismatches, o.entity_hash_equal, o.bad_chunks,
+                "{{\"run\":{},\"frame\":{},\"players\":{:?},\"common_chunks\":{},\"chunk_mismatches\":{},\"partial_chunks\":{},\"common_positions\":{},\"position_mismatches\":{},\"entity_hash_equal\":{},\"bad_chunks\":{:?},\"bad_entities\":[{}]}}",
+                o.run, o.frame, players, o.common_chunks, o.chunk_mismatches, o.partial_chunks, o.common_positions, o.position_mismatches, o.entity_hash_equal, o.bad_chunks,
                 o.bad_entities.iter().map(|(k, id)| format!("[{k},{id}]")).collect::<Vec<_>>().join(",")
             );
         }
     }
 }
 
-fn compare(frame: u32, reps: &HashMap<u8, Report>) -> Outcome {
+fn compare(run: u32, frame: u32, reps: &HashMap<u8, Report>) -> Outcome {
     // Chunks: compare those loaded on 2+ clients; count chunks loaded on only some clients.
     let mut chunk_hashes: HashMap<u32, Vec<u64>> = HashMap::new();
     for r in reps.values() {
@@ -169,6 +186,7 @@ fn compare(frame: u32, reps: &HashMap<u8, Report>) -> Outcome {
     let first = digests.next();
     let entity_hash_equal = first.is_none_or(|f| digests.all(|d| d == f));
     Outcome {
+        run,
         frame,
         players: n,
         common_chunks,
@@ -201,12 +219,13 @@ mod tests {
     fn waits_for_all_active_then_counts_exact_mismatches() {
         let mut v = Verifier::new(None);
         let active = [0u8, 1, 2];
-        assert!(v.add(60, 0, rep(&[(1, 10), (2, 20)], &[(5, 0, 1.0, 2.0)]), &active).is_empty());
-        assert!(v.add(60, 1, rep(&[(1, 10), (2, 21)], &[(5, 0, 1.0, 2.0)]), &active).is_empty());
-        let out = v.add(60, 2, rep(&[(1, 10)], &[(5, 0, 1.0, 2.000001)]), &active);
+        assert!(v.add(0, 60, 0, rep(&[(1, 10), (2, 20)], &[(5, 0, 1.0, 2.0)]), &active).is_empty());
+        assert!(v.add(0, 60, 1, rep(&[(1, 10), (2, 21)], &[(5, 0, 1.0, 2.0)]), &active).is_empty());
+        let out = v.add(0, 60, 2, rep(&[(1, 10)], &[(5, 0, 1.0, 2.000001)]), &active);
         assert_eq!(
             out,
             vec![Outcome {
+                run: 0,
                 frame: 60,
                 players: 3,
                 common_chunks: 2,
@@ -219,29 +238,50 @@ mod tests {
                 bad_entities: vec![(0, 5)],
             }]
         );
-        assert_eq!(v.first_mismatch(), Some(60));
+        assert_eq!(v.first_mismatch(), Some((0, 60)));
     }
 
     #[test]
     fn entity_missing_on_one_client_is_a_mismatch() {
         let mut v = Verifier::new(None);
         let active = [0u8, 1, 2];
-        v.add(60, 0, rep(&[], &[(5, 1, 0.0, 0.0)]), &active);
-        v.add(60, 1, rep(&[], &[(5, 1, 0.0, 0.0)]), &active);
-        let out = v.add(60, 2, rep(&[], &[]), &active);
+        v.add(0, 60, 0, rep(&[], &[(5, 1, 0.0, 0.0)]), &active);
+        v.add(0, 60, 1, rep(&[], &[(5, 1, 0.0, 0.0)]), &active);
+        let out = v.add(0, 60, 2, rep(&[], &[]), &active);
         assert_eq!(out[0].position_mismatches, 1);
     }
 
     #[test]
     fn departed_player_does_not_stall_old_frames() {
         let mut v = Verifier::new(None);
-        v.add(60, 0, rep(&[(1, 1)], &[]), &[0, 1]);
-        v.add(60, 1, rep(&[(1, 1)], &[]), &[0, 1]);
+        v.add(0, 60, 0, rep(&[(1, 1)], &[]), &[0, 1]);
+        v.add(0, 60, 1, rep(&[(1, 1)], &[]), &[0, 1]);
         // Player 1 leaves; frame 120 only gets player 0, then much later frames arrive.
-        v.add(120, 0, rep(&[(1, 1)], &[]), &[0, 1]);
-        let out = v.add(900, 0, rep(&[(1, 1)], &[]), &[0]);
+        v.add(0, 120, 0, rep(&[(1, 1)], &[]), &[0, 1]);
+        let out = v.add(0, 900, 0, rep(&[(1, 1)], &[]), &[0]);
         // Frame 120 had a single report (nothing to compare) and is dropped; 900 likewise.
         assert!(out.is_empty());
         assert_eq!(v.totals.checkpoints, 1);
+    }
+
+    #[test]
+    fn runs_are_kept_apart_and_an_ended_run_is_evaluated() {
+        let mut v = Verifier::new(None);
+        // Run 0: player 1 reported frame 60, then player 0 left the run before reporting it.
+        v.add(0, 60, 1, rep(&[(1, 1)], &[]), &[0, 1]);
+        v.add(0, 60, 0, rep(&[(1, 1)], &[]), &[0, 1]);
+        v.add(0, 120, 1, rep(&[(1, 5)], &[]), &[0, 1]);
+        v.add(0, 120, 0, rep(&[(1, 6)], &[]), &[1, 2]);
+        // Run 1 restarts at frame 60 with different worlds: never compared with run 0's.
+        assert!(v.add(1, 60, 0, rep(&[(1, 2)], &[]), &[0, 1]).is_empty());
+        let out = v.add(1, 60, 1, rep(&[(1, 2)], &[]), &[0, 1]);
+        assert_eq!((out[0].run, out[0].chunk_mismatches), (1, 0));
+        // Run 0's frame 120 waited for player 2, which never reports: evaluated at its end.
+        let out = v.end_run(0);
+        assert_eq!((out[0].run, out[0].frame, out[0].chunk_mismatches), (0, 120, 1));
+        assert_eq!(v.run_totals[&0].chunk_mismatches, 1);
+        assert_eq!(v.run_totals[&1].checkpoints, 1);
+        assert_eq!(v.totals.checkpoints, 3);
+        assert_eq!(v.first_mismatch(), Some((0, 120)));
     }
 }

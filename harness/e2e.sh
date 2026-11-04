@@ -52,7 +52,9 @@ cleanup() {
 trap cleanup EXIT
 
 export NOITA_MODS=noita_online
-SCENARIO=bot
+# Scripted runs: the bot scenario by default; --scenario picks another scripted one (e.g.
+# "death": a player dies and respawns, see mod/noita_online/files/bot.lua).
+SCENARIO="${SCENARIO_ARG:-bot}"
 if [[ "${HUMAN:-0}" == 1 ]]; then
   # Manual play: real input via the proxy, no scripted events (unless --scenario, e.g.
   # "items"), no auto-exit.
@@ -81,6 +83,9 @@ else
   # INPUT_DELAY=N: fixed lockstep input delay (default: auto, adapted during the session).
   [[ -n "${INPUT_DELAY:-}" ]] && SRV_ARGS+=(--input-delay "$INPUT_DELAY")
   [[ -n "$SEED" ]] && SRV_ARGS+=(--seed "$SEED")
+  # SRV_EXTRA="--respawn-gold-loss 0.5 ...": further server options.
+  # shellcheck disable=SC2206
+  [[ -n "${SRV_EXTRA:-}" ]] && SRV_ARGS+=($SRV_EXTRA)
   "$ROOT/target/release/noita-online-server" "${SRV_ARGS[@]}" >"$OUT/server.out" 2>&1 &
   SRV=$!
   export NOITA_ONLINE_SERVER="127.0.0.1:$PORT"

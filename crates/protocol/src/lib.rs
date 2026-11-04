@@ -17,7 +17,9 @@ pub const CH_UNRELIABLE: u8 = 1;
 /// Bumped whenever the message format or lockstep rules change; server and clients must match.
 /// 5: every input carries its client's render camera (the client's input trailer).
 /// 6: `Perf` carries the client's measured round trip (the adaptive input delay's network bound).
-pub const GAME_PROTOCOL_VERSION: u32 = 6;
+/// 7: runs: after an all-dead game over every client starts a new game (`NextRun`), the server
+///    starts the next run (`Start.run`); the lockstep streams carry their run index.
+pub const GAME_PROTOCOL_VERSION: u32 = 7;
 
 /// Budget for one unreliable lockstep datagram's payload (fits rudp's unreliable limit).
 pub const STREAM_BUDGET: usize = 1100;
@@ -53,9 +55,9 @@ pub type Tick = Vec<(u8, Vec<u8>)>;
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientMsg {
     Hello { protocol: u32, game_build: String, mod_hash: u64, name: String },
-    /// Lockstep stream (unreliable). `tick_ack`: next tick frame the client still needs
-    /// (all earlier ticks received). `inputs[i]` is the local input for frame `first + i`.
-    Inputs { tick_ack: u32, first: u32, inputs: Vec<Vec<u8>> },
+    /// Lockstep stream (unreliable) of run `run`. `tick_ack`: next tick frame the client still
+    /// needs (all earlier ticks received). `inputs[i]` is the local input for frame `first + i`.
+    Inputs { run: u32, tick_ack: u32, first: u32, inputs: Vec<Vec<u8>> },
     /// State at the end of simulation frame `frame`: hashes of the chunks scheduled for this
     /// frame and, on entity checkpoints, the entity digest plus tracked positions.
     StateHash { frame: u32, entities: Option<u64>, chunks: Vec<ChunkHash>, positions: Vec<EntityPos> },
@@ -68,17 +70,22 @@ pub enum ClientMsg {
     /// Free-form log line forwarded to the server log.
     Log { text: String },
     Ping { t: u64 },
+    /// The client left its run (every player died and it started a new game) and is ready for
+    /// run `run` (its run + 1). Sent after the old run's last state report.
+    NextRun { run: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ServerMsg {
     Welcome { player: u8, max_players: u8 },
     Lobby { players: Vec<(u8, String)>, needed: u8 },
-    /// Session starts: every client starts a new game with this seed and these parameters.
-    Start { seed: u32, players: Vec<(u8, String)>, input_delay: u16, session_id: u64, params: Vec<u8> },
-    /// Lockstep stream (unreliable). `input_ack`: next input frame the server still needs
-    /// from this client. `ticks[i]` is the tick for frame `first + i`.
-    Ticks { input_ack: u32, first: u32, ticks: Vec<Tick> },
+    /// A run starts: every client starts a new game with this seed and these parameters, from
+    /// frame 0 of run `run` (0: the session's first run; the next one starts once every client
+    /// sent `NextRun`). Every run of a session has the same session id and roster.
+    Start { run: u32, seed: u32, players: Vec<(u8, String)>, input_delay: u16, session_id: u64, params: Vec<u8> },
+    /// Lockstep stream (unreliable) of run `run`. `input_ack`: next input frame the server
+    /// still needs from this client. `ticks[i]` is the tick for frame `first + i`.
+    Ticks { run: u32, input_ack: u32, first: u32, ticks: Vec<Tick> },
     PlayerLeft { player: u8 },
     Pong { t: u64 },
     Kick { reason: String },
@@ -94,8 +101,8 @@ impl ClientMsg {
             ClientMsg::Hello { protocol, game_build, mod_hash, name } => {
                 w.u8(1).u32(*protocol).str(game_build).u64(*mod_hash).str(name);
             }
-            ClientMsg::Inputs { tick_ack, first, inputs } => {
-                w.u8(2).varint(*tick_ack as u64).varint(*first as u64).varint(inputs.len() as u64);
+            ClientMsg::Inputs { run, tick_ack, first, inputs } => {
+                w.u8(2).varint(*run as u64).varint(*tick_ack as u64).varint(*first as u64).varint(inputs.len() as u64);
                 // Delta coding: 0 = same as the previous input, 1 = blob follows.
                 for (i, input) in inputs.iter().enumerate() {
                     if i > 0 && inputs[i - 1] == *input {
@@ -137,6 +144,9 @@ impl ClientMsg {
             ClientMsg::Ping { t } => {
                 w.u8(6).u64(*t);
             }
+            ClientMsg::NextRun { run } => {
+                w.u8(7).varint(*run as u64);
+            }
         }
         w.finish()
     }
@@ -151,6 +161,7 @@ impl ClientMsg {
                 name: r.str()?.to_owned(),
             },
             2 => {
+                let run = r.varint()? as u32;
                 let tick_ack = r.varint()? as u32;
                 let first = r.varint()? as u32;
                 let n = bounded(r.varint()?, &r, 1)?;
@@ -165,7 +176,7 @@ impl ClientMsg {
                         _ => return Err(DecodeError),
                     }
                 }
-                ClientMsg::Inputs { tick_ack, first, inputs }
+                ClientMsg::Inputs { run, tick_ack, first, inputs }
             }
             3 => {
                 let frame = r.varint()? as u32;
@@ -203,6 +214,7 @@ impl ClientMsg {
             },
             5 => ClientMsg::Log { text: r.str()?.to_owned() },
             6 => ClientMsg::Ping { t: r.u64()? },
+            7 => ClientMsg::NextRun { run: r.varint()? as u32 },
             _ => return Err(DecodeError),
         };
         if !r.is_empty() {
@@ -289,13 +301,13 @@ impl ServerMsg {
                 w.u8(2).u8(*needed);
                 put_roster(&mut w, players);
             }
-            ServerMsg::Start { seed, players, input_delay, session_id, params } => {
-                w.u8(3).u32(*seed).u16(*input_delay).u64(*session_id);
+            ServerMsg::Start { run, seed, players, input_delay, session_id, params } => {
+                w.u8(3).varint(*run as u64).u32(*seed).u16(*input_delay).u64(*session_id);
                 put_roster(&mut w, players);
                 w.blob(params);
             }
-            ServerMsg::Ticks { input_ack, first, ticks } => {
-                w.u8(4).varint(*input_ack as u64).varint(*first as u64).varint(ticks.len() as u64);
+            ServerMsg::Ticks { run, input_ack, first, ticks } => {
+                w.u8(4).varint(*run as u64).varint(*input_ack as u64).varint(*first as u64).varint(ticks.len() as u64);
                 let mut prev: Option<&Tick> = None;
                 for t in ticks {
                     w.u8(t.len() as u8);
@@ -335,14 +347,16 @@ impl ServerMsg {
                 ServerMsg::Lobby { players: get_roster(&mut r)?, needed }
             }
             3 => {
+                let run = r.varint()? as u32;
                 let seed = r.u32()?;
                 let input_delay = r.u16()?;
                 let session_id = r.u64()?;
                 let players = get_roster(&mut r)?;
                 let params = r.blob()?.to_vec();
-                ServerMsg::Start { seed, players, input_delay, session_id, params }
+                ServerMsg::Start { run, seed, players, input_delay, session_id, params }
             }
             4 => {
+                let run = r.varint()? as u32;
                 let input_ack = r.varint()? as u32;
                 let first = r.varint()? as u32;
                 let n = bounded(r.varint()?, &r, 1)?;
@@ -363,7 +377,7 @@ impl ServerMsg {
                     }
                     ticks.push(t);
                 }
-                ServerMsg::Ticks { input_ack, first, ticks }
+                ServerMsg::Ticks { run, input_ack, first, ticks }
             }
             5 => ServerMsg::PlayerLeft { player: r.u8()? },
             6 => ServerMsg::Pong { t: r.u64()? },
@@ -386,7 +400,7 @@ mod tests {
     fn client_messages_roundtrip() {
         let msgs = vec![
             ClientMsg::Hello { protocol: 1, game_build: "b".into(), mod_hash: 9, name: "n".into() },
-            ClientMsg::Inputs { tick_ack: 70_000, first: 70_003, inputs: vec![vec![1, 2, 3], vec![]] },
+            ClientMsg::Inputs { run: 2, tick_ack: 70_000, first: 70_003, inputs: vec![vec![1, 2, 3], vec![]] },
             ClientMsg::StateHash {
                 frame: 60,
                 entities: Some(3),
@@ -406,6 +420,7 @@ mod tests {
             },
             ClientMsg::Log { text: "hi".into() },
             ClientMsg::Ping { t: 5 },
+            ClientMsg::NextRun { run: 3 },
         ];
         for m in msgs {
             assert_eq!(ClientMsg::decode(&m.encode()).unwrap(), m);
@@ -417,8 +432,8 @@ mod tests {
         let msgs = vec![
             ServerMsg::Welcome { player: 3, max_players: 8 },
             ServerMsg::Lobby { players: vec![(0, "a".into())], needed: 4 },
-            ServerMsg::Start { seed: 1, players: vec![(0, "a".into()), (1, "b".into())], input_delay: 4, session_id: 77, params: vec![9] },
-            ServerMsg::Ticks { input_ack: 15, first: 12, ticks: vec![vec![(0, vec![1]), (1, vec![])], vec![]] },
+            ServerMsg::Start { run: 1, seed: 1, players: vec![(0, "a".into()), (1, "b".into())], input_delay: 4, session_id: 77, params: vec![9] },
+            ServerMsg::Ticks { run: 1, input_ack: 15, first: 12, ticks: vec![vec![(0, vec![1]), (1, vec![])], vec![]] },
             ServerMsg::PlayerLeft { player: 2 },
             ServerMsg::Pong { t: 8 },
             ServerMsg::Kick { reason: "x".into() },
@@ -433,9 +448,10 @@ mod tests {
     fn tick_len_matches_encoding_including_repeats() {
         let t1: Tick = vec![(0, vec![1; 6]), (3, vec![2; 200])];
         let t2: Tick = vec![(0, vec![1; 6]), (3, vec![9; 3])];
-        let empty = ServerMsg::Ticks { input_ack: 0, first: 0, ticks: vec![] }.encode().len();
-        let one = ServerMsg::Ticks { input_ack: 0, first: 0, ticks: vec![t1.clone()] }.encode().len();
-        let two = ServerMsg::Ticks { input_ack: 0, first: 0, ticks: vec![t1.clone(), t2.clone()] }.encode().len();
+        let ticks = |ticks: Vec<Tick>| ServerMsg::Ticks { run: 0, input_ack: 0, first: 0, ticks }.encode().len();
+        let empty = ticks(vec![]);
+        let one = ticks(vec![t1.clone()]);
+        let two = ticks(vec![t1.clone(), t2.clone()]);
         assert_eq!(one - empty, tick_encoded_len(None, &t1));
         assert_eq!(two - one, tick_encoded_len(Some(&t1), &t2));
         assert_eq!(tick_encoded_len(Some(&t1), &t2), 1 + 1 + (1 + 1 + 3), "player 0 repeats");
@@ -444,16 +460,16 @@ mod tests {
     #[test]
     fn repeated_inputs_and_ticks_roundtrip_compactly() {
         let same = vec![7u8; 23];
-        let inputs = ClientMsg::Inputs { tick_ack: 1, first: 2, inputs: vec![same.clone(); 30] };
+        let inputs = ClientMsg::Inputs { run: 0, tick_ack: 1, first: 2, inputs: vec![same.clone(); 30] };
         let enc = inputs.encode();
-        assert!(enc.len() < 23 + 2 + 30 + 8, "{} bytes", enc.len());
+        assert!(enc.len() < 23 + 2 + 30 + 9, "{} bytes", enc.len());
         assert_eq!(ClientMsg::decode(&enc).unwrap(), inputs);
         let tick: Tick = (0..4).map(|p| (p, same.clone())).collect();
-        let ticks = ServerMsg::Ticks { input_ack: 0, first: 0, ticks: vec![tick; 30] };
+        let ticks = ServerMsg::Ticks { run: 0, input_ack: 0, first: 0, ticks: vec![tick; 30] };
         assert_eq!(ServerMsg::decode(&ticks.encode()).unwrap(), ticks);
         // A repeat flag in the first tick (nothing to repeat) is malformed.
         let mut w = Writer::new();
-        w.u8(4).varint(0).varint(0).varint(1).u8(1).u8(0x80);
+        w.u8(4).varint(0).varint(0).varint(0).varint(1).u8(1).u8(0x80);
         assert!(ServerMsg::decode(&w.finish()).is_err());
     }
 

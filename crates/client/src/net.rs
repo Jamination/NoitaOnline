@@ -21,6 +21,8 @@ pub enum Status {
 
 #[derive(Debug, Clone, Default)]
 pub struct StartInfo {
+    /// The run (world) of the session this start is for (0: the first).
+    pub run: u32,
     pub seed: u32,
     pub player: u8,
     pub input_delay: u16,
@@ -85,6 +87,28 @@ impl Shared {
             self.net_wake.notify();
         }
     }
+}
+
+/// Leave the current run (its world is gone: every player died and this client started a
+/// new game) and tell the server this client is ready for the next one. The lockstep streams
+/// end; the status is `Lobby` until the next run's `Start`. Messages already queued (the old
+/// run's last state reports) go out before `NextRun`. Returns the next run's index, or None
+/// outside a started session.
+pub fn next_run(shared: &Shared) -> Option<u32> {
+    let mut s = shared.state.lock().unwrap();
+    if s.status != Some(Status::Started) {
+        return None;
+    }
+    let run = s.start.take()?.run + 1;
+    s.stream = None;
+    s.input_dirty = false;
+    s.game_waiting = false;
+    s.status = Some(Status::Lobby);
+    s.outgoing.push_back((CH_RELIABLE, ClientMsg::NextRun { run }.encode()));
+    s.events.push_back(format!("left the run; ready for run {run}"));
+    drop(s);
+    shared.net_wake.notify();
+    Some(run)
 }
 
 /// Wakes the network thread. On Windows the thread also wakes when a datagram arrives, so it
@@ -382,24 +406,24 @@ fn receive(shared: &Shared, client: &mut Client) -> bool {
             ServerMsg::Lobby { players, needed } => {
                 s.events.push_back(format!("lobby: {}/{} {:?}", players.len(), needed, players));
             }
-            ServerMsg::Start { seed, players, input_delay, session_id, params } => {
+            ServerMsg::Start { run, seed, players, input_delay, session_id, params } => {
                 let player = s.player.unwrap_or(0);
                 let params = String::from_utf8_lossy(&params).into_owned();
-                s.start = Some(StartInfo { seed, player, input_delay, session_id, players: players.clone(), params });
-                s.stream = Some(ClientStream::new(input_delay as u32));
+                s.start = Some(StartInfo { run, seed, player, input_delay, session_id, players: players.clone(), params });
+                s.stream = Some(ClientStream::new(run, input_delay as u32));
                 s.input_delay = input_delay;
                 s.status = Some(Status::Started);
-                s.events.push_back(format!("start: seed={seed} delay={input_delay} players={players:?}"));
+                s.events.push_back(format!("start: run={run} seed={seed} delay={input_delay} players={players:?}"));
                 wake_game = true;
             }
             ServerMsg::InputDelay { delay } => {
                 s.input_delay = delay;
                 s.events.push_back(format!("input delay: {delay}"));
             }
-            ServerMsg::Ticks { input_ack, first, ticks } => {
+            ServerMsg::Ticks { run, input_ack, first, ticks } => {
                 // The tick ack goes out with the next input.
                 if let Some(stream) = &mut s.stream {
-                    wake_game |= stream.on_ticks(input_ack, first, ticks);
+                    wake_game |= stream.on_ticks(run, input_ack, first, ticks);
                 }
             }
             ServerMsg::PlayerLeft { player } => s.events.push_back(format!("left: {player}")),

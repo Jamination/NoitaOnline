@@ -101,12 +101,32 @@ Inside the window:
 | `sound_rng` | Sound events (`FUN_0047b990`) draw two global-LCG steps for pitch and volume (@0x0047be26, @0x0047be82), after early returns that depend on this client's audio state (event lookup, voice stealing). | Own LCG. Sounds no longer touch the simulation's RNG, so player-scoped ones can play on one client only (`local_presentation`). |
 | `local_presentation` | (presentation, not determinism) Every slot has `player_unit`, so engine presentation gated by "is player" (`FUN_0063e880`) ran for every player on every client: log messages (`$log_teleported`, `$log_polymorph`, `$log_pickedup`, `$log_equipped`, ...), wand and breathing sounds, the out-of-air screen darkening; the low-health indicator read the players vector (the proxy); gamepad camera look-ahead, reticle and rumble (`FUN_00a8d5f0`) never ran for a slot. The damage flash (camera +0x5c amount, +0x60 fade rate; raised by the PlatformShooterPlayerSystem's damage handler for every slot, `FUN_006f2f10` @0x00bf66be, which draws the global LCG, on some paths only while the amount is under a limit; faded by `FUN_006f1d40` in the world update) flashed every client for every player's damage. | The gates keep the engine's answer (the simulation in those blocks is unchanged) and record whether the subject is this client's slot; the presentation calls in the block are skipped otherwise (`slots.rs` `GATED_PRESENTATION`). The low-health indicator and the gamepad users take this client's slot (its gamepad via the proxy). Damage flash: inside the window the camera keeps the shared flash (every player's hits, as before, so the LCG draws stay identical on every client); this client's own player's hits also raise a local copy (the same setter on a scratch object, with the LCG put back), which fades with the same dt and rule (hook at the fade call @0x006b32ae) and is what the render shows: swapped in at window exit, the shared one back at the next entry. |
 | camera lock (window code, no patch) | GameGlobal::SetCameraPos ignores unforced requests while the camera lock (GameGlobal+0x3c) is set. A forced request sets the lock only if it actually moves the camera, and the engine clears it only at the end of each frame. So the forced simulation camera locked the camera only when this client's render camera had been elsewhere. Inside the window, unforced requests (any mod's or script's `GameSetCameraPos`) took effect on some clients and frames but not others, and the PlatformShooterPlayerSystem, which computes the player's camera target only while the lock is clear (`FUN_00bf2040` @0x00bf4caf), ran it on some frames. After the window, the render camera's request was ignored on every frame in which the lock was set. On a client whose player is not the first, the view alternated between the two players every frame while the first player stood still, and stayed on the first player while it moved. | `no_set_sim_camera` and the early window entry clear the lock after the forced move, on every client (vanilla's state at that point); a forced request inside the window (a teleporting player) sets it as in vanilla; `no_sim_leave` clears it. |
+| `world_teardown` | A new game in the same process (the next run, after every player died) rebuilds the game in place at the end of a DeathMatch::Update (`FUN_006b59d0` calls `FUN_006af010` when the game mode's restart request +0x7d is set; `FUN_006e9f30` tears the world, entities, Box2D and Lua states down and recreates them). The Box2D step was sent to its worker at that frame's render start, which comes before (`box2d_overlap`), and the frame's state report waits for the buffer swap that comes after (`report`) with the old world's chunks; the emitter scan armed at window exit would scan at that swap (`cell_emitters`). | The restart call (@0x006b5c08) goes through a hook that first joins the step, hashes and sends the report and disarms the scan. See *Runs* below for what else a new run resets. |
 
 Seeds are set at world init and at frame 1 by `no_fix_seeds`:
 - the platform RNGs, the global LCG and PM, the particle RNG and the `rand` state;
 - the simulation RNG bank.
 
 All of them are derived from the session seed.
+
+## Runs
+
+After an all-dead game over every client starts a new game into the session's next run
+(architecture.md, *Runs*), in the same process. The engine rebuilds the game object, but
+GameGlobal and the engine's statics stay, and so does the runtime's own state. The clients
+left the old world at different frames (each when its player pressed New game), so whatever
+carries over must be reset to the same values everywhere. `no_next_run` (from the new game's
+`init.lua`, before the world exists) resets, as in a fresh process: the chunk gate (job ages,
+submission frames), the camera loads (vanilla again until the new world's first window),
+the view loads and the eviction schedule, the simulation RNG bank (then `no_fix_seeds` with
+the new seed), the armed early window, the freeze foci, the pathfinding clearance cycles
+(the runtime's per-player ones and the engine's own cycle state at `0x01208520`, which held
+the old world's pathfinding chunk table and each client's progress), the views and every
+player's last camera from the ticks, the input trailer's camera stream and slow-step flag,
+the parked shared screen shake and damage flash and this client's own, the fog-of-war passes,
+the emitter scan's results, the inventory GUI's system, player, ops and replace screen, the
+early input's ControlsSystem and proxy, the slot registry, and the respawn state
+(`respawn::reset_run`).
 
 ## Mod-level rules
 

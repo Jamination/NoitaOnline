@@ -1301,6 +1301,8 @@ const PATCHES: &[(&str, PatchFn)] = &[
     ("polymorph_slots", |ex| unsafe { crate::slots::patch_polymorph(ex) }),
     ("sound_rng", |ex| unsafe { crate::slots::patch_sound_rng(ex) }),
     ("local_presentation", |ex| unsafe { crate::slots::patch_presentation(ex) }),
+    ("game_over_respawn", |ex| unsafe { crate::respawn::patch_game_over_button(ex) }),
+    ("world_teardown", |ex| unsafe { crate::nextrun::patch(ex) }),
 ];
 
 /// Overwrite every time/pid-seeded engine RNG with values derived from the session seed.
@@ -2891,4 +2893,39 @@ pub unsafe fn focus_freeze_step(foci: &[(f32, f32)]) {
     let rect = [x as i32 - 213, y as i32 - 120, 427, 240];
     let pass: extern "fastcall" fn(u32, u32, *const i32) = std::mem::transmute(FREEZE_PASS_FN as usize);
     pass(grid_world, 0, rect.as_ptr());
+}
+
+/// New run (`no_next_run`, after the old world's teardown): the per-world state of the patches
+/// above starts as in a fresh process, identically on every client (they left the old world
+/// at different frames): the chunk gate's job ages and submission frames, the camera loads
+/// (vanilla again until the new world's first window), the view loads, the eviction schedule,
+/// the simulation RNG bank (reseeded by `fix_seeds`), the armed early window, the freeze foci
+/// and the pathfinding clearance cycles, including the engine's own cycle state
+/// ([`PF_REFRESH_STATE`], a static that the new game keeps: it holds the old world's
+/// pathfinding chunk table and each client's progress in its cycle).
+///
+/// # Safety
+/// Game thread, between the old world's teardown and the new world's creation.
+pub unsafe fn reset_run() {
+    *CHUNK_GATE.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    CHUNK_SUBMIT_FRAMES.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    DEFERRED_TILES.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    let flag = CAMERA_LOADS_FLAG.load(Ordering::Relaxed);
+    if flag != 0 {
+        *(flag as *mut u8) = 1;
+    }
+    *VIEW_LOADS.lock().unwrap_or_else(|p| p.into_inner()) = ViewLoads { start: None, last: Vec::new() };
+    *EVICT.lock().unwrap_or_else(|p| p.into_inner()) = (0, 0.0, false);
+    SIM_BANK.with(|b| *b.borrow_mut() = None);
+    IN_WINDOW.store(false, Ordering::Relaxed);
+    *ARMED_CAMERA.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    FREEZE_LAST.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    let n = FREEZE_FOCI_N.load(Ordering::Relaxed);
+    if n != 0 {
+        *(n as *mut u32) = 0;
+    }
+    set_box2d_freeze(false);
+    PF_FOCI.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    PF_REFRESH.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    std::ptr::write_bytes(PF_REFRESH_STATE as *mut u8, 0, PF_REFRESH_STATE_LEN);
 }

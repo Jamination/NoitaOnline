@@ -58,6 +58,18 @@ int32_t no_gui_apply(uint32_t owner_id, const uint8_t* data, uint32_t len);
 void no_slots_set(const uint32_t* ids, uint32_t n, int32_t local, uint32_t proxy_id);
 uint32_t no_slots_get(uint32_t* out, uint32_t cap);
 int32_t no_slots_install(void);
+void no_run_over(uint32_t frame);
+int32_t no_run_over_frame(void);
+int32_t no_next_run(void);
+int32_t no_press_new_game(void);
+int32_t no_player_name(uint32_t index, uint8_t* out, uint32_t cap);
+int32_t no_respawn_save(uint32_t slot, uint32_t entity_id);
+int32_t no_respawn_save_b64(uint32_t slot, const uint8_t* data, uint32_t len);
+uint32_t no_respawn_restore(uint32_t slot, float x, float y);
+void no_respawn_mode(int32_t on);
+int32_t no_respawn_take_press(void);
+void no_game_over_shared(void);
+void no_game_over_clear(void);
 ]])
 
 local M = {}
@@ -106,6 +118,18 @@ function M.start_info()
     session_id = info.session_id,
     params = params,
   }
+end
+
+-- Name of the session's `index`-th player (0-based, roster order), nil if unknown.
+function M.player_name(index)
+  local n = lib.no_player_name(index, err_buf, 1024)
+  if n < 0 then return nil end
+  return ffi.string(err_buf, n)
+end
+
+-- Store the player a polymorph keeps (base64 text) for slot `slot` (0-based) to respawn.
+function M.respawn_save_b64(slot, data)
+  return lib.no_respawn_save_b64(slot, data, #data)
 end
 
 local tick_buf = ffi.new("uint8_t[16384]")

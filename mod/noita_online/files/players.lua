@@ -12,11 +12,22 @@ local Robes = dofile_once("mods/noita_online/files/robes.lua")
 
 local M = {}
 
-M.slots = {}          -- array of { id = player_id, entity = eid, controls = cid, prev = state }
+M.slots = {}          -- array of { id = player_id, index = slot position (1-based), name =, entity = eid, controls = cid, prev = state, dead =, left = }
 M.by_id = {}
 M.proxy = nil
 M.proxy_controls = nil
 M.local_id = nil
+-- Respawn penalty (server options --respawn-gold-loss, --respawn-item-loss, sent in Start)
+-- and the session seed (the lost item's draw).
+M.params = { gold_loss = 0.5, item_loss = 1, seed = 1 }
+-- Called (inside the simulation window, every client) when no player is alive any more.
+M.on_all_dead = nil
+
+local DAMAGE_LOG = "mods/noita_online/files/damage_log.lua"
+-- The lockstep input op of a dead player choosing where to respawn: this byte, then the
+-- chosen (living) player's id. Handled here (a dead player's ops never reach the inventory
+-- GUI's op player, crates/client/src/invgui.rs).
+local RESPAWN_OP = 0xF0
 
 -- Only the ControlsComponent stays on: Noita's input system writes this client's keyboard,
 -- mouse and gamepad state into it (ControlsSystem). Everything else is off, including the
@@ -53,8 +64,8 @@ local function make_proxy_inert(e)
 end
 
 -- Tell the client runtime (slots.rs) the slot entities, which it follows through polymorphs,
--- our own slot (none once we died: vanilla shows a dead player nothing more) and the proxy;
--- and the patched vanilla scripts (local_prints.lua) our own player's entity.
+-- our own slot (none while we are dead) and the proxy; and the patched vanilla scripts
+-- (local_prints.lua) our own player's entity.
 local function register_slots()
   local ents, local_index = {}, -1
   for i, slot in ipairs(M.slots) do
@@ -63,6 +74,34 @@ local function register_slots()
   end
   NO.slots_set(ents, local_index, M.proxy or 0)
   LocalPrints.set_local(local_index >= 0 and ents[local_index + 1] or 0)
+end
+
+-- Every entity a slot drives (its player, a creature it is polymorphed into, a respawned
+-- player), identically on every client: inputs come from the ticks (ControlsComponent
+-- disabled and written by the mod); a dying player stays at 0 HP until the mod has stored it
+-- for its respawn (`wait_for_kill_flag_on_death`, see `die`), then dies vanilla's death; and
+-- every damage it takes is recorded for the debug log (files/damage_log.lua).
+local function adopt(slot, e)
+  EntityAddTag(e, "noita_online_player")
+  slot.controls = EntityGetFirstComponentIncludingDisabled(e, "ControlsComponent")
+  if slot.controls then ComponentSetValue2(slot.controls, "enabled", false) end
+  local dm = EntityGetFirstComponentIncludingDisabled(e, "DamageModelComponent")
+  if dm then ComponentSetValue2(dm, "wait_for_kill_flag_on_death", true) end
+  for _, c in ipairs(EntityGetComponentIncludingDisabled(e, "LuaComponent") or {}) do
+    if ComponentGetValue2(c, "script_damage_received") == DAMAGE_LOG then return end
+  end
+  EntityAddComponent2(e, "LuaComponent", { script_damage_received = DAMAGE_LOG, execute_every_n_frame = -1 })
+end
+
+-- Presentation of our own player: the camera follows only this client's own slot, and
+-- Noita's own inventory GUI (InventoryGuiComponent) stays enabled on every slot, so the
+-- simulation sees the same components everywhere, but the engine never runs it for a slot:
+-- this client runs it for its own player outside the simulation window (M.gui_update), and
+-- the client runtime turns its inventory edits into input ops.
+local function own_view(slot, e)
+  local shooter = EntityGetFirstComponentIncludingDisabled(e, "PlatformShooterPlayerComponent")
+  if shooter then ComponentSetValue2(shooter, "center_camera_on_this_entity", slot.id == M.local_id) end
+  if slot.id == M.local_id then NO.lib.no_gui_set_local(e) end
 end
 
 -- Called from OnPlayerSpawned (same frame on every client).
@@ -74,39 +113,23 @@ function M.setup(proxy, ids, local_id)
   M.proxy_controls = EntityGetFirstComponentIncludingDisabled(proxy, "ControlsComponent")
   for i, id in ipairs(ids) do
     local e = EntityLoad(Robes.entity_file(i), x, y)
-    EntityAddTag(e, "noita_online_player")
-    local controls = EntityGetFirstComponentIncludingDisabled(e, "ControlsComponent")
-    ComponentSetValue2(controls, "enabled", false)
-    -- Players never die by themselves (which would end this client's run); the lockstep
-    -- step turns them into spectators instead, identically everywhere.
-    local dm = EntityGetFirstComponentIncludingDisabled(e, "DamageModelComponent")
-    if dm then ComponentSetValue2(dm, "wait_for_kill_flag_on_death", true) end
-    local slot = { id = id, entity = e, controls = controls, prev = Input.NEUTRAL }
+    local slot = { id = id, index = i, name = NO.player_name(i - 1) or ("p" .. id), entity = e, prev = Input.NEUTRAL }
+    adopt(slot, e)
+    own_view(slot, e)
     M.slots[#M.slots + 1] = slot
     M.by_id[id] = slot
-    -- The camera follows only this client's own slot (presentation only).
-    local shooter = EntityGetFirstComponentIncludingDisabled(e, "PlatformShooterPlayerComponent")
-    if shooter then ComponentSetValue2(shooter, "center_camera_on_this_entity", id == local_id) end
-    -- Noita's own inventory GUI (InventoryGuiComponent) stays enabled on every slot, so the
-    -- simulation sees the same components everywhere, but the engine never runs it for a
-    -- slot: this client runs it for its own player outside the simulation window
-    -- (M.gui_update), and the client runtime turns its inventory edits into input ops.
-    if id == local_id then NO.lib.no_gui_set_local(e) end
   end
   register_slots()
 end
 
 -- Solo baseline (no networking): the engine's own player is slot 0, driven by applied
--- inputs exactly like a lockstep slot, and like a lockstep slot it never dies by itself
--- (apply_tick turns it into a spectator), so the scenario's world events run as in a session.
+-- inputs exactly like a lockstep slot, and it dies like one (with nobody to respawn at:
+-- vanilla's game over).
 function M.setup_solo(player)
   M.local_id = 0
-  local controls = EntityGetFirstComponentIncludingDisabled(player, "ControlsComponent")
-  ComponentSetValue2(controls, "enabled", false)
-  EntityAddTag(player, "noita_online_player")
-  local dm = EntityGetFirstComponentIncludingDisabled(player, "DamageModelComponent")
-  if dm then ComponentSetValue2(dm, "wait_for_kill_flag_on_death", true) end
-  local slot = { id = 0, entity = player, controls = controls, prev = Input.NEUTRAL }
+  M.solo = true
+  local slot = { id = 0, index = 1, name = "p0", entity = player, prev = Input.NEUTRAL }
+  adopt(slot, player)
   M.slots = { slot }
   M.by_id = { [0] = slot }
   if NO.lib.no_slots_install() ~= 0 and M.log then M.log("slot polymorph patch failed: " .. NO.last_error()) end
@@ -122,6 +145,12 @@ end
 
 function M.local_slot()
   return M.by_id[M.local_id]
+end
+
+-- Whether this client's own player is dead (waiting to respawn, or game over).
+function M.local_dead()
+  local slot = M.local_slot()
+  return slot ~= nil and slot.dead == true
 end
 
 -- This client's view is vanilla's camera: Noita's PlatformShooterPlayerSystem computes it
@@ -147,8 +176,14 @@ end
 local POLY_CAM_EASE, POLY_CAM_MIN2, POLY_CAM_MAX2 = 0.25, 1, 512 * 512
 
 -- The camera position Noita computes for our player this frame (nil before the first one).
+-- While our player is dead the view stays where it was when it died, as vanilla's game over
+-- leaves the camera (the simulation window puts the camera elsewhere every frame).
 function M.local_camera_target()
   local slot = M.local_slot()
+  if slot and slot.dead then
+    if M.view then return M.view[1], M.view[2] end
+    return nil
+  end
   if not slot or not EntityGetIsAlive(slot.entity) then return nil end
   local x, y
   local psp = EntityGetFirstComponentIncludingDisabled(slot.entity, "PlatformShooterPlayerComponent")
@@ -192,6 +227,8 @@ end
 -- render camera, taken after the last update) replaces it.
 function M.capture_local(mouse)
   if not M.proxy_controls then return Input.NEUTRAL end
+  -- A dead player does nothing but choose where to respawn (M.choose_respawn).
+  if M.local_dead() then return M.dead_input() end
   local now = GameGetFrameNum()
   local fresh = NO.lib.no_input_fresh() == 1
   local s = Input.capture_from(M.proxy_controls, fresh and Input.press_frame(now) or now)
@@ -321,8 +358,13 @@ end
 -- The scripted test bot (files/bot.lua) cannot use the GUI; it states what it would do
 -- there and gets the same ops the GUI records for it (crates/client/src/invgui.rs):
 -- `select = k` (number key k: equip the quick-bar item of key k) and
--- `swap = { wand = n, a = i, b = j }` (drag spell slot i of the n-th wand onto slot j).
+-- `swap = { wand = n, a = i, b = j }` (drag spell slot i of the n-th wand onto slot j);
+-- dead, `respawn = player id` (the respawn picker's choice).
 function M.bot_ops(s)
+  if M.local_dead() then
+    if s.respawn then M.choose_respawn(s.respawn) end
+    return M.dead_input()
+  end
   local slot = M.local_slot()
   local quick = slot and EntityGetIsAlive(slot.entity) and child_named(slot.entity, "inventory_quick")
   if not quick then return s end
@@ -352,44 +394,179 @@ function M.bot_ops(s)
   return s
 end
 
--- A dead player's body: invulnerable, no longer a "player" for the simulation, and never
--- polymorphed (it would become a creature nobody controls).
-local function make_spectator(e)
-  local dm = EntityGetFirstComponentIncludingDisabled(e, "DamageModelComponent")
-  if dm then
-    ComponentSetValue2(dm, "hp", 0.04)
-    ComponentSetValue2(dm, "invincibility_frames", 2000000000)
+-- ---------------------------------------------------------------------------------------
+-- Death and respawn.
+--
+-- A slot whose HP reached 0 (the engine holds it there: `wait_for_kill_flag_on_death`) is
+-- stored by the client runtime with the engine's own entity serializer (the one polymorph
+-- uses to keep the player: with its children, i.e. perks, effects, wands, spells, items),
+-- then dies vanilla's death in this frame's update (`kill_now`: death effects, sound,
+-- ragdoll in its robe colour, which stays in the world). A player that dies as a creature is
+-- the record its polymorph keeps. Its client shows vanilla's game over; its "New game"
+-- button opens the respawn picker instead (crates/client/src/respawn.rs), whose choice is a
+-- lockstep op (RESPAWN_OP): in that tick every client loads the stored player at the chosen
+-- player's position, at full HP, minus the penalty. With nobody left alive it is vanilla's
+-- game over for everyone (M.on_all_dead).
+
+-- The player a polymorph keeps (base64 `mSerializedData` of its polymorph effect), for the
+-- creature `e`.
+local function polymorph_record(e)
+  local function scan(ent)
+    for _, c in ipairs(EntityGetComponentIncludingDisabled(ent, "GameEffectComponent") or {}) do
+      local data = ComponentGetValue2(c, "mSerializedData")
+      if type(data) == "string" and data ~= "" then return data end
+    end
   end
-  EntityRemoveTag(e, "player_unit")
-  EntityRemoveTag(e, "hittable")
-  EntityRemoveTag(e, "mortal")
-  EntityAddTag(e, "noita_online_dead")
-  EntityAddTag(e, "polymorphable_NOT")
+  local data = scan(e)
+  if data then return data end
+  for _, child in ipairs(EntityGetAllChildren(e) or {}) do
+    data = scan(child)
+    if data then return data end
+  end
 end
 
--- A player whose HP reached zero becomes an invulnerable, input-less spectator; one whose
--- entity is gone (e.g. its polymorphed creature died in the frame it was made) becomes a
--- spectator without a body.
-local function check_death(slot)
+local function alive(slot)
+  return not slot.dead and not slot.left and EntityGetIsAlive(slot.entity)
+end
+
+local function die(slot, frame)
+  local e = slot.entity
+  local x, y = slot.last_x or 0, slot.last_y or 0
+  local size, kind = -1, "gone"
+  if EntityGetIsAlive(e) then
+    x, y = EntityGetTransform(e)
+    local data = EntityHasTag(e, "polymorphed_player") and polymorph_record(e)
+    if data then
+      size, kind = NO.respawn_save_b64(slot.index - 1, data), "polymorph record"
+    else
+      size, kind = NO.lib.no_respawn_save(slot.index - 1, e), "player"
+    end
+    local dm = EntityGetFirstComponentIncludingDisabled(e, "DamageModelComponent")
+    if dm then ComponentSetValue2(dm, "kill_now", true) else EntityKill(e) end
+  end
+  slot.dead, slot.death_x, slot.death_y, slot.death_frame = true, x, y, frame
+  slot.frozen, slot.inv_sig = nil, nil
+  if M.log then
+    M.log(string.format("slot %d died: entity %d (%s) at %.1f,%.1f frame %d; stored %s (%d bytes)", slot.id, e,
+      EntityGetIsAlive(e) and EntityGetFilename(e) or "gone", x, y, frame, kind, size))
+  end
+  if slot.id == M.local_id then
+    M.pending_game_over = true
+    register_slots()
+  else
+    GamePrint(slot.name .. " died")
+  end
+end
+
+local function check_death(slot, frame)
   if slot.dead then return end
   if EntityGetIsAlive(slot.entity) then
     local dm = EntityGetFirstComponentIncludingDisabled(slot.entity, "DamageModelComponent")
     if not dm or ComponentGetValue2(dm, "hp") > 0 then return end
-    make_spectator(slot.entity)
   end
-  slot.dead = true
-  if M.log then M.log(string.format("slot %d died: entity %d frame %d", slot.id, slot.entity, GameGetFrameNum())) end
+  die(slot, frame)
+end
+
+-- Park-Miller draws from the session seed, the frame and the player: the same everywhere,
+-- and no engine RNG is touched.
+local function draws(frame, id)
+  local x = (M.params.seed % 2147483646 + frame * 7919 + id * 104729) % 2147483647
+  if x == 0 then x = 1 end
+  return function(n)
+    x = (x * 48271) % 2147483647
+    return x % n + 1
+  end
+end
+
+local function item_label(e)
+  local ability = EntityGetFirstComponentIncludingDisabled(e, "AbilityComponent")
+  local name = ability and ComponentGetValue2(ability, "ui_name")
+  if not name or name == "" then
+    local ic = EntityGetFirstComponentIncludingDisabled(e, "ItemComponent")
+    name = ic and ComponentGetValue2(ic, "item_name")
+  end
+  if not name or name == "" then return EntityGetFilename(e) or "?" end
+  return GameTextGetTranslatedOrNot(name)
+end
+
+-- The respawn penalty: M.params.gold_loss of the gold (rounded down) and M.params.item_loss
+-- random items of the quick inventory (wands, flasks, other items; never the last wand),
+-- which are destroyed. Returns the gold and the items' names lost.
+local function penalty(slot, e, frame)
+  local gold = 0
+  local wallet = EntityGetFirstComponentIncludingDisabled(e, "WalletComponent")
+  if wallet then
+    local money = ComponentGetValue2(wallet, "money")
+    gold = math.floor(money * M.params.gold_loss)
+    ComponentSetValue2(wallet, "money", money - gold)
+    ComponentSetValue2(wallet, "mMoneyPrevFrame", money - gold)
+  end
+  local lost = {}
+  local quick = child_named(e, "inventory_quick")
+  local draw = draws(frame, slot.id)
+  for _ = 1, M.params.item_loss do
+    local items, wands = {}, 0
+    for _, c in ipairs(quick and EntityGetAllChildren(quick) or {}) do
+      if EntityGetFirstComponentIncludingDisabled(c, "ItemComponent") then
+        items[#items + 1] = c
+        if is_wand(c) then wands = wands + 1 end
+      end
+    end
+    local candidates = {}
+    for _, c in ipairs(items) do
+      if wands > 1 or not is_wand(c) then candidates[#candidates + 1] = c end
+    end
+    if #candidates == 0 then break end
+    local c = candidates[draw(#candidates)]
+    lost[#lost + 1] = item_label(c)
+    EntityRemoveFromParent(c)
+    EntityKill(c)
+  end
+  return gold, lost
+end
+
+local function respawn(slot, target, frame)
+  local x, y = EntityGetTransform(target.entity)
+  local e = NO.lib.no_respawn_restore(slot.index - 1, x, y)
+  local how = "stored player"
+  if e == 0 or not EntityGetIsAlive(e) then
+    -- Nothing stored (the player vanished without dying, e.g. its creature died in the frame
+    -- it was made): a new player.
+    e, how = EntityLoad(Robes.entity_file(slot.index), x, y), "new player"
+  end
+  slot.entity = e
+  adopt(slot, e)
+  local dm = EntityGetFirstComponentIncludingDisabled(e, "DamageModelComponent")
+  if dm then
+    ComponentSetValue2(dm, "kill_now", false)
+    ComponentSetValue2(dm, "hp", ComponentGetValue2(dm, "max_hp"))
+    ComponentSetValue2(dm, "air_in_lungs", ComponentGetValue2(dm, "air_in_lungs_max"))
+  end
+  slot.dead, slot.frozen, slot.inv_sig, slot.prev, slot.respawn_frame = false, nil, nil, Input.NEUTRAL, frame
+  local gold, lost = penalty(slot, e, frame)
+  own_view(slot, e)
+  register_slots()
+  if M.log then
+    M.log(string.format("slot %d respawned: entity %d (%s) at player %d %.1f,%.1f frame %d; lost %d gold, items: %s",
+      slot.id, e, how, target.id, x, y, frame, gold, table.concat(lost, ", ")))
+  end
   if slot.id == M.local_id then
-    GamePrint("You died - spectating")
-    register_slots()
+    M.pending_respawned = { at = target.name, gold = gold, lost = lost }
+  else
+    GamePrint(slot.name .. " respawned at " .. target.name)
   end
+end
+
+-- The living player a dead slot's input op chose to respawn at, if valid.
+local function respawn_target(ops)
+  if #ops < 2 or ops:byte(1) ~= RESPAWN_OP then return nil end
+  local target = M.by_id[ops:byte(2)]
+  return target and alive(target) and target or nil
 end
 
 -- Follow a slot to its new entity: Noita polymorphed the player into a creature or restored
 -- it (slots.rs records the swap inside the engine's polymorph code, identically on every
--- client). The creature is set up like a slot: our ControlsComponent to drive (vanilla's
--- input system would write this client's own input into an enabled one), no death by
--- itself (check_death), and a dead slot stays a spectator.
+-- client). The creature is set up like a slot (adopt).
 local function retarget(slot, e)
   if M.log then
     M.log(string.format("slot %d follows its player: entity %d -> %d (%s) frame %d", slot.id, slot.entity, e,
@@ -400,11 +577,7 @@ local function retarget(slot, e)
   slot.inv_sig = nil
   slot.frozen = nil
   if not EntityGetIsAlive(e) then return end
-  EntityAddTag(e, "noita_online_player")
-  if slot.controls then ComponentSetValue2(slot.controls, "enabled", false) end
-  local dm = EntityGetFirstComponentIncludingDisabled(e, "DamageModelComponent")
-  if dm then ComponentSetValue2(dm, "wait_for_kill_flag_on_death", true) end
-  if slot.dead then make_spectator(e) end
+  adopt(slot, e)
   if slot.id == M.local_id then
     NO.lib.no_gui_set_local(e)
     if not slot.dead then LocalPrints.set_local(e) end
@@ -424,11 +597,15 @@ function M.apply_tick(frame, tick)
   follow_slots()
   for _, slot in ipairs(M.slots) do
     local bytes = tick[slot.id]
-    check_death(slot)
-    if bytes == nil or slot.dead then
+    if bytes == nil then slot.left = true end
+    check_death(slot, frame)
+    if slot.dead then
+      local target = bytes and respawn_target(Input.decode(bytes).ops)
+      if target and not M.all_dead then respawn(slot, target, frame) end
+    elseif bytes == nil then
       if not slot.frozen then
         slot.frozen = true
-        -- Departed or dead player: neutral input from now on, identically on every client.
+        -- Departed player: neutral input from now on, identically on every client.
         if slot.controls and EntityGetIsAlive(slot.entity) then
           Input.apply(slot.controls, Input.NEUTRAL, frame, slot.entity)
           slot.prev = Input.NEUTRAL
@@ -438,9 +615,94 @@ function M.apply_tick(frame, tick)
       normalize_inventory(slot)
       local state = Input.decode(bytes)
       Input.apply(slot.controls, state, frame, slot.entity)
-      if #state.ops > 0 then NO.lib.no_gui_apply(slot.entity, state.ops, #state.ops) end
+      -- (a respawn choice sent while dead can arrive after the respawn: ignored)
+      if #state.ops > 0 and state.ops:byte(1) ~= RESPAWN_OP then NO.lib.no_gui_apply(slot.entity, state.ops, #state.ops) end
       slot.prev = state
     end
+    if not slot.dead and EntityGetIsAlive(slot.entity) then
+      slot.last_x, slot.last_y = EntityGetTransform(slot.entity)
+    end
+  end
+  if not M.all_dead and #M.slots > 0 then
+    local living, present = 0, 0
+    for _, slot in ipairs(M.slots) do
+      if not slot.left then present = present + 1 end
+      if alive(slot) then living = living + 1 end
+    end
+    if present > 0 and living == 0 then
+      M.all_dead, M.all_dead_frame = true, frame
+      M.pending_game_over = true
+      NO.lib.no_game_over_shared()
+      if M.log then M.log("every player is dead: game over at frame " .. frame) end
+      if M.on_all_dead then M.on_all_dead(frame) end
+    end
+  end
+end
+
+-- ---------------------------------------------------------------------------------------
+-- This client's dead player (outside the simulation window).
+
+local Picker = dofile_once("mods/noita_online/files/respawn_picker.lua")
+local respawn_choice = nil -- player id chosen in the picker, sent with the next input
+local picker_open = false
+
+-- The input of our dead player: nothing but the respawn choice, once.
+function M.dead_input()
+  local s = { buttons = {}, count_r = 0, count_l = 0, mx = 0, my = 0, ax = 0, ay = 0, ops = "" }
+  if respawn_choice then
+    s.ops = string.char(RESPAWN_OP, respawn_choice)
+    respawn_choice = nil
+  end
+  return s
+end
+
+function M.choose_respawn(id)
+  respawn_choice = id
+end
+
+-- The living players we can respawn at: { id, name, colour (RGB) }, slot order.
+local function respawn_choices()
+  local out = {}
+  for _, slot in ipairs(M.slots) do
+    if alive(slot) then
+      out[#out + 1] = { id = slot.id, name = slot.name, colour = Robes.colour(slot.index) }
+    end
+  end
+  return out
+end
+
+-- After the simulation window: vanilla's game over for our player's death (and for
+-- everyone's), its respawn button and the picker, and the end of the game over on respawn.
+function M.after_window()
+  if M.pending_game_over then
+    M.pending_game_over = false
+    picker_open = false
+    GameTriggerGameOver()
+  end
+  if M.pending_respawned then
+    local r = M.pending_respawned
+    M.pending_respawned = nil
+    picker_open = false
+    NO.lib.no_game_over_clear()
+    local msg = "You respawned at " .. r.at
+    if r.gold > 0 or #r.lost > 0 then
+      local parts = {}
+      if r.gold > 0 then parts[#parts + 1] = r.gold .. " gold" end
+      for _, name in ipairs(r.lost) do parts[#parts + 1] = name end
+      msg = msg .. "; lost " .. table.concat(parts, ", ")
+    end
+    GamePrint(msg)
+  end
+  local choices = M.local_dead() and not M.all_dead and respawn_choices() or {}
+  NO.lib.no_respawn_mode(#choices > 0 and 1 or 0)
+  if #choices == 0 then picker_open = false end
+  if NO.lib.no_respawn_take_press() == 1 and #choices > 0 then picker_open = true end
+  local chosen = Picker.update(picker_open and choices or nil)
+  if chosen == false then
+    picker_open = false
+  elseif chosen then
+    picker_open = false
+    M.choose_respawn(chosen)
   end
 end
 

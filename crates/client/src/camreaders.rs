@@ -961,9 +961,22 @@ unsafe fn laser(c: &Ctx) {
 }
 
 /// The view (index into [`views::centre`]) of this client's player, whose shake this client
-/// renders; None (spectating, before the first window) renders the shared shake.
+/// renders; None (no view yet: before the first window) renders the shared shake.
 pub fn set_local_view(view: Option<usize>) {
     LOCAL_VIEW.store(view.map_or(u32::MAX, |v| v as u32), Ordering::Relaxed);
+}
+
+/// New run (`no_next_run`): the parked simulation shake offsets, this client's own shake and
+/// the fog-of-war passes belong to the old world.
+pub fn reset_run() {
+    SHAKE_AT_CAMERA.store(0, Ordering::Relaxed);
+    LOCAL_SHAKE.store(0, Ordering::Relaxed);
+    LOCAL_VIEW.store(u32::MAX, Ordering::Relaxed);
+    *PARKED.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    for fog in [&FOG1, &FOG2] {
+        *fog.lock().unwrap_or_else(|p| p.into_inner()) = FogPass::new();
+    }
+    FOG_FLAG.store(0, Ordering::Relaxed);
 }
 
 /// After the window closes, before the render camera is set: park the simulation's shake

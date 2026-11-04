@@ -6,6 +6,8 @@ use std::time::Instant;
 
 #[derive(Default)]
 pub struct ClientStream {
+    /// The run these streams belong to (`Start.run`): datagrams of another run are ignored.
+    run: u32,
     /// Unacknowledged local inputs, the first for frame `inputs_first`.
     inputs_first: u32,
     inputs: Vec<Vec<u8>>,
@@ -16,8 +18,12 @@ pub struct ClientStream {
 }
 
 impl ClientStream {
-    pub fn new(first_input_frame: u32) -> Self {
-        Self { inputs_first: first_input_frame, ..Default::default() }
+    pub fn new(run: u32, first_input_frame: u32) -> Self {
+        Self { run, inputs_first: first_input_frame, ..Default::default() }
+    }
+
+    pub fn run(&self) -> u32 {
+        self.run
     }
 
     /// Queue the local input for `frame`. Frames must be pushed in order without gaps.
@@ -47,9 +53,13 @@ impl ClientStream {
         self.tick_ack
     }
 
-    /// Apply a server `Ticks` datagram: drop acknowledged inputs, store new ticks.
-    /// Returns true if anything new arrived.
-    pub fn on_ticks(&mut self, input_ack: u32, first: u32, ticks: Vec<Tick>) -> bool {
+    /// Apply a server `Ticks` datagram of run `run`: drop acknowledged inputs, store new
+    /// ticks (a late datagram of another run changes nothing). Returns true if anything new
+    /// arrived.
+    pub fn on_ticks(&mut self, run: u32, input_ack: u32, first: u32, ticks: Vec<Tick>) -> bool {
+        if run != self.run {
+            return false;
+        }
         if input_ack > self.inputs_first {
             let n = ((input_ack - self.inputs_first) as usize).min(self.inputs.len());
             self.inputs.drain(..n);
@@ -95,7 +105,7 @@ impl ClientStream {
             used += len;
             inputs.push(i.clone());
         }
-        ClientMsg::Inputs { tick_ack: self.tick_ack, first: self.inputs_first, inputs }
+        ClientMsg::Inputs { run: self.run, tick_ack: self.tick_ack, first: self.inputs_first, inputs }
     }
 }
 
@@ -105,7 +115,7 @@ mod tests {
 
     #[test]
     fn acks_trim_inputs_and_ticks_accumulate() {
-        let mut s = ClientStream::new(3);
+        let mut s = ClientStream::new(0, 3);
         for f in 3..8 {
             s.push_input(f, vec![f as u8]);
         }
@@ -117,19 +127,22 @@ mod tests {
             _ => unreachable!(),
         }
         // Server acks inputs up to 6 (needs 6 next) and sends ticks 0..2.
-        assert!(s.on_ticks(6, 0, vec![vec![], vec![(0, vec![1])]]));
+        assert!(s.on_ticks(0, 6, 0, vec![vec![], vec![(0, vec![1])]]));
         match s.inputs_msg() {
-            ClientMsg::Inputs { tick_ack, first, inputs } => {
+            ClientMsg::Inputs { tick_ack, first, inputs, .. } => {
                 assert_eq!((tick_ack, first), (2, 6));
                 assert_eq!(inputs, vec![vec![6], vec![7]]);
             }
             _ => unreachable!(),
         }
         // Redundant repeat of an old tick changes nothing; a gap keeps the ack at 2.
-        assert!(!s.on_ticks(6, 1, vec![vec![(0, vec![1])]]));
-        assert!(s.on_ticks(6, 3, vec![vec![]]));
+        assert!(!s.on_ticks(0, 6, 1, vec![vec![(0, vec![1])]]));
+        assert!(s.on_ticks(0, 6, 3, vec![vec![]]));
         assert_eq!(s.tick_ack(), 2);
-        assert!(s.on_ticks(6, 2, vec![vec![]]));
+        assert!(s.on_ticks(0, 6, 2, vec![vec![]]));
+        // A late datagram of another run is ignored.
+        assert!(!s.on_ticks(1, 9, 4, vec![vec![]]));
+        assert_eq!(s.tick_ack(), 4);
         assert_eq!(s.tick_ack(), 4);
         assert_eq!(s.take_tick(1), Some(vec![(0, vec![1])]));
         assert_eq!(s.take_tick(1), None);
@@ -137,7 +150,7 @@ mod tests {
 
     #[test]
     fn gap_in_pushed_inputs_is_filled_with_repeats() {
-        let mut s = ClientStream::new(0);
+        let mut s = ClientStream::new(0, 0);
         s.push_input(0, vec![1]);
         s.push_input(3, vec![4]);
         match s.inputs_msg() {

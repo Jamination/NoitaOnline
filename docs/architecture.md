@@ -97,7 +97,8 @@ sequenceDiagram
   player) and simulated around every player (identically on every client) instead of around
   each client's own camera; a deterministic eviction replaces the engine's wall-clock one
   (vanilla's rule, applied per player).
-* Deaths do not end the run: a player at 0 HP becomes an invulnerable spectator.
+* Deaths: see `files/players.lua` (a dead player respawns, vanilla's game over is that
+  player's own). When every player is dead at once the run is over: see *Runs* below.
 * **Robe colours** (`files/robes.lua`): during mod init, once the session's player list is
   known, every slot after the first gets virtual copies (`mods/noita_online/robes/<k>/`) of
   the player entity, its robe sprites (body, Lukki body, arm, the unlockable hat's two
@@ -115,10 +116,57 @@ sequenceDiagram
   thread waits on the driver there and the pool workers are idle); cells only change inside
   the window, and the next window entry waits for the worker.
 
+## Runs (game over for everyone, then a new world)
+
+A session is a series of runs, each a world with its own seed and frames counting from 0.
+
+```mermaid
+sequenceDiagram
+  participant A as Client A
+  participant S as Server
+  participant B as Client B
+  Note over A,B: frame f of run n: every player is dead (inside the window, every client)
+  A->>A: NextRun.all_dead(f): run over; vanilla's game over screen
+  B->>B: same
+  A->>A: New game: the main loop ends, the old world is torn down, init.lua runs again
+  A->>S: NextRun{n+1} (after its last state report of run n)
+  S->>S: A leaves run n (its ticks no longer wait for or carry A)
+  S->>B: Ticks of run n (B still simulates the old world)
+  B->>B: New game ...
+  B->>S: NextRun{n+1}
+  S->>A: Start{run n+1, new seed, same roster}
+  S->>B: Start{run n+1, ...}
+```
+
+* Vanilla's new game restarts the game in place: the game-over menu's "New game" opens the
+  game-mode screen (`FUN_006ceb00`, which loads the modes); picking a mode with the game over
+  set calls `FUN_006cc030`, which starts a fade; when the fade ends the game mode's restart
+  request is set, and the end of that frame's world update (`FUN_006b59d0` →
+  `FUN_006af010` → `FUN_006e9f30`) tears the world, entities, Box2D and the mods' Lua states
+  down and rebuilds them, running every mod's `init.lua` again. GameGlobal (`[0x0122374c]`)
+  and the engine's other statics stay, and so does the client runtime (the DLL with its
+  connection, network thread and engine patches).
+* `init.lua` on such a new game calls `no_next_run`: if the run is over (`no_run_over`, set
+  by `NextRun.all_dead`) the runtime resets every per-world piece of its state as in a fresh
+  process (`nextrun::reset_run`, see determinism.md) and sends `NextRun`; then the session
+  start repeats (wait for `Start`, seed, magic numbers, player slots, robes). A new game
+  while the run goes on (from the pause menu) leaves the session as before.
+* Server: a client's `NextRun` takes it out of the run like a departed player, so the clients
+  still on the game-over screen keep simulating the old world in lockstep (and are verified
+  against each other); once every connected client is ready, the server starts the next run:
+  the next seed (with `--seed S`: S for run 0, then a seed derived from S and the run index,
+  so tests are reproducible; otherwise random), the same roster and parameters plus `run=n`,
+  a fresh relay, the input delay carried over with a fresh adaptation. Lockstep datagrams
+  carry their run index; one of another run is ignored. Verification keys reports by (run,
+  frame); `hashes.jsonl` lines carry `run`, `summary.json` lists every run (seed, frames,
+  verification totals) and the current one, `events.log` logs each client leaving a run and
+  each run's start.
+
 ## Server
 
 * Lobby until `--players` clients said hello (same protocol version, game build and mod
-  list), then `Start{seed, players, input_delay, params}`.
+  list), then `Start{run 0, seed, players, input_delay, params}`; each later run starts with
+  its own `Start` once every client sent `NextRun` (see *Runs*).
 * Lockstep relay: per frame, one tick containing every active player's input, emitted in
   order once complete; departed players are dropped from subsequent ticks. The server waits
   on its socket (at most 1 ms, for timers), so a datagram is relayed as soon as it arrives.

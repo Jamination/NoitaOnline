@@ -40,6 +40,7 @@ local SCENE_POLY = SCENE == "poly"
 -- physics chest is put on the spawn point (the previous one removed), so it rolls through
 -- the players standing there.
 local SCENE_CHESTS = SCENE == "chests"
+local SCENE_ACID = SCENE == "acid"
 local scene_chest = 0
 local POOLS = { "acid", "magic_liquid_charm", "magic_liquid_mana_regeneration", "radioactive_liquid" }
 
@@ -248,7 +249,7 @@ local function apart_events(f, players)
 end
 
 local function standing(p)
-  return p.entity and EntityGetIsAlive(p.entity) and not EntityHasTag(p.entity, "noita_online_dead")
+  return p.entity and not p.dead and EntityGetIsAlive(p.entity)
 end
 
 -- NOITA_ONLINE_SCENE=poly (polymorph checks). Until 1300 it mirrors the human session
@@ -311,7 +312,7 @@ local function poly_events(f, players)
       end
       M.log(string.format("poly f=%d slot=%d entity=%d alive=%s file=%s pos=%.1f,%.1f hp=%.2f polymorphed=%s dead=%s hax=%s next_attack=%d",
         f, i, e, tostring(alive), alive and EntityGetFilename(e) or "-", x, y, hp,
-        tostring(alive and EntityHasTag(e, "polymorphed_player")), tostring(alive and EntityHasTag(e, "noita_online_dead")),
+        tostring(alive and EntityHasTag(e, "polymorphed_player")), tostring(q.dead == true),
         tostring(hax), attack))
     end
   end
@@ -322,7 +323,8 @@ end
 -- of Down (crouch) puts the next thing of this cycle at the player's feet: a heart (picked up
 -- by touch), a wand that always casts teleport bolt, a flask of polymorphine, a chest, a perk
 -- (pick up with Interact), then the polymorph effect itself; each press of Kick costs the
--- player 10 HP (while above 30 HP).
+-- player 10 HP (while above 30 HP). With NOITA_ONLINE_SCENE=acid (respawn checks) Down pours
+-- acid onto the player instead.
 local ITEM_CYCLE = { "heart", "wand", "flask", "chest", "perk", "polymorph" }
 local item_state = {}
 function M.items_events(f, players)
@@ -338,7 +340,11 @@ function M.items_events(f, players)
     local down, kick = b.Down == true, b.Kick == true
     if standing(p) then
       local x, y = EntityGetTransform(p.entity)
-      if down and not st.down then
+      if down and not st.down and SCENE_ACID then
+        -- A pool of acid poured onto the player: vanilla's acid death unless it gets out.
+        for k = -2, 2 do GameCreateParticle("acid", x + 6 * k, y - 24, 120, 0, 0, false, false) end
+        if M.log then M.log(string.format("items: acid poured on player %d at %.1f,%.1f frame %d", i, x, y, f)) end
+      elseif down and not st.down then
         local what = ITEM_CYCLE[st.n % #ITEM_CYCLE + 1]
         st.n = st.n + 1
         local e = 0
@@ -387,7 +393,7 @@ end
 
 -- Default scenario: the bot players never die, so every 4800-frame cycle (the 8 phases of
 -- M.input) exercises movement, casts, digging with explosions, throws, kicks, pickups and
--- item switching for the whole session (a dead player is an input-less spectator). Test
+-- item switching for the whole session. Test
 -- scenario only: a standing player (or the creature it is polymorphed into) gets BOT_HP max
 -- HP and is healed to full whenever it drops below half (far more than one frame of damage
 -- here); before the bomb phase its spells' uses are refilled (vanilla's spell refresher), and
@@ -526,8 +532,7 @@ function M.world_events(f, players)
       end
       if f % CYCLE == 6 * PHASE then
         -- every cycle the last player still standing is polymorphed for the long-walk phase
-        -- (a sheep for 600 frames, then restored before the wand edit of the idle phase); a
-        -- dead player's spectator body is not polymorphable
+        -- (a sheep for 600 frames, then restored before the wand edit of the idle phase)
         local target = nil
         for _, q in ipairs(players) do
           if standing(q) then target = q end
@@ -547,6 +552,94 @@ function M.world_events(f, players)
         EntityLoad("data/entities/projectiles/bomb.xml", x + 70, y - 10)
       end
     end
+  end
+end
+
+-- Session scenario "death" (`e2e.sh --scenario death`): the bot scenario (its world events and
+-- inputs) plus deaths and respawns of the last player. A dead bot chooses, 180 frames after
+-- its death, to respawn at the first living player (M.respawn_choice), as the respawn picker
+-- does. Run 0 and every later run of the session (a new world after everyone died):
+--   300  the last player gets 200 gold (the respawn costs half of it);
+--   900  the last player is killed;
+--   2100 the last player is polymorphed into a sheep, killed as the sheep at 2250 (it
+--        respawns as the player the polymorph kept);
+-- run 0 only:
+--   3300 every player is killed: game over for everyone, then a new run (nextrun.lua).
+-- `death` lines log the last player's gold and quick inventory before each death and after
+-- each respawn, and the entities around the place it died (its ragdoll) 5 frames and 1200
+-- frames after each death.
+local deaths = {} -- { x, y, f } of the last player's deaths
+
+local function inventory_summary(e)
+  local quick = quick_inventory(e)
+  local names = {}
+  for _, c in ipairs(quick and EntityGetAllChildren(quick) or {}) do
+    names[#names + 1] = (EntityHasTag(c, "wand") and "wand:" or "item:") .. (EntityGetFilename(c) or "?"):match("[^/]*$")
+  end
+  local wallet = EntityGetFirstComponentIncludingDisabled(e, "WalletComponent")
+  local dm = EntityGetFirstComponentIncludingDisabled(e, "DamageModelComponent")
+  return string.format("gold=%d hp=%.0f/%.0f items=%d [%s]", wallet and ComponentGetValue2(wallet, "money") or -1,
+    dm and ComponentGetValue2(dm, "hp") * 25 or -1, dm and ComponentGetValue2(dm, "max_hp") * 25 or -1, #names,
+    table.concat(names, ","))
+end
+
+local function kill(p, f)
+  local x, y = EntityGetTransform(p.entity)
+  if M.log then M.log(string.format("death f=%d slot=%d killed (%s): %s", f, p.id, EntityGetFilename(p.entity), inventory_summary(p.entity))) end
+  EntityInflictDamage(p.entity, 1000, "DAMAGE_CURSE", "death scenario", "NORMAL", 0, 0, 0, x, y, 0)
+end
+
+function M.death_events(f, players, run)
+  M.world_events(f, players)
+  local last = players[#players]
+  if not last then return end
+  if f == 300 and standing(last) then
+    local wallet = EntityGetFirstComponentIncludingDisabled(last.entity, "WalletComponent")
+    if wallet then ComponentSetValue2(wallet, "money", 200) end
+  elseif (f == 900 or f == 2250) and standing(last) then
+    deaths[#deaths + 1] = { x = EntityGetTransform(last.entity), f = f }
+    deaths[#deaths].y = select(2, EntityGetTransform(last.entity))
+    kill(last, f)
+  elseif f == 2100 and standing(last) then
+    LoadGameEffectEntityTo(last.entity, "data/entities/misc/effect_polymorph.xml")
+  elseif f == 3300 and run == 0 then
+    for _, p in ipairs(players) do
+      if standing(p) then kill(p, f) end
+    end
+  end
+  if M.log then
+    if last.respawn_frame == f then
+      M.log(string.format("death f=%d slot=%d respawned as %d (%s): %s", f, last.id, last.entity, EntityGetFilename(last.entity), inventory_summary(last.entity)))
+    end
+    for _, d in ipairs(deaths) do
+      if f == d.f + 5 then
+        -- The player's ragdoll: the ragdoll parts made from the player's (robe) images.
+        d.parts = {}
+        for _, e in ipairs(EntityGetInRadius(d.x, d.y, 64) or {}) do
+          local shape = EntityGetFirstComponentIncludingDisabled(e, "PhysicsImageShapeComponent")
+          local img = shape and ComponentGetValue2(shape, "image_file") or ""
+          if img:find("ragdolls/player") then d.parts[#d.parts + 1] = { id = e, img = img } end
+        end
+      end
+      if d.parts and (f == d.f + 5 or f == d.f + 1200 or f == d.f + 2400) then
+        local s = {}
+        for _, p in ipairs(d.parts) do
+          local x, y = 0, 0
+          if EntityGetIsAlive(p.id) then x, y = EntityGetTransform(p.id) end
+          s[#s + 1] = string.format("%d:%s:%s@%.0f,%.0f", p.id, p.img:match("[^/]*$"), EntityGetIsAlive(p.id) and "alive" or "gone", x, y)
+        end
+        M.log(string.format("death f=%d ragdoll of the death at f=%d (%.0f,%.0f), %d parts: %s", f, d.f, d.x, d.y, #d.parts, table.concat(s, " ")))
+        if #d.parts > 0 then M.log("death ragdoll images: " .. d.parts[1].img) end
+      end
+    end
+  end
+end
+
+-- The player a dead bot respawns at: the first living one, 180 frames after its death.
+function M.respawn_choice(f, me, players)
+  if not me or not me.death_frame or f < me.death_frame + 180 then return nil end
+  for _, p in ipairs(players) do
+    if p ~= me and standing(p) and not p.left then return p.id end
   end
 end
 

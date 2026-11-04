@@ -6,7 +6,7 @@
 -- everywhere), so every client printed every player's messages. The print statements are
 -- wrapped (text patch of the vanilla script, same line, so line numbers stay) in a test of
 -- the script's own subject entity against this client's player: the entity id kept in the
--- mod setting `noita_online.local_entity` (players.lua; 0 = none: spectating). Nothing else
+-- mod setting `noita_online.local_entity` (players.lua; 0 = none: our player is dead). Nothing else
 -- in the scripts changes, so the simulation is the same on every client; the prints change
 -- nothing in it. Outside a session the setting is "" and every message shows (vanilla).
 local M = {}
@@ -143,7 +143,7 @@ function M.install(log)
   end
 end
 
--- This client's player for the patched scripts: entity id, 0 = none (spectating), nil =
+-- This client's player for the patched scripts: entity id, 0 = none (dead), nil =
 -- every player (no session).
 function M.set_local(entity)
   ModSettingSet(M.SETTING, entity or "")

@@ -27,6 +27,8 @@ struct Bot {
     next_frame_at: Instant,
     last_stream_send: Instant,
     stalled_frames: u64,
+    /// The run being played (`Start.run`); None after leaving it, until the next Start.
+    run: Option<u32>,
 }
 
 const STREAM_RESEND: Duration = Duration::from_millis(16);
@@ -37,6 +39,7 @@ fn main() {
     let mut frames = 3600u32;
     let mut netsim: Option<LinkConditions> = None;
     let mut input_bytes = 6usize;
+    let mut runs = 1u32;
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
         let v = it.next().unwrap_or_default();
@@ -46,8 +49,11 @@ fn main() {
             "--frames" => frames = v.parse().expect("--frames"),
             "--netsim" => netsim = Some(LinkConditions::parse(&v).expect("--netsim")),
             "--input-bytes" => input_bytes = v.parse().expect("--input-bytes"),
+            // Every run but the last ends like an all-dead game over: bot i leaves it (NextRun)
+            // at frame `frames + 60 * i`, the others keep playing it until they leave.
+            "--runs" => runs = v.parse().expect("--runs"),
             _ => {
-                eprintln!("simclient [--server ADDR] [--bots N] [--frames N] [--netsim SPEC] [--input-bytes N]");
+                eprintln!("simclient [--server ADDR] [--bots N] [--frames N] [--netsim SPEC] [--input-bytes N] [--runs N]");
                 std::process::exit(2);
             }
         }
@@ -65,6 +71,7 @@ fn main() {
             next_frame_at: Instant::now(),
             last_stream_send: Instant::now(),
             stalled_frames: 0,
+            run: None,
         })
         .collect();
     let t0 = Instant::now();
@@ -92,16 +99,18 @@ fn main() {
             while let Some((_, d)) = b.client.receive() {
                 match ServerMsg::decode(&d) {
                     Ok(ServerMsg::Welcome { player, .. }) => b.id = player,
-                    Ok(ServerMsg::Start { input_delay, seed, .. }) => {
+                    Ok(ServerMsg::Start { run, input_delay, seed, .. }) => {
+                        b.run = Some(run);
+                        b.frame = 0;
                         b.delay = input_delay as u32;
                         b.state = seed as u64;
                         b.next_input = b.delay;
-                        b.stream = Some(ClientStream::new(b.delay));
+                        b.stream = Some(ClientStream::new(run, b.delay));
                         b.next_frame_at = Instant::now();
                     }
-                    Ok(ServerMsg::Ticks { input_ack, first, ticks }) => {
+                    Ok(ServerMsg::Ticks { run, input_ack, first, ticks }) => {
                         if let Some(s) = &mut b.stream {
-                            s.on_ticks(input_ack, first, ticks);
+                            s.on_ticks(run, input_ack, first, ticks);
                         }
                     }
                     // A shorter delay pauses submitting until the simulation catches up; a
@@ -114,10 +123,21 @@ fn main() {
                     _ => {}
                 }
             }
+            let Some(run) = b.run else { continue };
             let Some(stream) = &mut b.stream else { continue };
+            let last_run = run + 1 >= runs;
+            let leave_at = frames + 60 * i as u32;
+            if !last_run && b.frame >= leave_at {
+                let _ = b.client.send(CH_RELIABLE, &ClientMsg::NextRun { run: run + 1 }.encode());
+                b.client.flush();
+                b.run = None;
+                b.stream = None;
+                continue;
+            }
+            let end = if last_run { frames } else { leave_at };
             let mut pushed = false;
             // Keep input submitted `delay` frames ahead of the simulation.
-            while b.next_input <= b.frame + b.delay && b.next_input < frames + b.delay {
+            while b.next_input <= b.frame + b.delay && b.next_input < end + b.delay {
                 let f = b.next_input;
                 let data: Vec<u8> =
                     (0..input_bytes).map(|k| (mix(f as u64 ^ ((b.id as u64) << 40), k as u64) & 0xff) as u8).collect();
@@ -132,7 +152,7 @@ fn main() {
                 b.last_stream_send = now;
             }
             // Advance at most at 60 Hz, only when the tick is present.
-            if b.frame < frames && now >= b.next_frame_at {
+            if b.frame < end && now >= b.next_frame_at {
                 if let Some(inputs) = stream.take_tick(b.frame) {
                     for (p, d) in &inputs {
                         b.state = mix(b.state, *p as u64);
@@ -156,7 +176,7 @@ fn main() {
                     b.stalled_frames += 1;
                 }
             }
-            if b.frame >= frames {
+            if last_run && b.frame >= frames {
                 done += 1;
             }
         }

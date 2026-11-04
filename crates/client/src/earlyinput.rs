@@ -85,6 +85,13 @@ pub fn fresh() -> bool {
     }
 }
 
+/// New run (`no_next_run`): the old world's ControlsSystem and proxy component are gone.
+pub fn reset_run() {
+    SYSTEM.store(0, Ordering::Relaxed);
+    EARLY_COMPONENT.store(0, Ordering::Relaxed);
+    EARLY_FRAME.store(u32::MAX, Ordering::Relaxed);
+}
+
 /// Patch `early_input` (module docs; the early call itself is in `early_window`).
 ///
 /// # Safety

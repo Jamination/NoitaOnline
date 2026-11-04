@@ -35,6 +35,10 @@ pub mod rngwatch;
 #[cfg(all(windows, target_arch = "x86"))]
 pub mod world;
 #[cfg(all(windows, target_arch = "x86"))]
+pub mod respawn;
+#[cfg(all(windows, target_arch = "x86"))]
+pub mod nextrun;
+#[cfg(all(windows, target_arch = "x86"))]
 pub mod invgui;
 #[cfg(all(windows, target_arch = "x86"))]
 pub mod slots;
@@ -82,11 +86,24 @@ pub extern "C" fn no_abi_version() -> u32 {
     1
 }
 
-/// Initialise the runtime (idempotent).
+/// Initialise the runtime (idempotent). The first call pins this DLL in the process: every
+/// new game closes the mods' Lua states, which unloads a library loaded with `ffi.load` (its
+/// handle is collected), and the engine patches, the network thread and the session state
+/// must outlive them (the next run's `init.lua` loads it again and finds them).
 #[no_mangle]
 pub extern "C" fn no_init() -> i32 {
     let mut g = RUNTIME.lock().unwrap_or_else(|p| p.into_inner());
     if g.is_none() {
+        #[cfg(windows)]
+        {
+            extern "system" {
+                fn GetModuleHandleExW(flags: u32, name: *const u16, module: *mut isize) -> i32;
+            }
+            const FROM_ADDRESS_PIN: u32 = 0x4 | 0x1;
+            let mut module = 0isize;
+            // SAFETY: the address is this function's, inside this module.
+            unsafe { GetModuleHandleExW(FROM_ADDRESS_PIN, no_init as *const u16, &mut module) };
+        }
         *g = Some(Runtime { shared: Shared::new(), net: None, timer: perf::FrameTimer::default() });
     }
     0
@@ -172,6 +189,23 @@ pub unsafe extern "C" fn no_start_info(out: *mut StartInfoC) -> i32 {
     })
 }
 
+/// Copy the name of the session's `index`-th player (roster order, as in `no_start_info`)
+/// into `out` (NUL-terminated). Returns its length, or -1 if there is none.
+///
+/// # Safety
+/// `out` must point at `cap` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn no_player_name(index: u32, out: *mut u8, cap: u32) -> i32 {
+    with_rt(-1, |rt| {
+        let s = rt.shared.state.lock().unwrap();
+        let Some((_, name)) = s.start.as_ref().and_then(|st| st.players.get(index as usize)) else { return -1 };
+        let n = name.len().min(cap.saturating_sub(1) as usize);
+        std::ptr::copy_nonoverlapping(name.as_ptr(), out, n);
+        *out.add(n) = 0;
+        n as i32
+    })
+}
+
 /// This client's Box2D step took longer than BOX2D_THREAD_MAX_WAIT_IN_MS since its last
 /// input (patch `box2d_freeze`). Every input carries it as a trailing byte, which
 /// `no_wait_tick` strips: a tick in which any player reports a slow step freezes the most
@@ -180,6 +214,13 @@ pub(crate) static BOX2D_STEP_SLOW: std::sync::atomic::AtomicBool = std::sync::at
 
 /// The camera stream of this client's inputs (see `views`).
 static CAMERA_ENCODER: Mutex<views::CameraEncoder> = Mutex::new(views::CameraEncoder::new());
+
+/// New run: the input trailer's camera stream and slow-step flag start afresh.
+#[cfg(all(windows, target_arch = "x86"))]
+fn reset_input_trailer() {
+    CAMERA_ENCODER.lock().unwrap_or_else(|p| p.into_inner()).reset();
+    BOX2D_STEP_SLOW.store(false, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// This client's render camera for the input being sent: the camera it drew the last frame
 /// with (taken at the early window entry, before the simulation camera replaces it).
@@ -664,8 +705,9 @@ pub unsafe extern "C" fn no_evict_chunks(foci: *const i32, n: u32, frame: u32) -
 pub extern "C" fn no_sim_enter() {
     #[cfg(all(windows, target_arch = "x86"))]
     unsafe {
-        patches::sim_rng_enter()
-    };
+        patches::sim_rng_enter();
+        respawn::sim_enter();
+    }
 }
 
 /// Leave the simulation window: save the simulation stream, restore this client's own.
@@ -673,8 +715,9 @@ pub extern "C" fn no_sim_enter() {
 pub extern "C" fn no_sim_leave() {
     #[cfg(all(windows, target_arch = "x86"))]
     unsafe {
-        patches::sim_rng_leave()
-    };
+        patches::sim_rng_leave();
+        respawn::sim_leave();
+    }
 }
 
 /// Set the simulation camera centre (inside the simulation window). Unlike Lua's
@@ -849,7 +892,7 @@ pub unsafe extern "C" fn no_focus_freeze(xy: *const f32, n: u32) {
 }
 
 /// This client's player's view: its index among the foci last passed to `no_focus_freeze`,
-/// -1 when it has none (spectating). The client renders the screen shake of that view.
+/// -1 when it has none (before the players exist). The client renders the screen shake of that view.
 #[no_mangle]
 pub extern "C" fn no_local_view(i: i32) {
     #[cfg(all(windows, target_arch = "x86"))]
@@ -948,6 +991,64 @@ pub extern "C" fn no_wait_started(timeout_ms: u32) -> i32 {
     }
 }
 
+/// Every player is dead at simulation frame `frame` (`NextRun.all_dead`, inside the window,
+/// on every client): the run is over, and this client's next new game starts the next run
+/// (`no_next_run`) instead of leaving the session.
+#[no_mangle]
+pub extern "C" fn no_run_over(frame: u32) {
+    #[cfg(all(windows, target_arch = "x86"))]
+    nextrun::set_run_over(frame);
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    let _ = frame;
+}
+
+/// The frame at which the current run ended (every player dead), or -1 while it runs.
+#[no_mangle]
+pub extern "C" fn no_run_over_frame() -> i32 {
+    #[cfg(all(windows, target_arch = "x86"))]
+    return nextrun::run_over().map_or(-1, |f| f.min(i32::MAX as u32) as i32);
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    -1
+}
+
+/// A new game after the run ended (call at the top of the new game's `init.lua`, before the
+/// world exists): reset every per-run piece of the runtime's state and tell the server this
+/// client is ready for the next run; then wait for it as at the session start
+/// (`no_wait_started`, `no_start_info`). Returns the next run's index, -1 if the run is not
+/// over (a new game in the middle of a run leaves the session), -2 outside a started session.
+#[no_mangle]
+pub extern "C" fn no_next_run() -> i32 {
+    #[cfg(all(windows, target_arch = "x86"))]
+    {
+        if nextrun::run_over().is_none() {
+            return -1;
+        }
+        let Some(shared) = with_rt(None, |rt| Some(rt.shared.clone())) else { return -2 };
+        // The old run's last state reports are queued before NextRun.
+        unsafe { nextrun::reset_run() };
+        net::next_run(&shared).map_or(-2, |r| r as i32)
+    }
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    -1
+}
+
+/// Scripted runs: press vanilla's "New game" (game-over menu, then the mode screen's button
+/// for the current game mode), outside the simulation window. Returns 1 if a new game was
+/// requested, else 0 (reason in `no_last_error`).
+#[no_mangle]
+pub extern "C" fn no_press_new_game() -> i32 {
+    #[cfg(all(windows, target_arch = "x86"))]
+    return match unsafe { nextrun::press_new_game() } {
+        Ok(()) => 1,
+        Err(e) => {
+            set_last_error(e);
+            0
+        }
+    };
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    0
+}
+
 /// Smoothed round-trip time to the server in µs (from pings).
 #[no_mangle]
 pub extern "C" fn no_rtt_us() -> u64 {
@@ -972,4 +1073,83 @@ pub extern "C" fn no_shutdown() {
     if let Some(h) = handle {
         let _ = h.join();
     }
+}
+
+/// Store the dying player of session slot `slot` (entity `entity_id`, with its children) for
+/// its respawn (`respawn`). Inside the simulation window. Returns the record size, -1 if the
+/// entity does not exist.
+#[no_mangle]
+pub extern "C" fn no_respawn_save(slot: u32, entity_id: u32) -> i32 {
+    #[cfg(all(windows, target_arch = "x86"))]
+    return unsafe { respawn::save(slot as usize, entity_id) };
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    {
+        let _ = (slot, entity_id);
+        -1
+    }
+}
+
+/// Store the player of slot `slot` kept by a polymorph (`mSerializedData`, base64, `len`
+/// bytes) for its respawn. Returns the record size, -1 if malformed.
+///
+/// # Safety
+/// `data` must point at `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn no_respawn_save_b64(slot: u32, data: *const u8, len: u32) -> i32 {
+    #[cfg(all(windows, target_arch = "x86"))]
+    return respawn::save_base64(slot as usize, std::slice::from_raw_parts(data, len as usize));
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    {
+        let _ = (slot, data, len);
+        -1
+    }
+}
+
+/// Load the player stored for slot `slot` as a new entity at x, y (inside the simulation
+/// window). Returns its id, 0 if none is stored.
+#[no_mangle]
+pub extern "C" fn no_respawn_restore(slot: u32, x: f32, y: f32) -> u32 {
+    #[cfg(all(windows, target_arch = "x86"))]
+    return unsafe { respawn::restore(slot as usize, x, y) };
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    {
+        let _ = (slot, x, y);
+        0
+    }
+}
+
+/// Whether the game-over menu's "New game" button respawns this client's player (1: it
+/// reads "Respawn" and only records the click, see `no_respawn_take_press`) or is vanilla's.
+#[no_mangle]
+pub extern "C" fn no_respawn_mode(on: i32) {
+    #[cfg(all(windows, target_arch = "x86"))]
+    respawn::set_respawn_mode(on != 0);
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    let _ = on;
+}
+
+/// 1 if the game-over menu's respawn button was clicked since the last call, else 0.
+#[no_mangle]
+pub extern "C" fn no_respawn_take_press() -> i32 {
+    #[cfg(all(windows, target_arch = "x86"))]
+    return respawn::take_press() as i32;
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    0
+}
+
+/// Every player is dead (inside the window, identically on every client): from now on the
+/// world update sees vanilla's game over.
+#[no_mangle]
+pub extern "C" fn no_game_over_shared() {
+    #[cfg(all(windows, target_arch = "x86"))]
+    respawn::set_shared_game_over();
+}
+
+/// This client's player respawned: undo its game over (outside the window).
+#[no_mangle]
+pub extern "C" fn no_game_over_clear() {
+    #[cfg(all(windows, target_arch = "x86"))]
+    unsafe {
+        respawn::clear_local_game_over()
+    };
 }

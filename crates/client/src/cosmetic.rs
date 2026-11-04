@@ -428,6 +428,15 @@ pub fn join_cell_emitters() {
     drop(join_scan());
 }
 
+/// New run (`no_next_run`): the last scan's emitters (cells and effects of the old world) are
+/// dropped and no scan is armed.
+pub fn reset_run() {
+    SCAN_ARMED.store(false, Ordering::Relaxed);
+    let mut state = join_scan();
+    state.ready = false;
+    state.found.clear();
+}
+
 /// Start scanning for the next window entry's emitters on the worker (buffer swap after a
 /// window exit; without a worker the scan runs here).
 ///

@@ -602,6 +602,16 @@ pub fn take_ops() -> Vec<u8> {
     std::mem::take(&mut *OPS.lock().unwrap_or_else(|p| p.into_inner()))
 }
 
+/// New run (`no_next_run`): the old world's InventoryGuiSystem, local player, pending ops and
+/// "replace which item" screen are gone; the inventory screen starts closed.
+pub fn reset_run() {
+    SYSTEM.store(0, Ordering::Relaxed);
+    *LOCAL.lock().unwrap_or_else(|p| p.into_inner()) = (0, 0, 0);
+    OPS.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    *SWAP.lock().unwrap_or_else(|p| p.into_inner()) = (0, 0);
+    INVENTORY_OPEN.store(0, Ordering::Relaxed);
+}
+
 unsafe fn set_active(owner: u32, item: u32, flag: u32, p4: u32) {
     std::arch::asm!(
         "push {p4}",

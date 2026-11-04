@@ -21,6 +21,8 @@ harness/sim_test.sh 4 1800 loss=0.05,latency=100
 
 Server plus `simclient` bots running the full lockstep loop at 60 Hz, with each bot's state
 derived from the ticks it consumed (relay bugs show up as verification mismatches).
+`RUNS=3 harness/sim_test.sh 3 600` plays three runs: every run but the last ends with each
+bot leaving it (`NextRun`) at frame 600 + 60 · its index while the others keep playing it.
 
 ## End-to-end with real Noita clients
 
@@ -51,6 +53,20 @@ harness/fps_pairs.sh --pairs 3 --seed 98765432 --frames 3600 --out run/e2e/fps  
 harness/e2e.sh --pin --solo --players 4 --frames 36000 --out run/e2e/solo4   # informational
 harness/evaluate.py --run run/e2e/full --netsim-run run/e2e/netsim \
   --fps-run run/e2e/fps/mp_* --baseline run/e2e/fps/solo_* --info-baseline run/e2e/solo4
+```
+
+**Next run** (`--scenario restart`, `files/nextrun.lua`): the bot scenario, and in the first
+run every player counts as dead at frame 1200 (`NextRun.all_dead` inside the window,
+vanilla's `GameTriggerGameOver` outside it, a stand-in for the real all-dead path); each bot
+presses vanilla's New game 120 + 180 · its player id frames later (`no_press_new_game`), so
+the clients leave the old world at different frames while the others keep simulating it;
+the new run (new seed, same players) then plays the bot scenario. `--frames` (and
+`NOITA_ONLINE_DURATION`) counts frames per run: a client finishes when its current run
+reaches it. `summary.json` lists each run's frames and verification totals under `runs`;
+`hashes.jsonl` lines carry the run.
+
+```sh
+harness/e2e.sh --players 2 --scenario restart --frames 2700 --seed 98765432 --timeout 1500 --out run/nextrun/2p
 ```
 
 * `--pin` gives client *k* its own physical core (CPUs `B+k` and `B+6+k`, `B` =

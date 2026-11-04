@@ -387,6 +387,13 @@ pub fn join() {
     check_step_time();
 }
 
+/// New run (`no_next_run`): the old world's last step was joined at its teardown
+/// (`world_teardown`); its slow-step report is dropped.
+pub fn reset_run() {
+    UNCHECKED.store(false, Ordering::Relaxed);
+    *CHECK_BODIES.lock().unwrap_or_else(|p| p.into_inner()) = None;
+}
+
 /// The grid update's join of the last step (ECX = GridWorld+0x4f8): normally DeathMatch::Update
 /// joined it already.
 extern "fastcall" fn grid_join(handle: u32) {

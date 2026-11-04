@@ -210,6 +210,19 @@ pub fn set_slots(ids: &[u32], local: i32, proxy_id: u32) {
     PROXY_ID.store(proxy_id, Ordering::Relaxed);
 }
 
+/// New run (`no_next_run`): no slots, proxy or local player until the new world's players are
+/// set up; this client's own damage flash and the parked shared one belong to the old world.
+pub fn reset_run() {
+    set_slots(&[], -1, 0);
+    SUBJECT_LOCAL.store(0, Ordering::Relaxed);
+    POLY_ATTACK_ACTIVE.store(0, Ordering::Relaxed);
+    LOCAL_FLASH.store(0, Ordering::Relaxed);
+    LOCAL_FLASH_RATE.store(1.0f32.to_bits(), Ordering::Relaxed);
+    SHARED_FLASH.store(0, Ordering::Relaxed);
+    SHARED_FLASH_RATE.store(0, Ordering::Relaxed);
+    FLASH_PARKED.store(0, Ordering::Relaxed);
+}
+
 /// Current entity id of every slot (after polymorphs), into `out`. Returns the slot count.
 pub fn slot_ids(out: &mut [u32]) -> usize {
     let n = (SLOT_COUNT.load(Ordering::Relaxed) as usize).min(out.len());
@@ -245,7 +258,7 @@ unsafe fn id_of(e: u32) -> u32 {
     }
 }
 
-unsafe fn entity(id: u32) -> u32 {
+pub(crate) unsafe fn entity(id: u32) -> u32 {
     let mgr = rd(ENTITY_MANAGER);
     if id == 0 || mgr == 0 {
         return 0;

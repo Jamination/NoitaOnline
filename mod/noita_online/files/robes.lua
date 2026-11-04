@@ -54,6 +54,13 @@ function M.entity_file(index)
   return files[index] or PLAYER
 end
 
+-- Robe colour of the slot at (1-based) position `index`: its light shade (RGB) and name.
+function M.colour(index)
+  if index <= 1 then return VANILLA[1], "purple" end
+  local p = M.PALETTE[(index - 2) % #M.PALETTE + 1]
+  return p[1], p.name
+end
+
 local function rgb(c) return bit.rshift(c, 16) % 256, bit.rshift(c, 8) % 256, c % 256 end
 
 -- ABGR pixel with RGB `c` and alpha `a`, as a non-negative number.
