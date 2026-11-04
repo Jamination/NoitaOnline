@@ -154,6 +154,10 @@ else
   session.scenario = info.params.scenario or ""
   -- The run (world) of the session: 0 first, then one more after every all-dead game over.
   session.run = tonumber(info.params.run) or 0
+  -- The in-game date and time (weather, holidays, GameGetDateAndTime*) is the server's start
+  -- time of this run plus game time, in UTC, on every client (crates/client/src/clock.rs).
+  local start_time = tonumber(info.params.time)
+  if start_time then NO.lib.no_set_session_time(start_time) end
   log(string.format("session started: run=%d seed=%.0f delay=%d me=%d players=%s", session.run, info.seed, info.input_delay, info.player, table.concat(info.players, ",")))
   NextRun = dofile_once(ROOT .. "nextrun.lua")
   NextRun.log = log
@@ -221,7 +225,10 @@ function OnPlayerSpawned(player)
     GameSetCameraFree(true)
   end
   ready = true
-  log("players ready at frame " .. GameGetFrameNum())
+  -- The calendar the engine reads (GetLocalTime through the clock patch), the same on every
+  -- client of the session.
+  local y, mo, d, h, mi, s = GameGetDateAndTimeLocal()
+  log(string.format("players ready at frame %d; local time %04d-%02d-%02d %02d:%02d:%02d", GameGetFrameNum(), y, mo, d, h, mi, s))
 end
 
 -- The mouse in world coordinates as this client sees it, for a frame without the client

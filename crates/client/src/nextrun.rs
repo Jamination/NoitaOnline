@@ -77,9 +77,11 @@ pub(crate) unsafe fn patch(ex: &mut Exec) -> Result<(), PatchError> {
 
 /// The game restarts in place (a new game): nothing of ours may read the old world after this.
 extern "fastcall" fn restart(game_mode: u32) {
+    unsafe { crate::patches::mem_dump_diag("t") };
     world_teardown();
     let f: extern "fastcall" fn(u32) = unsafe { std::mem::transmute(RESTART_FN as usize) };
     f(game_mode);
+    unsafe { crate::patches::mem_dump_diag("a") };
 }
 
 fn world_teardown() {
@@ -94,6 +96,7 @@ fn world_teardown() {
 /// # Safety
 /// Game thread.
 pub unsafe fn reset_run() {
+    crate::patches::mem_dump_diag("r");
     world_teardown();
     crate::patches::reset_run();
     crate::box2d::reset_run();

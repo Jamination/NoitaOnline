@@ -240,6 +240,11 @@ fn slot_of(id: u32) -> Option<usize> {
     (0..n).find(|&i| SLOT_IDS[i].load(Ordering::Relaxed) == id)
 }
 
+/// Whether entity `id` is a session slot's current entity.
+pub fn is_slot(id: u32) -> bool {
+    slot_of(id).is_some()
+}
+
 /// Entity id of this client's own slot (0: none).
 pub fn local_id() -> u32 {
     let i = LOCAL_SLOT.load(Ordering::Relaxed);

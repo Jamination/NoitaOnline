@@ -70,6 +70,7 @@ void no_respawn_mode(int32_t on);
 int32_t no_respawn_take_press(void);
 void no_game_over_shared(void);
 void no_game_over_clear(void);
+void no_local_death(uint32_t entity_id);
 ]])
 
 local M = {}

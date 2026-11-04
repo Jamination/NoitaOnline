@@ -1145,6 +1145,16 @@ pub extern "C" fn no_game_over_shared() {
     respawn::set_shared_game_over();
 }
 
+/// This client's own player (entity `entity_id`) dies in this frame's world update (inside the
+/// window): its death finishes this client's game-over stats (cause of death, gold, time).
+#[no_mangle]
+pub extern "C" fn no_local_death(entity_id: u32) {
+    #[cfg(all(windows, target_arch = "x86"))]
+    respawn::set_local_death(entity_id);
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    let _ = entity_id;
+}
+
 /// This client's player respawned: undo its game over (outside the window).
 #[no_mangle]
 pub extern "C" fn no_game_over_clear() {

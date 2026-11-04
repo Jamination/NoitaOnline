@@ -1302,6 +1302,7 @@ const PATCHES: &[(&str, PatchFn)] = &[
     ("sound_rng", |ex| unsafe { crate::slots::patch_sound_rng(ex) }),
     ("local_presentation", |ex| unsafe { crate::slots::patch_presentation(ex) }),
     ("game_over_respawn", |ex| unsafe { crate::respawn::patch_game_over_button(ex) }),
+    ("death_cause", |ex| unsafe { crate::respawn::patch_death_cause(ex) }),
     ("world_teardown", |ex| unsafe { crate::nextrun::patch(ex) }),
 ];
 
@@ -1311,12 +1312,21 @@ const PATCHES: &[(&str, PatchFn)] = &[
 /// # Safety
 /// Must run inside noita.exe build 0x6794ee3c on the game thread.
 pub unsafe fn fix_seeds(seed: u32) {
+    mem_dump_diag("s");
     *((PLATFORM + 0xa0) as *mut u32) = 0x0012_d687 ^ seed.rotate_left(13);
     *((PLATFORM + 0xa4) as *mut u32) = seed;
     *(GLOBAL_LCG as *mut u32) = seed ^ 0xc;
     *(GLOBAL_PM as *mut f64) = seed as f64;
     *(PARTICLE_RNG as *mut f64) = seed as f64;
     SESSION_SEED.store(seed, Ordering::Relaxed);
+    // A next run's world reuses the old GridWorld ([`reset_run`]): its RNG gets the value
+    // construction would give it (`FUN_00717c50`: the platform RNG ^ 0xc).
+    if GRID_RNG_RESEED.swap(false, Ordering::Relaxed) {
+        let gw = grid_world_ptr();
+        if gw != 0 {
+            *((gw + GW_RNG) as *mut u32) = *((PLATFORM + 0xa0) as *const u32) ^ 0xc;
+        }
+    }
     let rs = RAND_STATE_ADDR.load(Ordering::Relaxed);
     if rs != 0 {
         *(rs as *mut u32) = seed.wrapping_mul(0x9e37_79b9) | 1;
@@ -1394,6 +1404,26 @@ const REQUEST_LOAD_FN: u32 = 0x0073_dab0;
 /// GridWorld: the last camera load rect ({x, y, w, h}) and the camera loads' off switch.
 const GW_CAMERA_LOAD_RECT: u32 = 0x4a8;
 const GW_CAMERA_LOADS_OFF: u32 = 0x5cc;
+/// The camera load rect GridWorld init (`FUN_007184d0`) stores before its first camera load
+/// (`[0x01054340]`).
+const GW_CAMERA_LOAD_RECT_INIT: [i32; 4] = [64, 64, 128, 128];
+/// GridWorld: its RNG (grid::GridRandomUtility state) and frame counter (incremented at the
+/// start of every grid update, read through the world's vtable+0x10).
+const GW_RNG: u32 = 4;
+const GW_FRAME: u32 = 0x4fc;
+/// GameGlobal: world frames (counted with the frame number by GameGlobal::Update
+/// `FUN_006363b0`; a new game resets only the frame number).
+const GG_WORLD_FRAMES: u32 = 4;
+/// Set by [`reset_run`]: the next [`fix_seeds`] seeds the reused GridWorld's RNG.
+static GRID_RNG_RESEED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The GridWorld (`[[GameGlobal+0xc]+0x44]`), 0 before the world exists.
+unsafe fn grid_world_ptr() -> u32 {
+    let gg = rd(GAME_GLOBAL_PTR);
+    let world_data = if gg != 0 { rd(gg + 0x0c) } else { 0 };
+    if world_data != 0 { rd(world_data + 0x44) } else { 0 }
+}
+
 /// The streaming keep-alive list (std::vector of 0x18-byte entries: +0 expiry frame, +0x10 /
 /// +0x14 pointers to the chunk's x / y; written by `FUN_0073aa70`, e.g. for the player's
 /// StreamingKeepAliveComponent), which vanilla's eviction leaves alone.
@@ -1785,6 +1815,7 @@ pub unsafe fn sim_rng_enter() {
     sync_platform_frame();
     camera_loads_window_entry();
     rng_log('<');
+    mem_dump_diag("w");
     {
         let gg = rd(GAME_GLOBAL_PTR);
         let wd = if gg != 0 { rd(gg + 0x0c) } else { 0 };
@@ -1986,6 +2017,42 @@ unsafe fn rng_watch(enter: bool) {
     let rs = RAND_STATE_ADDR.load(Ordering::Relaxed);
     let watch = [(GLOBAL_LCG, 4), (PARTICLE_RNG, 8), (if gw != 0 { gw + 4 } else { 0 }, 4), (rs, 4)];
     crate::rngwatch::on_window(enter, if gg != 0 { rd(gg) } else { 0 }, watch);
+}
+
+/// TEMP diagnostics (`NOITA_ONLINE_MEMDUMP=1`): at frame 0 and 1's window entry, at
+/// `fix_seeds` and at `reset_run`, dump noita.exe's .data, the GridWorld, GameGlobal and
+/// WorldData to `mem_<inst>_<n>_<tag>f<frame>.bin`.
+pub(crate) unsafe fn mem_dump_diag(tag: &str) {
+    static N: AtomicU32 = AtomicU32::new(0);
+    if std::env::var_os("NOITA_ONLINE_MEMDUMP").is_none() {
+        return;
+    }
+    let gg = rd(GAME_GLOBAL_PTR);
+    if gg != 0 && rd(gg) > 1 && tag == "w" {
+        return;
+    }
+    let Ok(out) = std::env::var("NOITA_ONLINE_OUT") else { return };
+    let inst = std::env::var("NOITA_ONLINE_INSTANCE").unwrap_or_default();
+    let wd = if gg != 0 { rd(gg + 0x0c) } else { 0 };
+    let gw = if wd != 0 { rd(wd + 0x44) } else { 0 };
+    let mut buf: Vec<u8> = Vec::new();
+    let mut put = |addr: u32, len: usize| {
+        buf.extend_from_slice(&addr.to_le_bytes());
+        buf.extend_from_slice(&(len as u32).to_le_bytes());
+        if addr != 0 {
+            buf.extend_from_slice(std::slice::from_raw_parts(addr as *const u8, len));
+        } else {
+            buf.extend(std::iter::repeat_n(0u8, len));
+        }
+    };
+    put(0x0115_2000, 0xd7650);
+    put(gw, 0x600);
+    put(gg, if gg != 0 { 0x1a0 } else { 0 });
+    put(wd, 0x200);
+    put(if gg != 0 { rd(gg + 0x10) } else { 0 }, 0x600);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let f = if gg != 0 { rd(gg) } else { 0 };
+    let _ = std::fs::write(std::path::Path::new(&out).join(format!("mem_{inst}_{n:02}_{tag}f{f}.bin")), &buf);
 }
 
 /// Diagnostics: `NOITA_ONLINE_RNGLOG=from-to` appends the simulation RNG states at every
@@ -2904,6 +2971,20 @@ pub unsafe fn focus_freeze_step(foci: &[(f32, f32)]) {
 /// ([`PF_REFRESH_STATE`], a static that the new game keeps: it holds the old world's
 /// pathfinding chunk table and each client's progress in its cycle).
 ///
+/// The engine's GridWorld outlives the new game as well: GameGlobal+0x10 and WorldData+0x44
+/// keep pointing at the same object, which only a fresh process constructs (`FUN_00717c50`,
+/// via `FUN_006f1230`); the rebuild only clears parts of it. Three of its fields kept what each
+/// client's old world left and fed the new world's simulation (run 1 of a 2-player restart
+/// differed from frame 20 on): its RNG (+4: drawn by the falling-sand update, seeded once at
+/// construction from the platform RNG, `rng ^ 0xc`), its frame counter (+0x4fc: the creation
+/// frame of generated fire and liquid cells, `chunk_frame`), and the last camera load rect
+/// (+0x4a8, the base of the look-ahead load: the rebuild runs with camera loads off, +0x5cc, so
+/// it still held each client's last camera at its teardown, and the first window's view loads
+/// look ahead from it). GameGlobal::Update (`FUN_006363b0`) counts the world frames (+4) beside
+/// the frame number (+0), and the new game resets only the latter. They get their construction
+/// values: frames 0, the rect GridWorld init (`FUN_007184d0`) starts from, and the RNG from the
+/// new seed's platform RNG ([`fix_seeds`]).
+///
 /// # Safety
 /// Game thread, between the old world's teardown and the new world's creation.
 pub unsafe fn reset_run() {
@@ -2928,4 +3009,14 @@ pub unsafe fn reset_run() {
     PF_FOCI.lock().unwrap_or_else(|p| p.into_inner()).clear();
     PF_REFRESH.lock().unwrap_or_else(|p| p.into_inner()).clear();
     std::ptr::write_bytes(PF_REFRESH_STATE as *mut u8, 0, PF_REFRESH_STATE_LEN);
+    let gg = rd(GAME_GLOBAL_PTR);
+    if gg != 0 {
+        *((gg + GG_WORLD_FRAMES) as *mut u32) = 0;
+    }
+    let gw = grid_world_ptr();
+    if gw != 0 {
+        *((gw + GW_FRAME) as *mut u32) = 0;
+        std::ptr::copy_nonoverlapping(GW_CAMERA_LOAD_RECT_INIT.as_ptr(), (gw + GW_CAMERA_LOAD_RECT) as *mut i32, 4);
+        GRID_RNG_RESEED.store(true, Ordering::Relaxed);
+    }
 }

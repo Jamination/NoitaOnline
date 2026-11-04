@@ -442,6 +442,9 @@ local function die(slot, frame)
       size, kind = NO.lib.no_respawn_save(slot.index - 1, e), "player"
     end
     local dm = EntityGetFirstComponentIncludingDisabled(e, "DamageModelComponent")
+    -- Our own player's death finishes this client's game-over stats (cause of death, gold,
+    -- time), as vanilla's player death does (crates/client/src/respawn.rs).
+    if slot.id == M.local_id then NO.lib.no_local_death(e) end
     if dm then ComponentSetValue2(dm, "kill_now", true) else EntityKill(e) end
   end
   slot.dead, slot.death_x, slot.death_y, slot.death_frame = true, x, y, frame
