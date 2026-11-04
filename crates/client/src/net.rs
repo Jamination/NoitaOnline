@@ -30,6 +30,8 @@ pub struct StartInfo {
     pub players: Vec<(u8, String)>,
     /// Session parameters from the server ("key=value" text).
     pub params: String,
+    /// The session's persistent progress (`Start.progress`: the host's save; empty after run 0).
+    pub progress: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -237,6 +239,8 @@ pub struct ConnectParams {
     pub game_build: String,
     pub mod_hash: u64,
     pub netsim: Option<LinkConditions>,
+    /// This client's persistent progress (`protocol::Progress`, encoded) for `Hello`.
+    pub progress: Vec<u8>,
 }
 
 /// Repeat unacknowledged inputs at least this often while the game waits for a tick (else
@@ -329,6 +333,7 @@ fn run(shared: Arc<Shared>, mut client: Client, p: ConnectParams) {
                     game_build: p.game_build.clone(),
                     mod_hash: p.mod_hash,
                     name: p.name.clone(),
+                    progress: p.progress.clone(),
                 };
                 let _ = client.send(CH_RELIABLE, &hello.encode());
                 client.flush();
@@ -406,10 +411,10 @@ fn receive(shared: &Shared, client: &mut Client) -> bool {
             ServerMsg::Lobby { players, needed } => {
                 s.events.push_back(format!("lobby: {}/{} {:?}", players.len(), needed, players));
             }
-            ServerMsg::Start { run, seed, players, input_delay, session_id, params } => {
+            ServerMsg::Start { run, seed, players, input_delay, session_id, params, progress } => {
                 let player = s.player.unwrap_or(0);
                 let params = String::from_utf8_lossy(&params).into_owned();
-                s.start = Some(StartInfo { run, seed, player, input_delay, session_id, players: players.clone(), params });
+                s.start = Some(StartInfo { run, seed, player, input_delay, session_id, players: players.clone(), params, progress });
                 s.stream = Some(ClientStream::new(run, input_delay as u32));
                 s.input_delay = input_delay;
                 s.status = Some(Status::Started);

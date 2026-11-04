@@ -489,7 +489,15 @@ local function item_label(e)
     name = ic and ComponentGetValue2(ic, "item_name")
   end
   if not name or name == "" then return EntityGetFilename(e) or "?" end
-  return GameTextGetTranslatedOrNot(name)
+  local text = GameTextGetTranslatedOrNot(name)
+  if text:find("$0", 1, true) then
+    -- A flask ("$0 potion"): its main material, as the inventory names it.
+    local mat = GetMaterialInventoryMainMaterial(e) or 0
+    local what = mat > 0 and GameTextGetTranslatedOrNot(CellFactory_GetUIName(mat)) or "empty"
+    text = GameTextGet(name, what)
+    text = text:sub(1, 1):upper() .. text:sub(2)
+  end
+  return text
 end
 
 -- The respawn penalty: M.params.gold_loss of the gold (rounded down) and M.params.item_loss

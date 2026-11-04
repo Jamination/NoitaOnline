@@ -324,7 +324,7 @@ end
 -- by touch), a wand that always casts teleport bolt, a flask of polymorphine, a chest, a perk
 -- (pick up with Interact), then the polymorph effect itself; each press of Kick costs the
 -- player 10 HP (while above 30 HP). With NOITA_ONLINE_SCENE=acid (respawn checks) Down pours
--- acid onto the player instead.
+-- acid onto the player instead, and Kick gives it 100 gold (to lose on the respawn).
 local ITEM_CYCLE = { "heart", "wand", "flask", "chest", "perk", "polymorph" }
 local item_state = {}
 function M.items_events(f, players)
@@ -379,7 +379,12 @@ function M.items_events(f, players)
         dofile_once("data/scripts/gun/procedural/gun_action_utils.lua")
         AddGunActionPermanent(st.wand, "TELEPORT_PROJECTILE")
       end
-      if kick and not st.kick then
+      if kick and not st.kick and SCENE_ACID then
+        -- Gold to lose on the respawn (its penalty).
+        local wallet = EntityGetFirstComponentIncludingDisabled(p.entity, "WalletComponent")
+        if wallet then ComponentSetValue2(wallet, "money", ComponentGetValue2(wallet, "money") + 100) end
+        if M.log then M.log(string.format("items: player %d gets 100 gold at frame %d", i, f)) end
+      elseif kick and not st.kick then
         local dm = EntityGetFirstComponentIncludingDisabled(p.entity, "DamageModelComponent")
         if dm and ComponentGetValue2(dm, "hp") > 1.2 then
           EntityInflictDamage(p.entity, 0.4, "DAMAGE_PROJECTILE", "", "NORMAL", 0, 0, 0, x, y, 0)
@@ -560,14 +565,15 @@ end
 -- its death, to respawn at the first living player (M.respawn_choice), as the respawn picker
 -- does. Run 0 and every later run of the session (a new world after everyone died):
 --   300  the last player gets 200 gold (the respawn costs half of it);
---   900  the last player is killed;
+--   900  the last player is killed (a curse hit with an impulse up and to the right);
 --   2100 the last player is polymorphed into a sheep, killed as the sheep at 2250 (it
 --        respawns as the player the polymorph kept);
 -- run 0 only:
 --   3300 every player is killed: game over for everyone, then a new run (nextrun.lua).
 -- `death` lines log the last player's gold and quick inventory before each death and after
--- each respawn, and the entities around the place it died (its ragdoll) 5 frames and 1200
--- frames after each death.
+-- each respawn, each client's game-over stats (`stats:`, cause of death; finished only on the
+-- dying player's client) 5 frames after each death, and the player's ragdoll parts 5, 60,
+-- 1200 and 2400 frames after each death.
 local deaths = {} -- { x, y, f } of the last player's deaths
 
 local function inventory_summary(e)
@@ -586,7 +592,8 @@ end
 local function kill(p, f)
   local x, y = EntityGetTransform(p.entity)
   if M.log then M.log(string.format("death f=%d slot=%d killed (%s): %s", f, p.id, EntityGetFilename(p.entity), inventory_summary(p.entity))) end
-  EntityInflictDamage(p.entity, 1000, "DAMAGE_CURSE", "death scenario", "NORMAL", 0, 0, 0, x, y, 0)
+  -- A hit with an impulse up and to the right: the ragdoll flies off with it (death_cause).
+  EntityInflictDamage(p.entity, 1000, "DAMAGE_CURSE", "death scenario", "NORMAL", 300, -300, 0, x, y, 0)
 end
 
 function M.death_events(f, players, run)
@@ -613,15 +620,25 @@ function M.death_events(f, players, run)
     end
     for _, d in ipairs(deaths) do
       if f == d.f + 5 then
-        -- The player's ragdoll: the ragdoll parts made from the player's (robe) images.
+        -- The player's ragdoll: vanilla's death makes it from the dead entity's ragdoll images
+        -- (the robe's copies, mods/noita_online/robes/<n>/ragdoll/, after the first player) as
+        -- data/entities/props/physics_ragdoll_part.xml entities.
         d.parts = {}
+        local near = {}
         for _, e in ipairs(EntityGetInRadius(d.x, d.y, 64) or {}) do
-          local shape = EntityGetFirstComponentIncludingDisabled(e, "PhysicsImageShapeComponent")
-          local img = shape and ComponentGetValue2(shape, "image_file") or ""
-          if img:find("ragdolls/player") then d.parts[#d.parts + 1] = { id = e, img = img } end
+          local file = EntityGetFilename(e) or ""
+          if file:find("ragdoll") then d.parts[#d.parts + 1] = { id = e, img = file } end
+          near[#near + 1] = string.format("%d:%s", e, file)
         end
+        if #d.parts == 0 then
+          M.log(string.format("death f=%d no ragdoll parts; entities near: %s", f, table.concat(near, " ")))
+        end
+        -- This client's game-over stats (the dying player's client finishes them).
+        M.log(string.format("death f=%d stats: killed_by=%q killed_by_extra=%q gold=%s playtime=%s dead=%s", f,
+          StatsGetValue("killed_by") or "", StatsGetValue("killed_by_extra") or "", StatsGetValue("gold") or "",
+          StatsGetValue("playtime") or "", StatsGetValue("dead") or ""))
       end
-      if d.parts and (f == d.f + 5 or f == d.f + 1200 or f == d.f + 2400) then
+      if d.parts and (f == d.f + 5 or f == d.f + 60 or f == d.f + 1200 or f == d.f + 2400) then
         local s = {}
         for _, p in ipairs(d.parts) do
           local x, y = 0, 0
@@ -629,7 +646,7 @@ function M.death_events(f, players, run)
           s[#s + 1] = string.format("%d:%s:%s@%.0f,%.0f", p.id, p.img:match("[^/]*$"), EntityGetIsAlive(p.id) and "alive" or "gone", x, y)
         end
         M.log(string.format("death f=%d ragdoll of the death at f=%d (%.0f,%.0f), %d parts: %s", f, d.f, d.x, d.y, #d.parts, table.concat(s, " ")))
-        if #d.parts > 0 then M.log("death ragdoll images: " .. d.parts[1].img) end
+        if #d.parts > 0 and f == d.f + 5 then M.log("death ragdoll images: " .. d.parts[1].img) end
       end
     end
   end

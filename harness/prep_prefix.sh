@@ -40,10 +40,13 @@ NOITA_DIR="${NOITA_DIR:-/home/james/.local/share/Steam/steamapps/common/Noita}"
   set_attr "$CFG" single_threaded_loading 1
 }
 # Every run starts from an identical profile (project-owned prefix only): blank, or a copy
-# of NOITA_SAVE_TEMPLATE (a save00 directory) when set.
+# of NOITA_SAVE_TEMPLATE (a save00 directory) when set; NOITA_SAVE_TEMPLATE_<instance id>
+# (e.g. NOITA_SAVE_TEMPLATE_13) overrides it for one instance (players with different saves).
 rm -rf "$SAVE/save00"
-if [[ -n "${NOITA_SAVE_TEMPLATE:-}" ]]; then
-  cp -a "$NOITA_SAVE_TEMPLATE" "$SAVE/save00"
+TEMPLATE_VAR="NOITA_SAVE_TEMPLATE_${NOITA_ONLINE_INSTANCE:-}"
+TEMPLATE="${!TEMPLATE_VAR:-${NOITA_SAVE_TEMPLATE:-}}"
+if [[ -n "$TEMPLATE" ]]; then
+  cp -a "$TEMPLATE" "$SAVE/save00"
 else
   mkdir -p "$SAVE/save00"
 fi

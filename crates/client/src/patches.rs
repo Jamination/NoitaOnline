@@ -1304,6 +1304,7 @@ const PATCHES: &[(&str, PatchFn)] = &[
     ("game_over_respawn", |ex| unsafe { crate::respawn::patch_game_over_button(ex) }),
     ("death_cause", |ex| unsafe { crate::respawn::patch_death_cause(ex) }),
     ("world_teardown", |ex| unsafe { crate::nextrun::patch(ex) }),
+    ("progress", |_| unsafe { crate::progress::install() }),
 ];
 
 /// Overwrite every time/pid-seeded engine RNG with values derived from the session seed.

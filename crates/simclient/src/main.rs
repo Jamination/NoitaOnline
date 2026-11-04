@@ -86,6 +86,7 @@ fn main() {
                         game_build: "simclient".into(),
                         mod_hash: 0,
                         name: format!("bot{i}"),
+                        progress: Vec::new(),
                     };
                     b.client.send(CH_RELIABLE, &h.encode()).unwrap();
                     b.hello_sent = true;

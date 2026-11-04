@@ -106,6 +106,8 @@ fn parse_args() -> Result<Args, String> {
 struct Player {
     name: String,
     hello: bool,
+    /// The client's persistent progress (`Hello.progress`, opaque to the server).
+    progress: Vec<u8>,
     bytes_out: metrics::Rate,
     bytes_in: metrics::Rate,
     /// Next tick frame this client still needs.
@@ -236,7 +238,10 @@ fn start_run(
         args.scenario, now, args.respawn_gold_loss, args.respawn_item_loss
     )
     .into_bytes();
-    let start = ServerMsg::Start { run, seed, players: roster.clone(), input_delay, session_id, params };
+    // The session plays with its first player's persistent progress (run 0's Start; the
+    // clients keep it for the later runs).
+    let progress = if run == 0 { ids.first().map(|i| players[i].progress.clone()).unwrap_or_default() } else { Vec::new() };
+    let start = ServerMsg::Start { run, seed, players: roster.clone(), input_delay, session_id, params, progress };
     let _ = server.broadcast(CH_RELIABLE, &start.encode());
     server.flush();
     for id in &ids {
@@ -327,6 +332,7 @@ fn run(args: Args) -> std::io::Result<()> {
                         Player {
                             name,
                             hello: false,
+                            progress: Vec::new(),
                             bytes_out: Default::default(),
                             bytes_in: Default::default(),
                             tick_ack: 0,
@@ -359,7 +365,7 @@ fn run(args: Args) -> std::io::Result<()> {
                         }
                     };
                     match msg {
-                        ClientMsg::Hello { protocol, game_build, mod_hash, name } => {
+                        ClientMsg::Hello { protocol, game_build, mod_hash, name, progress } => {
                             let build_ok = args.game_build.as_ref().is_none_or(|b| *b == game_build);
                             // Every client must run the same mod set (mods change the simulation):
                             // the first client to say hello defines it for the session.
@@ -382,11 +388,15 @@ fn run(args: Args) -> std::io::Result<()> {
                                 players.remove(&id);
                                 continue;
                             }
+                            let progress_len = progress.len();
                             if let Some(p) = players.get_mut(&id) {
                                 p.hello = true;
                                 p.name = name.clone();
+                                p.progress = progress;
                             }
-                            logs.event(&format!("client {id} hello: name={name} build={game_build} mod={mod_hash:016x}"));
+                            logs.event(&format!(
+                                "client {id} hello: name={name} build={game_build} mod={mod_hash:016x} progress={progress_len} bytes"
+                            ));
                             let _ = server.send(client, CH_RELIABLE, &ServerMsg::Welcome { player: id, max_players: args.max_players }.encode());
                             let roster: Vec<(u8, String)> =
                                 players.iter().filter(|(_, p)| p.hello).map(|(i, p)| (*i, p.name.clone())).collect();

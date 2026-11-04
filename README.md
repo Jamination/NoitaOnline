@@ -63,10 +63,35 @@ Outputs: `target/release/noita-online-server` (Linux),
 All players must run the same Noita build (2025-01-25) and the same set of mods; the server
 rejects mismatches.
 
+**Whose progress**: Noita builds the world partly from your save (spell, perk and secret
+unlocks, the intro, orbs collected over all runs, your death count, the bones wands
+apparitions carry). A session plays with the **host's** progress, the first player's (the
+first to join the server), on every client. What you earn during the session (a new
+unlock, an orb, your deaths) is still saved to **your own** save, as in vanilla; the host's
+progress is never written to it.
+
 Every player wears their own robe colour (body, arm and cape, also with the Lukki
 mutation), the same on every screen, by the player's place in the session: the first player
 keeps Noita's purple, then red, green, blue, yellow, orange, cyan, pink and white (a session
 of more than 9 players repeats them from red).
+
+## Death and respawn
+
+- **Death is vanilla's**: a player whose HP reaches 0 dies as in single player: death
+  effects and sound, and a ragdoll in that player's robe colour that stays in the world and
+  is seen by everyone. The dying player sees vanilla's game-over screen with the cause of
+  death and the run's stats; the others see "*name* died".
+- **Respawn**: while another player lives, the game-over screen's **New game** button reads
+  **Respawn**; it opens a list of the living players (in their robe colours), and the player
+  respawns beside the one picked, at full HP, with the perks, wands, spells and items it
+  died with, minus a penalty: half its gold (`--respawn-gold-loss 0.5`, rounded down) and one
+  random quick-inventory item, destroyed (`--respawn-item-loss 1`; never the last wand).
+  It is told what it lost; the others see "*name* respawned at *other*". A player who dies
+  polymorphed respawns as the player the polymorph kept.
+- **Game over for everyone**: when every player is dead at the same time, each sees vanilla's
+  game-over screen with its **New game**; once every player pressed it the session starts its
+  next run, a new world (new seed) in which all players spawn together as at the session
+  start (the others keep seeing the old world until then).
 
 ## Test
 
@@ -87,13 +112,23 @@ harness/evaluate.py --run run/e2e/full --baseline run/e2e/baseline --netsim-run 
 The goal is the base game's behaviour; these are the deviations multiplayer forces.
 
 - Lockstep: a session starts with all players present; players cannot join mid-session.
-  A player who leaves becomes a frozen spectator instead of ending the run for everyone.
-  When every player is dead at the same time the game is over for everyone: each player
-  sees vanilla's game-over screen, and its **New game** joins the session's next run, a new
-  world (new seed) in which all players spawn together as at the session start; the run
-  starts once every player pressed New game (the others keep seeing the old world until
-  then). Starting a new game from the pause menu during a run ends that client's session
-  (restart Noita to join another).
+  A player who leaves stays in the world as a motionless player (neutral input) instead of
+  ending the run for everyone; it no longer counts for the all-dead game over. Starting a
+  new game from the pause menu during a run ends that client's session (restart Noita to
+  join another).
+- Death and respawn (see *Death and respawn*) add to vanilla's death:
+  - the respawn picker is the mod's own overlay (a list of the living players), opened from
+    vanilla's game-over button relabelled "Respawn"; vanilla has no respawn;
+  - a player dies one frame after its fatal hit (it is held at 0 HP for a frame so every
+    client can store it for the respawn first); the cause of death, the killer and the
+    ragdoll's impulse are the fatal hit's, as in vanilla;
+  - no "bones" wand is saved for later runs on death (that path writes a save file and
+    draws from the shared RNG);
+  - the game-over screen's stats are this client's stats for the run, not strictly the dead
+    player's own;
+  - during a session the all-time `death_count` the game reads is the host's (world
+    generation reads it); each player's own deaths are added to its own save's count when
+    Noita saves it (at exit).
 - Input latency: your inputs take effect after the session's input delay, the frames an
   input needs to reach every client: 1 frame (17 ms) on a LAN, about the round trip over the
   internet; the server adapts it to the network during the session. Inventory GUI actions

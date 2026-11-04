@@ -97,8 +97,27 @@ sequenceDiagram
   player) and simulated around every player (identically on every client) instead of around
   each client's own camera; a deterministic eviction replaces the engine's wall-clock one
   (vanilla's rule, applied per player).
-* Deaths: see `files/players.lua` (a dead player respawns, vanilla's game over is that
-  player's own). When every player is dead at once the run is over: see *Runs* below.
+* **Deaths and respawn** (`files/players.lua`, `crates/client/src/respawn.rs`), all inside
+  the window and identical on every client unless noted:
+  - a slot whose HP reached 0 is held there for one frame (`wait_for_kill_flag_on_death`);
+    in the next tick every client stores it with the engine's own entity serializer (the
+    one polymorph uses; a player that dies polymorphed is the record its polymorph keeps)
+    and sets `kill_now`: vanilla's death (effects, sound, robe-coloured ragdoll that stays).
+    `death_cause` replays the fatal hit's KillMe for that deferred death, so the cause, the
+    killer and the ragdoll's impulse are the hit's;
+  - the dead player's own client finishes its game-over stats in its death (GameStatsSystem's
+    PlayerDied handler, which writes only the stats nothing in the simulation reads, keeping
+    `death_count`) and, after the window, calls vanilla's `GameTriggerGameOver`; the game
+    mode's game-over flag is swapped at the window edges (`respawn::sim_enter` /
+    `sim_leave`), so the simulation sees the shared value (set only when every player is
+    dead) and the menu this client's own;
+  - `game_over_respawn`: while another player lives, the game-over button reads "Respawn"
+    and only records the click; the mod's picker (`files/respawn_picker.lua`) lists the
+    living players, and the choice is a lockstep input op (`RESPAWN_OP`, target id). In the
+    tick that carries it every client loads the stored player at the target, at full HP,
+    and applies the penalty (Start params `respawn_gold_loss`, `respawn_item_loss`; the
+    lost item is drawn from the session seed, frame and player, not an engine RNG);
+  - when every player is dead at once the run is over: see *Runs* below.
 * **Robe colours** (`files/robes.lua`): during mod init, once the session's player list is
   known, every slot after the first gets virtual copies (`mods/noita_online/robes/<k>/`) of
   the player entity, its robe sprites (body, Lukki body, arm, the unlockable hat's two
@@ -162,10 +181,34 @@ sequenceDiagram
   verification totals) and the current one, `events.log` logs each client leaving a run and
   each run's start.
 
+## Persistent progress (whose save)
+
+Noita builds the world partly from the player's save: persistent flags (spell, perk and
+secret unlocks, the intro), the orbs collected over all runs, the all-time `death_count` and
+the bones wands apparitions carry (the readers: determinism.md, `progress`).
+A session plays with the host's, the first player's (`crates/client/src/progress.rs`):
+
+* `no_connect` snapshots this player's progress (`protocol::Progress`: flag and orb names,
+  `death_count`, bones files) into `Hello.progress`; the server keeps each client's and sends
+  the first player's in run 0's `Start.progress` (later runs' `Start` carries none: the
+  clients keep the session's).
+* `init.lua`, right after the session start (every run), calls `no_progress_apply`
+  (`NO.progress_apply`): the engine's flag and orb sets become the host's, `death_count` the
+  host's, and the host's bones files become virtual files (`mods/noita_online/session_bones/`)
+  that the apparitions' bones list names. The new game's reloads of the flags and orbs from
+  the save keep the session's sets.
+* Writes still reach each player's own save, as in vanilla: every add or remove of a flag or
+  orb runs the engine's own code against that player's own save's membership (it writes the
+  flag file exactly when vanilla would for this save) and then updates the session's set:
+  changes inside the simulation window (or before the run's first frame) are the session's,
+  this client's own GUI's (outside the window) only its save's. The stats are saved with the
+  player's own `death_count` plus its own deaths in the session. Leaving the session restores
+  the player's own progress. The host's progress is never written to another save.
+
 ## Server
 
 * Lobby until `--players` clients said hello (same protocol version, game build and mod
-  list), then `Start{run 0, seed, players, input_delay, params}`; each later run starts with
+  list), then `Start{run 0, seed, players, input_delay, params, progress}`; each later run starts with
   its own `Start` once every client sent `NextRun` (see *Runs*).
 * Lockstep relay: per frame, one tick containing every active player's input, emitted in
   order once complete; departed players are dropped from subsequent ticks. The server waits

@@ -410,8 +410,9 @@ unsafe fn copy_damage_info(src: u32) -> Box<[u32; DAMAGE_INFO_WORDS]> {
 /// gold, play time, then `FUN_00b18930`, which formats the cause of death from `killed_by`).
 /// Slots are not in the players vector, so this runs that handler for this client's own
 /// player. It also adds the run to the all-time stats, whose `death_count` world generation
-/// reads (`StatsGlobalGetValue`: the starting wand's spell, biome modifiers): it differs between
-/// clients that died different numbers of times, so it is kept at its session start.
+/// reads (`StatsGlobalGetValue`: the starting wand's spell, biome modifiers): in a session it
+/// holds the host's count (`progress`), so it is kept, and the change counts for this player's
+/// own save.
 unsafe fn player_died_stats(e: u32) {
     let mgr = rd(ENTITY_MANAGER);
     if mgr == 0 {
@@ -428,6 +429,7 @@ unsafe fn player_died_stats(e: u32) {
     let deaths = rd(GLOBAL_DEATH_COUNT);
     let handler: extern "thiscall" fn(u32, u32, u32, u32) = std::mem::transmute(PLAYER_DIED_STATS_FN as usize);
     handler(0, e, stats, message.as_ptr() as u32);
+    crate::progress::own_death_count_delta(rd(GLOBAL_DEATH_COUNT).wrapping_sub(deaths));
     *(GLOBAL_DEATH_COUNT as *mut u32) = deaths;
 }
 

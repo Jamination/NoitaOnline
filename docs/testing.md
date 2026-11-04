@@ -70,6 +70,35 @@ reaches it. `summary.json` lists each run's frames and verification totals under
 harness/e2e.sh --players 2 --scenario restart --frames 2700 --seed 98765432 --timeout 1500 --out run/nextrun/2p
 ```
 
+**Persistent progress** (`--scenario progress`, `files/progress_test.lua`): the bot scenario
+plus checks of the host's progress (crates/client/src/progress.rs): `progress f=...` lines in
+`client_<id>.log` show the unlocks, `death_count` and all-time orbs the simulation sees, an
+`AddFlagPersistent` of a new flag at 600 and apparitions with a bones wand at 900. The test
+saves give the players different progress: `NOITA_SAVE_TEMPLATE_<id>` (a `save00`
+directory) overrides `NOITA_SAVE_TEMPLATE` for instance `<id>`; afterwards
+`run/prefix<id>/.../save00/persistent/flags/` shows what each player's own save got.
+
+```sh
+NOITA_SAVE_TEMPLATE_12=$PWD/run/progress/save_vet NOITA_SAVE_TEMPLATE_13=$PWD/run/progress/save_fresh \
+  harness/e2e.sh --players 2 --first-id 12 --port 41812 --scenario progress --frames 2400 --seed 98765432 --out run/progress/after
+```
+
+**Death** (`--scenario death`, `M.death_events` in `files/bot.lua`): the bot scenario plus the
+last player's deaths and respawns (killed at 900 with an impulse, respawned 180 frames later
+at the first living player; polymorphed and killed as a sheep at 2250; in run 0 everyone is
+killed at 3300, then a new run). `death` lines in `client_<id>.log` show the gold and quick
+inventory before each death and after each respawn (the penalty), the game-over stats
+(`killed_by`: the cause of death, finished on the dying player's client only) and the
+ragdoll's parts 5, 60, 1200 and 2400 frames after each death. Run 0 needs about 3600
+frames to reach both New game presses.
+
+```sh
+harness/e2e.sh --players 2 --scenario death --frames 4000 --seed 98765432 --out run/respawn/death
+```
+
+**Manual death and respawn**: `NOITA_ONLINE_SCENE=acid harness/e2e.sh --human --scenario items
+--players 2`: Down (crouch) pours acid onto the player, Kick gives it 100 gold to lose.
+
 * `--pin` gives client *k* its own physical core (CPUs `B+k` and `B+6+k`, `B` =
   `NOITA_PIN_BASE`, default 2), so concurrent clients on one machine behave like separate
   machines; the baseline uses the same pinning. Concurrent harness runs must use disjoint
@@ -77,8 +106,8 @@ harness/e2e.sh --players 2 --scenario restart --frames 2700 --seed 98765432 --ti
   `0,1,6,7`) confines every client of the run to those CPUs instead.
 * `--solo` is the single-player baseline: the same scripted scenario without networking
   or engine patches, one player per instance. As in a session, a player at 0 HP (not
-  reached in the bot scenario) becomes a spectator instead of dying, so the scenario's
-  world events keep running.
+  reached in the bot scenario) dies like a slot, one frame later; with nobody to respawn at
+  it is vanilla's game over.
 * `--netsim` applies 5 % loss and 100 ms latency to every datagram the server sends *and*
   receives (i.e. on both directions of every client link).
 

@@ -159,6 +159,12 @@ else
   local start_time = tonumber(info.params.time)
   if start_time then NO.lib.no_set_session_time(start_time) end
   log(string.format("session started: run=%d seed=%.0f delay=%d me=%d players=%s", session.run, info.seed, info.input_delay, info.player, table.concat(info.players, ",")))
+  -- The world is built partly from the save (persistent flags, all-time orbs, death_count,
+  -- bones wands): every client plays with the host's (the first player's) progress
+  -- (crates/client/src/progress.rs); what a player earns still goes to its own save.
+  local progress, progress_err = NO.progress_apply()
+  if not progress then error("noita_online: session progress: " .. tostring(progress_err)) end
+  log(progress)
   NextRun = dofile_once(ROOT .. "nextrun.lua")
   NextRun.log = log
 end
@@ -378,6 +384,10 @@ local function scenario_events(f)
   if sc == "bot" then Bot.world_events(f, Players.slots)
   elseif sc == "items" then Bot.items_events(f, Players.slots)
   elseif sc == "death" then Bot.death_events(f, Players.slots, tonumber(session.params and session.params.run) or 0)
+  elseif sc == "progress" then
+    -- Test of the session's persistent progress (progress_test.lua): the bot scenario plus checks.
+    Bot.world_events(f, Players.slots)
+    dofile_once(ROOT .. "progress_test.lua").events(f, Players.slots, log)
   elseif NextRun and NextRun.restarts(sc) then
     -- Test of the next run (nextrun.lua): the bot scenario, all dead at a fixed frame of the
     -- first run(s).

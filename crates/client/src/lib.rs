@@ -39,6 +39,8 @@ pub mod respawn;
 #[cfg(all(windows, target_arch = "x86"))]
 pub mod nextrun;
 #[cfg(all(windows, target_arch = "x86"))]
+pub mod progress;
+#[cfg(all(windows, target_arch = "x86"))]
 pub mod invgui;
 #[cfg(all(windows, target_arch = "x86"))]
 pub mod slots;
@@ -135,6 +137,11 @@ pub unsafe extern "C" fn no_connect(
         game_build: cstr(game_build).to_owned(),
         mod_hash,
         netsim,
+        // This player's persistent progress: the session plays with the host's.
+        #[cfg(all(windows, target_arch = "x86"))]
+        progress: progress::snapshot().encode(),
+        #[cfg(not(all(windows, target_arch = "x86")))]
+        progress: Vec::new(),
     };
     with_rt(-1, |rt| {
         if rt.net.is_some() {
@@ -1061,6 +1068,7 @@ pub extern "C" fn no_rtt_us() -> u64 {
 pub extern "C" fn no_shutdown() {
     #[cfg(all(windows, target_arch = "x86"))]
     {
+        unsafe { progress::deactivate() };
         report::join();
         cosmetic::join_cell_emitters();
         box2d::join();
@@ -1073,6 +1081,70 @@ pub extern "C" fn no_shutdown() {
     });
     if let Some(h) = handle {
         let _ = h.join();
+    }
+}
+
+/// Install the session's persistent progress (the host's save, from run 0's `Start`) in place
+/// of this player's own, before the world is generated (`init.lua`'s session start, every
+/// run; later runs keep the session's). Writes a summary into `out` (NUL-terminated). Returns
+/// the number of the session's bones files (`no_progress_bone`), or -1 (`no_last_error`).
+///
+/// # Safety
+/// `out` must point at `cap` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn no_progress_apply(out: *mut u8, cap: u32) -> i32 {
+    #[cfg(all(windows, target_arch = "x86"))]
+    {
+        let Some(encoded) = with_rt(None, |rt| rt.shared.state.lock().unwrap().start.as_ref().map(|s| s.progress.clone())) else {
+            set_last_error("no session".into());
+            return -1;
+        };
+        match progress::apply(&encoded) {
+            Ok(summary) => {
+                let n = summary.len().min(cap.saturating_sub(1) as usize);
+                std::ptr::copy_nonoverlapping(summary.as_ptr(), out, n);
+                *out.add(n) = 0;
+                progress::bone_count() as i32
+            }
+            Err(e) => {
+                set_last_error(e);
+                -1
+            }
+        }
+    }
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    {
+        let _ = (out, cap);
+        set_last_error("progress only exists inside 32-bit Windows noita.exe".into());
+        -1
+    }
+}
+
+/// The session's `index`-th bones file: its virtual path (to `path`, NUL-terminated) and its
+/// contents (to `data`). Returns the contents' length (call with `data_cap` 0 to size the
+/// buffer), or -1 if there is no such file.
+///
+/// # Safety
+/// `path` / `data` must point at `path_cap` / `data_cap` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn no_progress_bone(index: u32, path: *mut u8, path_cap: u32, data: *mut u8, data_cap: u32) -> i32 {
+    #[cfg(all(windows, target_arch = "x86"))]
+    {
+        let Some((p, d)) = progress::bone(index as usize) else { return -1 };
+        if path_cap > 0 {
+            let n = p.len().min(path_cap as usize - 1);
+            std::ptr::copy_nonoverlapping(p.as_ptr(), path, n);
+            *path.add(n) = 0;
+        }
+        if data_cap > 0 {
+            std::ptr::copy_nonoverlapping(d.as_ptr(), data, d.len().min(data_cap as usize));
+        }
+        d.len() as i32
+    }
+    #[cfg(not(all(windows, target_arch = "x86")))]
+    {
+        let _ = (index, path, path_cap, data, data_cap);
+        -1
     }
 }
 

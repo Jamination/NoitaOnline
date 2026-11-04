@@ -71,6 +71,8 @@ int32_t no_respawn_take_press(void);
 void no_game_over_shared(void);
 void no_game_over_clear(void);
 void no_local_death(uint32_t entity_id);
+int32_t no_progress_apply(uint8_t* out, uint32_t cap);
+int32_t no_progress_bone(uint32_t index, uint8_t* path, uint32_t path_cap, uint8_t* data, uint32_t data_cap);
 ]])
 
 local M = {}
@@ -131,6 +133,24 @@ end
 -- Store the player a polymorph keeps (base64 text) for slot `slot` (0-based) to respawn.
 function M.respawn_save_b64(slot, data)
   return lib.no_respawn_save_b64(slot, data, #data)
+end
+
+-- Install the session's persistent progress (the host's save: persistent flags, orbs,
+-- death_count, bones wands) in place of this player's own, before the world is generated
+-- (crates/client/src/progress.rs), and the host's bones files as the virtual files the
+-- apparitions' bones list names. Returns a summary, or nil and the error.
+function M.progress_apply()
+  local n = lib.no_progress_apply(err_buf, 1024)
+  if n < 0 then return nil, M.last_error() end
+  local summary = ffi.string(err_buf)
+  local path = ffi.new("uint8_t[512]")
+  for i = 0, n - 1 do
+    local size = lib.no_progress_bone(i, path, 512, nil, 0)
+    local data = ffi.new("uint8_t[?]", math.max(size, 1))
+    lib.no_progress_bone(i, path, 512, data, size)
+    ModTextFileSetContent(ffi.string(path), ffi.string(data, size))
+  end
+  return summary
 end
 
 local tick_buf = ffi.new("uint8_t[16384]")

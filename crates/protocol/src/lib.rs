@@ -19,7 +19,9 @@ pub const CH_UNRELIABLE: u8 = 1;
 /// 6: `Perf` carries the client's measured round trip (the adaptive input delay's network bound).
 /// 7: runs: after an all-dead game over every client starts a new game (`NextRun`), the server
 ///    starts the next run (`Start.run`); the lockstep streams carry their run index.
-pub const GAME_PROTOCOL_VERSION: u32 = 7;
+/// 8: persistent progress: `Hello.progress` (the client's save), `Start.progress` (the host's,
+///    which every client simulates with).
+pub const GAME_PROTOCOL_VERSION: u32 = 8;
 
 /// Budget for one unreliable lockstep datagram's payload (fits rudp's unreliable limit).
 pub const STREAM_BUDGET: usize = 1100;
@@ -54,7 +56,9 @@ pub type Tick = Vec<(u8, Vec<u8>)>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientMsg {
-    Hello { protocol: u32, game_build: String, mod_hash: u64, name: String },
+    /// `progress`: this client's persistent progress ([`Progress::encode`]); the session plays
+    /// with the host's (the first player's).
+    Hello { protocol: u32, game_build: String, mod_hash: u64, name: String, progress: Vec<u8> },
     /// Lockstep stream (unreliable) of run `run`. `tick_ack`: next tick frame the client still
     /// needs (all earlier ticks received). `inputs[i]` is the local input for frame `first + i`.
     Inputs { run: u32, tick_ack: u32, first: u32, inputs: Vec<Vec<u8>> },
@@ -81,8 +85,10 @@ pub enum ServerMsg {
     Lobby { players: Vec<(u8, String)>, needed: u8 },
     /// A run starts: every client starts a new game with this seed and these parameters, from
     /// frame 0 of run `run` (0: the session's first run; the next one starts once every client
-    /// sent `NextRun`). Every run of a session has the same session id and roster.
-    Start { run: u32, seed: u32, players: Vec<(u8, String)>, input_delay: u16, session_id: u64, params: Vec<u8> },
+    /// sent `NextRun`). Every run of a session has the same session id and roster. `progress`:
+    /// the persistent progress the session plays with (the first player's `Hello.progress`) in
+    /// run 0's `Start`, empty in later runs (the clients keep the session's).
+    Start { run: u32, seed: u32, players: Vec<(u8, String)>, input_delay: u16, session_id: u64, params: Vec<u8>, progress: Vec<u8> },
     /// Lockstep stream (unreliable) of run `run`. `input_ack`: next input frame the server
     /// still needs from this client. `ticks[i]` is the tick for frame `first + i`.
     Ticks { run: u32, input_ack: u32, first: u32, ticks: Vec<Tick> },
@@ -98,8 +104,8 @@ impl ClientMsg {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::with_capacity(32);
         match self {
-            ClientMsg::Hello { protocol, game_build, mod_hash, name } => {
-                w.u8(1).u32(*protocol).str(game_build).u64(*mod_hash).str(name);
+            ClientMsg::Hello { protocol, game_build, mod_hash, name, progress } => {
+                w.u8(1).u32(*protocol).str(game_build).u64(*mod_hash).str(name).blob(progress);
             }
             ClientMsg::Inputs { run, tick_ack, first, inputs } => {
                 w.u8(2).varint(*run as u64).varint(*tick_ack as u64).varint(*first as u64).varint(inputs.len() as u64);
@@ -159,6 +165,7 @@ impl ClientMsg {
                 game_build: r.str()?.to_owned(),
                 mod_hash: r.u64()?,
                 name: r.str()?.to_owned(),
+                progress: r.blob()?.to_vec(),
             },
             2 => {
                 let run = r.varint()? as u32;
@@ -249,6 +256,62 @@ fn get_roster(r: &mut Reader) -> DecodeResult<Vec<(u8, String)>> {
     Ok(players)
 }
 
+/// A player's persistent progress: the parts of the save (`save00`) that Noita's simulation
+/// reads. A session plays with the host's (its first player's) progress on every client
+/// (`crates/client/src/progress.rs`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Progress {
+    /// Persistent flags (`persistent/flags/`: spell, perk and secret unlocks, intro, ...).
+    pub flags: Vec<String>,
+    /// Orbs collected over all runs (`persistent/orbs_new/`).
+    pub orbs: Vec<String>,
+    /// All-time stats' `death_count` (`stats/_stats.salakieli`).
+    pub death_count: u32,
+    /// Bones wands (`persistent/bones_new/`): file name and contents, the wands apparitions
+    /// carry.
+    pub bones: Vec<(String, Vec<u8>)>,
+}
+
+impl Progress {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        for list in [&self.flags, &self.orbs] {
+            w.varint(list.len() as u64);
+            for s in list {
+                w.str(s);
+            }
+        }
+        w.varint(self.death_count as u64);
+        w.varint(self.bones.len() as u64);
+        for (name, data) in &self.bones {
+            w.str(name).blob(data);
+        }
+        w.finish()
+    }
+
+    pub fn decode(data: &[u8]) -> DecodeResult<Self> {
+        let mut r = Reader::new(data);
+        let mut lists = [Vec::new(), Vec::new()];
+        for list in &mut lists {
+            let n = bounded(r.varint()?, &r, 1)?;
+            for _ in 0..n {
+                list.push(r.str()?.to_owned());
+            }
+        }
+        let [flags, orbs] = lists;
+        let death_count = u32::try_from(r.varint()?).map_err(|_| DecodeError)?;
+        let n = bounded(r.varint()?, &r, 2)?;
+        let mut bones = Vec::with_capacity(n);
+        for _ in 0..n {
+            bones.push((r.str()?.to_owned(), r.blob()?.to_vec()));
+        }
+        if !r.is_empty() {
+            return Err(DecodeError);
+        }
+        Ok(Self { flags, orbs, death_count, bones })
+    }
+}
+
 /// Encoded size of `t` inside a `Ticks` message whose previous tick is `prev` (entries equal
 /// to the same player's entry in `prev` cost one byte).
 pub fn tick_encoded_len(prev: Option<&Tick>, t: &Tick) -> usize {
@@ -301,10 +364,10 @@ impl ServerMsg {
                 w.u8(2).u8(*needed);
                 put_roster(&mut w, players);
             }
-            ServerMsg::Start { run, seed, players, input_delay, session_id, params } => {
+            ServerMsg::Start { run, seed, players, input_delay, session_id, params, progress } => {
                 w.u8(3).varint(*run as u64).u32(*seed).u16(*input_delay).u64(*session_id);
                 put_roster(&mut w, players);
-                w.blob(params);
+                w.blob(params).blob(progress);
             }
             ServerMsg::Ticks { run, input_ack, first, ticks } => {
                 w.u8(4).varint(*run as u64).varint(*input_ack as u64).varint(*first as u64).varint(ticks.len() as u64);
@@ -353,7 +416,8 @@ impl ServerMsg {
                 let session_id = r.u64()?;
                 let players = get_roster(&mut r)?;
                 let params = r.blob()?.to_vec();
-                ServerMsg::Start { run, seed, players, input_delay, session_id, params }
+                let progress = r.blob()?.to_vec();
+                ServerMsg::Start { run, seed, players, input_delay, session_id, params, progress }
             }
             4 => {
                 let run = r.varint()? as u32;
@@ -399,7 +463,7 @@ mod tests {
     #[test]
     fn client_messages_roundtrip() {
         let msgs = vec![
-            ClientMsg::Hello { protocol: 1, game_build: "b".into(), mod_hash: 9, name: "n".into() },
+            ClientMsg::Hello { protocol: 1, game_build: "b".into(), mod_hash: 9, name: "n".into(), progress: vec![1, 2] },
             ClientMsg::Inputs { run: 2, tick_ack: 70_000, first: 70_003, inputs: vec![vec![1, 2, 3], vec![]] },
             ClientMsg::StateHash {
                 frame: 60,
@@ -428,11 +492,34 @@ mod tests {
     }
 
     #[test]
+    fn progress_roundtrip() {
+        let p = Progress {
+            flags: vec!["card_unlocked_nuke".into(), "intro_has_played".into()],
+            orbs: vec!["0".into(), "7".into()],
+            death_count: 10,
+            bones: vec![("item1050.xml".into(), b"<Entity/>".to_vec()), ("item2.xml".into(), vec![])],
+        };
+        assert_eq!(Progress::decode(&p.encode()).unwrap(), p);
+        assert_eq!(Progress::decode(&Progress::default().encode()).unwrap(), Progress::default());
+        let mut enc = p.encode();
+        enc.push(0);
+        assert!(Progress::decode(&enc).is_err());
+    }
+
+    #[test]
     fn server_messages_roundtrip() {
         let msgs = vec![
             ServerMsg::Welcome { player: 3, max_players: 8 },
             ServerMsg::Lobby { players: vec![(0, "a".into())], needed: 4 },
-            ServerMsg::Start { run: 1, seed: 1, players: vec![(0, "a".into()), (1, "b".into())], input_delay: 4, session_id: 77, params: vec![9] },
+            ServerMsg::Start {
+                run: 1,
+                seed: 1,
+                players: vec![(0, "a".into()), (1, "b".into())],
+                input_delay: 4,
+                session_id: 77,
+                params: vec![9],
+                progress: vec![3],
+            },
             ServerMsg::Ticks { run: 1, input_ack: 15, first: 12, ticks: vec![vec![(0, vec![1]), (1, vec![])], vec![]] },
             ServerMsg::PlayerLeft { player: 2 },
             ServerMsg::Pong { t: 8 },

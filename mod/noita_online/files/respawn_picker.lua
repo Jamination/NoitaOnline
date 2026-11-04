@@ -25,7 +25,8 @@ function M.update(choices)
   GuiStartFrame(gui)
   shown = true
   local w, h = GuiGetScreenDimensions(gui)
-  local x, y = w / 2 - 60, h * 0.12
+  -- Left of the game-over screen's title and stats panel, below the inventory bar.
+  local x, y = w * 0.03, h * 0.3
   local result = nil
   GuiZSetForNextWidget(gui, -100)
   GuiText(gui, x, y, "Respawn at:")
