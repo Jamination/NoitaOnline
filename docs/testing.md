@@ -56,8 +56,9 @@ harness/evaluate.py --run run/e2e/full --netsim-run run/e2e/netsim \
 ```
 
 **Next run** (`--scenario restart`, `files/nextrun.lua`): the bot scenario, and in the first
-run every player counts as dead at frame 1200 (`NextRun.all_dead` inside the window,
-vanilla's `GameTriggerGameOver` outside it, a stand-in for the real all-dead path); each bot
+run (`--scenario restart<N>`: in each of the first N runs) every player counts as dead at frame
+1200 (`NextRun.all_dead` inside the window, vanilla's `GameTriggerGameOver` outside it, a
+stand-in for the real all-dead path); each bot
 presses vanilla's New game 120 + 180 · its player id frames later (`no_press_new_game`), so
 the clients leave the old world at different frames while the others keep simulating it;
 the new run (new seed, same players) then plays the bot scenario. `--frames` (and

@@ -394,6 +394,108 @@ pub fn reset_run() {
     *CHECK_BODIES.lock().unwrap_or_else(|p| p.into_inner()) = None;
 }
 
+/// b2World (Box2D 2.2, built with doubles): the broad phase (+0x191dc) starts with its dynamic
+/// tree {root, nodes, node count, capacity, free list, path, insertion count}, then the proxy
+/// count (+0x1c), the move buffer, capacity and count (+0x20, +0x24, +0x28) and the pair
+/// buffer, capacity and count (+0x2c, +0x30, +0x34) (`UpdatePairs` FUN_009d09d0). Tree nodes are
+/// 0x38 bytes: next / parent +0x24, height +0x30 (`AllocateNode` FUN_009b7590).
+const W_BROADPHASE: u32 = 0x191dc;
+const BP_PROXY_COUNT: u32 = 0x1c;
+const BP_MOVE_COUNT: u32 = 0x28;
+const BP_PAIR_COUNT: u32 = 0x34;
+const TREE_NODE_SIZE: u32 = 0x38;
+const NODE_NEXT: u32 = 0x24;
+const NODE_HEIGHT: u32 = 0x30;
+/// b2World: contact count (contact manager), body list (next body +0xb8, uid +0x110), joint
+/// count, `m_inv_dt0` (double).
+const W_CONTACT_COUNT: u32 = 0x1921c;
+const W_BODY_LIST: u32 = 0x1922c;
+const W_JOINT_COUNT: u32 = 0x19238;
+const W_INV_DT0: u32 = 0x19260;
+const BODY_NEXT: u32 = 0xb8;
+const BODY_UID: u32 = 0x110;
+/// The 64-bit uid counter that `CreateBody` (FUN_009bf120) and `CreateJoint` (FUN_009bf3d0)
+/// give each new body / joint without one (1 in a fresh process).
+const B2_UID_COUNTER: u32 = 0x0115_3308;
+
+/// New run: the b2World is not rebuilt by a new game (the GridWorld keeps it; the game start
+/// `FUN_006afaa0` only fetches it again into `0x01207414`), and neither is the static body at
+/// (0, 0) that world creation makes in a fresh process (the first body, uid 1, its proxy the
+/// tree's node 0 and root). The broad phase's dynamic tree keeps every other node of the old
+/// world on its free list, in the order each client's last frames freed them. Proxy ids come
+/// from that list, the broad phase creates contacts in the order of their proxy-id pairs
+/// (`UpdatePairs` sorts them), which is the order the solver meets them, and tree queries
+/// (`QueryAABB`) walk the tree the ids shape: run 1 of a restart differed in body motion from
+/// the first contacts on (seed 98765432: frame 17). With no joint or contact left, the free
+/// nodes are relinked in index order (a fresh tree's free list after the live nodes, whatever
+/// capacity it grew to), the move and pair buffers are emptied, `m_inv_dt0` is 0 as after
+/// construction, and the uid counter continues after the live bodies' uids, as in a fresh
+/// process after world creation. Returns what was done (client log).
+///
+/// # Safety
+/// Game thread, between the old world's teardown and the new world's creation; `world` is the
+/// b2World.
+pub unsafe fn reset_world(world: u32) -> String {
+    if world == 0 {
+        return "box2d: no world".into();
+    }
+    let bp = world + W_BROADPHASE;
+    let (joints, contacts) = (rd(world + W_JOINT_COUNT), rd(world + W_CONTACT_COUNT));
+    if joints != 0 || contacts != 0 {
+        return format!("box2d: NOT reset, {joints} joints and {contacts} contacts left");
+    }
+    let nodes = rd(bp + 4);
+    let live = rd(bp + 8) as i32;
+    let capacity = (rd(bp + 0xc) as i32).max(0);
+    let next_of = |i: i32| (nodes + i as u32 * TREE_NODE_SIZE + NODE_NEXT) as *mut i32;
+    let mut free = vec![false; capacity as usize];
+    let mut n = 0;
+    let mut i = rd(bp + 0x10) as i32;
+    while i != -1 {
+        if i < 0 || i >= capacity || free[i as usize] {
+            return format!("box2d: NOT reset, bad free list at node {i}");
+        }
+        free[i as usize] = true;
+        n += 1;
+        i = *next_of(i);
+    }
+    if n + live != capacity {
+        return format!("box2d: NOT reset, {n} free + {live} live nodes != capacity {capacity}");
+    }
+    let mut head = -1;
+    for i in (0..capacity).rev() {
+        if free[i as usize] {
+            *next_of(i) = head;
+            *((nodes + i as u32 * TREE_NODE_SIZE + NODE_HEIGHT) as *mut i32) = -1;
+            head = i;
+        }
+    }
+    *((bp + 0x10) as *mut i32) = head;
+    // m_path and m_insertionCount (only incremented by this build's InsertLeaf): as after
+    // inserting the live proxies into a fresh tree.
+    let proxies = rd(bp + BP_PROXY_COUNT);
+    *((bp + 0x14) as *mut u32) = 0;
+    *((bp + 0x18) as *mut u32) = proxies;
+    *((bp + BP_MOVE_COUNT) as *mut u32) = 0;
+    *((bp + BP_PAIR_COUNT) as *mut u32) = 0;
+    *((world + W_INV_DT0) as *mut f64) = 0.0;
+    let mut uid_next = 1u64;
+    let mut body = rd(world + W_BODY_LIST);
+    let mut bodies = 0;
+    while body != 0 && bodies < 1 << 20 {
+        let uid = rd(body + BODY_UID) as u64 | (rd(body + BODY_UID + 4) as u64) << 32;
+        uid_next = uid_next.max(uid + 1);
+        bodies += 1;
+        body = rd(body + BODY_NEXT);
+    }
+    let uid_old = rd(B2_UID_COUNTER) as u64 | (rd(B2_UID_COUNTER + 4) as u64) << 32;
+    *(B2_UID_COUNTER as *mut u32) = uid_next as u32;
+    *((B2_UID_COUNTER + 4) as *mut u32) = (uid_next >> 32) as u32;
+    format!(
+        "box2d: reset ({bodies} bodies and {live} tree nodes kept, {n} free of {capacity}; uid counter {uid_old} -> {uid_next})"
+    )
+}
+
 /// The grid update's join of the last step (ECX = GridWorld+0x4f8): normally DeathMatch::Update
 /// joined it already.
 extern "fastcall" fn grid_join(handle: u32) {

@@ -72,16 +72,15 @@ pub(crate) unsafe fn patch(ex: &mut Exec) -> Result<(), PatchError> {
     let _ = ex;
     expect(NEW_GAME_FN, &NEW_GAME_PROLOGUE)?;
     expect(LOAD_GAME_MODES_FN, &LOAD_GAME_MODES_PROLOGUE)?;
+    crate::patches::check_run_statics()?;
     redirect_call(RESTART_CALL, RESTART_FN, (restart as extern "fastcall" fn(u32)) as u32)
 }
 
 /// The game restarts in place (a new game): nothing of ours may read the old world after this.
 extern "fastcall" fn restart(game_mode: u32) {
-    unsafe { crate::patches::mem_dump_diag("t") };
     world_teardown();
     let f: extern "fastcall" fn(u32) = unsafe { std::mem::transmute(RESTART_FN as usize) };
     f(game_mode);
-    unsafe { crate::patches::mem_dump_diag("a") };
 }
 
 fn world_teardown() {
@@ -91,15 +90,15 @@ fn world_teardown() {
 }
 
 /// Reset every per-run piece of the runtime's state (the old world is gone; call before the
-/// new world exists, i.e. from the new game's `init.lua`).
+/// new world exists, i.e. from the new game's `init.lua`). Returns notes for the client log.
 ///
 /// # Safety
 /// Game thread.
-pub unsafe fn reset_run() {
-    crate::patches::mem_dump_diag("r");
+pub unsafe fn reset_run() -> String {
     world_teardown();
     crate::patches::reset_run();
     crate::box2d::reset_run();
+    let notes = crate::box2d::reset_world(crate::patches::b2_world());
     crate::cosmetic::reset_run();
     crate::camreaders::reset_run();
     crate::slots::reset_run();
@@ -109,6 +108,7 @@ pub unsafe fn reset_run() {
     crate::respawn::reset_run();
     crate::reset_input_trailer();
     RUN_OVER.store(0, Ordering::Relaxed);
+    notes
 }
 
 /// Start a new game in the current game mode, as the game-over menu's "New game" (opening

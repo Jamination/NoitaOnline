@@ -378,10 +378,11 @@ local function scenario_events(f)
   if sc == "bot" then Bot.world_events(f, Players.slots)
   elseif sc == "items" then Bot.items_events(f, Players.slots)
   elseif sc == "death" then Bot.death_events(f, Players.slots, tonumber(session.params and session.params.run) or 0)
-  elseif sc == "restart" then
-    -- Test of the next run (nextrun.lua): the bot scenario, all dead at a fixed frame of run 0.
+  elseif NextRun and NextRun.restarts(sc) then
+    -- Test of the next run (nextrun.lua): the bot scenario, all dead at a fixed frame of the
+    -- first run(s).
     Bot.world_events(f, Players.slots)
-    NextRun.restart_events(f, session.run)
+    NextRun.restart_events(f, session.run, NextRun.restarts(sc))
   end
 end
 
@@ -566,7 +567,8 @@ function OnWorldPostUpdate()
         log("death scenario: pressing New game at frame " .. f)
         dofile_once(ROOT .. "nextrun.lua").press_new_game()
       end
-      if cfg.bot and session.scenario == "restart" then NextRun.restart_post(f, session.run, session.player) end
+      local restarts = cfg.bot and NextRun and NextRun.restarts(session.scenario)
+      if restarts then NextRun.restart_post(f, session.run, restarts, session.player) end
     end
   end
   if solo and ready then

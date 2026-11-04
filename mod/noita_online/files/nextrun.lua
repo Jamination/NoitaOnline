@@ -33,15 +33,22 @@ function M.press_new_game()
 end
 
 -- Test scenario "restart" (server --scenario restart; the bot scenario's players and world
--- events): in the first run, every player counts as dead at RESTART_FRAME (a stand-in for the
--- real all-dead path, players.lua), every client shows the game over and its bot presses New
--- game 120 + 180 * (player id) frames later, so the clients leave the old world at different
--- frames while the others keep simulating it.
+-- events): in the first run ("restart<N>": in each of the first N runs) every player counts as
+-- dead at RESTART_FRAME (a stand-in for the real all-dead path, players.lua), every client
+-- shows the game over and its bot presses New game 120 + 180 * (player id) frames later, so
+-- the clients leave the old world at different frames while the others keep simulating it.
 M.RESTART_FRAME = 1200
 
+-- The number of runs a restart scenario ends, nil for another scenario.
+function M.restarts(scenario)
+  local n = scenario:match("^restart(%d*)$")
+  if not n then return nil end
+  return tonumber(n) or 1
+end
+
 -- Inside the window (every client, in tick order).
-function M.restart_events(f, run)
-  if run == 0 and f == M.RESTART_FRAME then
+function M.restart_events(f, run, restarts)
+  if run < restarts and f == M.RESTART_FRAME then
     NO.lib.no_game_over_shared()
     M.all_dead(f)
   end
@@ -49,8 +56,8 @@ end
 
 -- Outside the window (after it closed), this client's bot.
 local game_over_shown, pressed = false, false
-function M.restart_post(f, run, player)
-  if run ~= 0 or not M.over_frame then return end
+function M.restart_post(f, run, restarts, player)
+  if run >= restarts or not M.over_frame then return end
   if not game_over_shown then
     game_over_shown = true
     GameTriggerGameOver()

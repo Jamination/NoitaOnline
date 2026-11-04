@@ -1312,7 +1312,6 @@ const PATCHES: &[(&str, PatchFn)] = &[
 /// # Safety
 /// Must run inside noita.exe build 0x6794ee3c on the game thread.
 pub unsafe fn fix_seeds(seed: u32) {
-    mem_dump_diag("s");
     *((PLATFORM + 0xa0) as *mut u32) = 0x0012_d687 ^ seed.rotate_left(13);
     *((PLATFORM + 0xa4) as *mut u32) = seed;
     *(GLOBAL_LCG as *mut u32) = seed ^ 0xc;
@@ -1418,10 +1417,64 @@ const GG_WORLD_FRAMES: u32 = 4;
 static GRID_RNG_RESEED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The GridWorld (`[[GameGlobal+0xc]+0x44]`), 0 before the world exists.
-unsafe fn grid_world_ptr() -> u32 {
+pub(crate) unsafe fn grid_world_ptr() -> u32 {
     let gg = rd(GAME_GLOBAL_PTR);
     let world_data = if gg != 0 { rd(gg + 0x0c) } else { 0 };
     if world_data != 0 { rd(world_data + 0x44) } else { 0 }
+}
+
+/// The grid update's (`FUN_00726340`) function statics that carry state from frame to frame,
+/// constructed on its first call (guard `0x01225dc0` bits 1 and 2) and kept by a new game in
+/// the same process, each a `std::vector` of {x, y} int pairs (begin, end, capacity):
+/// - the wake list (`0x01225d4c`): the tile-sized offsets covering GetBorders' rect, rebuilt
+///   and shuffled with `rand` whenever its size changes; each update wakes the tile at the
+///   offset under the GridThreadImpl's cursor (+0x44, 0 at construction `FUN_00726220`) and
+///   advances it, reshuffling when it wraps;
+/// - the checkerboard pass order (`0x01225c3c`): the four tile parities, set to (0,0) (1,0)
+///   (0,1) (1,1) when empty and shuffled with `rand` from the previous order every update.
+/// The code that constructs them (with its operand addresses), checked by `world_teardown`.
+const GRID_WAKE_LIST: u32 = 0x0122_5d4c;
+const GRID_PASS_ORDER: u32 = 0x0122_5c3c;
+const GRID_IMPL_WAKE_CURSOR: u32 = 0x44;
+/// The calling thread's Park–Miller state (`FUN_0063d1c0`, no arguments, returns a double*):
+/// a heap double in noita.exe's TLS block (+0x24), created by the thread's first call with
+/// `[0x01053d28]` (`movsd xmm0,[0x01053d28]` @0x0063d1e8). On the game thread the simulation
+/// draws it: the verlet system's broken-link particles (`FUN_00c3a610`), damage, burning cells
+/// off the tile jobs (`tile_explosions` gives tiles their own stream).
+const THREAD_PM_FN: u32 = 0x0063_d1c0;
+const THREAD_PM_INIT: u32 = 0x0105_3d28;
+const RUN_STATICS_CODE: [(u32, &[u8]); 3] = [
+    // mov eax,[0x01225dc0]; test al,1; jnz; or eax,1; mov dword [0x01225d4c],0; push ..;
+    // mov [0x01225dc0],eax; mov dword [0x01225d50],0
+    (
+        0x0072_677d,
+        &[
+            0xA1, 0xC0, 0x5D, 0x22, 0x01, 0xA8, 0x01, 0x75, 0x33, 0x83, 0xC8, 0x01, 0xC7, 0x05, 0x4C, 0x5D, 0x22, 0x01, 0, 0, 0, 0, 0x68,
+            0x30, 0xCF, 0xEF, 0x00, 0xA3, 0xC0, 0x5D, 0x22, 0x01, 0xC7, 0x05, 0x50, 0x5D, 0x22, 0x01,
+        ],
+    ),
+    // mov edx,[0x01225dc0]; test dl,2; jnz; or edx,2; mov dword [0x01225c3c],0; push ..;
+    // mov [0x01225dc0],edx; mov dword [0x01225c40],0
+    (
+        0x0072_7223,
+        &[
+            0x8B, 0x15, 0xC0, 0x5D, 0x22, 0x01, 0xF6, 0xC2, 0x02, 0x75, 0x3A, 0x83, 0xCA, 0x02, 0xC7, 0x05, 0x3C, 0x5C, 0x22, 0x01, 0, 0, 0,
+            0, 0x68, 0xE0, 0xCE, 0xEF, 0x00, 0x89, 0x15, 0xC0, 0x5D, 0x22, 0x01, 0xC7, 0x05, 0x40, 0x5C, 0x22, 0x01,
+        ],
+    ),
+    // movsd xmm0,[0x01053d28]; movsd [eax],xmm0; mov [esi+0x24],eax
+    (0x0063_d1e8, &[0xF2, 0x0F, 0x10, 0x05, 0x28, 0x3D, 0x05, 0x01, 0xF2, 0x0F, 0x11, 0x00, 0x89, 0x86, 0x24, 0, 0, 0]),
+];
+
+/// Check the code [`reset_run`] relies on for the engine's statics (`world_teardown`).
+///
+/// # Safety
+/// Patch installation.
+pub(crate) unsafe fn check_run_statics() -> Result<(), PatchError> {
+    for (at, bytes) in RUN_STATICS_CODE {
+        expect(at, bytes)?;
+    }
+    Ok(())
 }
 
 /// The streaming keep-alive list (std::vector of 0x18-byte entries: +0 expiry frame, +0x10 /
@@ -1815,7 +1868,6 @@ pub unsafe fn sim_rng_enter() {
     sync_platform_frame();
     camera_loads_window_entry();
     rng_log('<');
-    mem_dump_diag("w");
     {
         let gg = rd(GAME_GLOBAL_PTR);
         let wd = if gg != 0 { rd(gg + 0x0c) } else { 0 };
@@ -2017,42 +2069,6 @@ unsafe fn rng_watch(enter: bool) {
     let rs = RAND_STATE_ADDR.load(Ordering::Relaxed);
     let watch = [(GLOBAL_LCG, 4), (PARTICLE_RNG, 8), (if gw != 0 { gw + 4 } else { 0 }, 4), (rs, 4)];
     crate::rngwatch::on_window(enter, if gg != 0 { rd(gg) } else { 0 }, watch);
-}
-
-/// TEMP diagnostics (`NOITA_ONLINE_MEMDUMP=1`): at frame 0 and 1's window entry, at
-/// `fix_seeds` and at `reset_run`, dump noita.exe's .data, the GridWorld, GameGlobal and
-/// WorldData to `mem_<inst>_<n>_<tag>f<frame>.bin`.
-pub(crate) unsafe fn mem_dump_diag(tag: &str) {
-    static N: AtomicU32 = AtomicU32::new(0);
-    if std::env::var_os("NOITA_ONLINE_MEMDUMP").is_none() {
-        return;
-    }
-    let gg = rd(GAME_GLOBAL_PTR);
-    if gg != 0 && rd(gg) > 1 && tag == "w" {
-        return;
-    }
-    let Ok(out) = std::env::var("NOITA_ONLINE_OUT") else { return };
-    let inst = std::env::var("NOITA_ONLINE_INSTANCE").unwrap_or_default();
-    let wd = if gg != 0 { rd(gg + 0x0c) } else { 0 };
-    let gw = if wd != 0 { rd(wd + 0x44) } else { 0 };
-    let mut buf: Vec<u8> = Vec::new();
-    let mut put = |addr: u32, len: usize| {
-        buf.extend_from_slice(&addr.to_le_bytes());
-        buf.extend_from_slice(&(len as u32).to_le_bytes());
-        if addr != 0 {
-            buf.extend_from_slice(std::slice::from_raw_parts(addr as *const u8, len));
-        } else {
-            buf.extend(std::iter::repeat_n(0u8, len));
-        }
-    };
-    put(0x0115_2000, 0xd7650);
-    put(gw, 0x600);
-    put(gg, if gg != 0 { 0x1a0 } else { 0 });
-    put(wd, 0x200);
-    put(if gg != 0 { rd(gg + 0x10) } else { 0 }, 0x600);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let f = if gg != 0 { rd(gg) } else { 0 };
-    let _ = std::fs::write(std::path::Path::new(&out).join(format!("mem_{inst}_{n:02}_{tag}f{f}.bin")), &buf);
 }
 
 /// Diagnostics: `NOITA_ONLINE_RNGLOG=from-to` appends the simulation RNG states at every
@@ -2587,6 +2603,16 @@ unsafe fn patch_cell_flash(ex: &mut Exec) -> Result<(), PatchError> {
 /// Box2D step in ms (QueryPerformanceCounter, written at the end of b2World::Step FUN_009c0d00).
 const GW_B2WORLD: u32 = 0x530;
 const B2_STEP_MS: u32 = 0x19270;
+
+/// The b2World (GridWorld+0x530), 0 without a world.
+pub(crate) unsafe fn b2_world() -> u32 {
+    let gw = grid_world_ptr();
+    if gw != 0 {
+        rd(gw + GW_B2WORLD)
+    } else {
+        0
+    }
+}
 /// Body->grid update FUN_00718d50: `cmp byte [BOX2D_FREEZE_STUCK_BODIES],0; push esi;
 /// push edi; mov edi,ecx; mov [esp+0x38],edi; jz 0x00718d91` (skips the freeze test).
 const FREEZE_STUCK_TEST: u32 = 0x0071_8d5c;
@@ -2983,7 +3009,16 @@ pub unsafe fn focus_freeze_step(foci: &[(f32, f32)]) {
 /// look ahead from it). GameGlobal::Update (`FUN_006363b0`) counts the world frames (+4) beside
 /// the frame number (+0), and the new game resets only the latter. They get their construction
 /// values: frames 0, the rect GridWorld init (`FUN_007184d0`) starts from, and the RNG from the
-/// new seed's platform RNG ([`fix_seeds`]).
+/// new seed's platform RNG ([`fix_seeds`]). The same holds for the grid update's own statics
+/// ([`GRID_WAKE_LIST`], [`GRID_PASS_ORDER`]) and the GridThreadImpl (GridWorld+0x5d0, made by
+/// GridWorld init) holding the wake cursor: each client's tiles woke at its own place in the
+/// old world's shuffled wake list, and its checkerboard passes ran in the order its old world
+/// left (run 1 differed from frame 8 on: another tile woken, then frame 10's first active tiles
+/// passed in another order). The two lists are emptied (the first grid update rebuilds them
+/// exactly as on first use, shuffled with the new run's `rand`) and the cursor is 0. The game
+/// thread's Park–Miller state ([`THREAD_PM_FN`]) is a thread's, not the world's: it gets the
+/// value the thread's first call gives it (run 1 differed at frame 573: a verlet link broke
+/// into a particle on one client only).
 ///
 /// # Safety
 /// Game thread, between the old world's teardown and the new world's creation.
@@ -3018,5 +3053,17 @@ pub unsafe fn reset_run() {
         *((gw + GW_FRAME) as *mut u32) = 0;
         std::ptr::copy_nonoverlapping(GW_CAMERA_LOAD_RECT_INIT.as_ptr(), (gw + GW_CAMERA_LOAD_RECT) as *mut i32, 4);
         GRID_RNG_RESEED.store(true, Ordering::Relaxed);
+        let imp = rd(gw + 0x5d0);
+        if imp != 0 {
+            *((imp + GRID_IMPL_WAKE_CURSOR) as *mut u32) = 0;
+        }
+    }
+    for list in [GRID_WAKE_LIST, GRID_PASS_ORDER] {
+        *((list + 4) as *mut u32) = rd(list);
+    }
+    let thread_pm: extern "C" fn() -> *mut f64 = std::mem::transmute(THREAD_PM_FN as usize);
+    let pm = thread_pm();
+    if !pm.is_null() {
+        *pm = *(THREAD_PM_INIT as *const f64);
     }
 }

@@ -1025,7 +1025,8 @@ pub extern "C" fn no_next_run() -> i32 {
         }
         let Some(shared) = with_rt(None, |rt| Some(rt.shared.clone())) else { return -2 };
         // The old run's last state reports are queued before NextRun.
-        unsafe { nextrun::reset_run() };
+        let notes = unsafe { nextrun::reset_run() };
+        shared.send(CH_RELIABLE, &ClientMsg::Log { text: format!("next run: {notes}") });
         net::next_run(&shared).map_or(-2, |r| r as i32)
     }
     #[cfg(not(all(windows, target_arch = "x86")))]
