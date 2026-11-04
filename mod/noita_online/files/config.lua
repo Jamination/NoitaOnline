@@ -30,8 +30,11 @@ function M.load()
   c.duration = tonumber(env("NOITA_ONLINE_DURATION") or "")
   c.exit_on_finish = env("NOITA_ONLINE_EXIT") == "1"
   c.debug = env("NOITA_ONLINE_DEBUG") == "1"
+  -- Desync verification (testing only, off in normal play: it costs ~1.5 % frame rate):
+  -- state reports of chunk hashes, entity digest and positions that the server compares.
   -- "full": hash every loaded chunk at once on each 60-frame checkpoint (instead of the
   -- default staggered hashing, one slice of chunks per frame).
+  c.verify = env("NOITA_ONLINE_VERIFY") == "1"
   c.full_hash = env("NOITA_ONLINE_HASH") == "full"
   -- Frame-rate cap (stands in for vsync on displays without it); nil = uncapped.
   c.fps_cap = tonumber(env("NOITA_ONLINE_FPS_CAP") or "")

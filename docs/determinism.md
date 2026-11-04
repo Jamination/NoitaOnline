@@ -178,10 +178,11 @@ All of them are derived from the session seed.
 
 ## Verification
 
-Each client hashes every loaded chunk's material cells once every 60 frames, staggered by
-chunk index. It also reports player and enemy positions plus an entity digest. The server
-compares all clients' reports per frame (`hashes.jsonl`). Setting
-`NOITA_ONLINE_HASH=full` reports full snapshots every 60 frames.
+Testing only (`NOITA_ONLINE_VERIFY=1`, set by `harness/e2e.sh`; off in normal play, where
+it would cost about 1.5 % frame rate): each client hashes every loaded chunk's material
+cells once every 60 frames, staggered by chunk index. It also reports player and enemy
+positions plus an entity digest. The server compares all clients' reports per frame
+(`hashes.jsonl`). Setting `NOITA_ONLINE_HASH=full` reports full snapshots every 60 frames.
 
 Diagnostics used to find the root causes above, enabled by environment variables:
 - `NOITA_ONLINE_DENSE=a-b`: per-frame entity dumps. With `NOITA_ONLINE_ENTLOG=id,...` it

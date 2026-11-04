@@ -34,6 +34,8 @@ run() {
   local args=(--pin --players 1 --frames "$FRAMES" --seed "$SEED" --out "$OUT/${kind}_$k")
   [[ "$kind" == solo ]] && args+=(--solo)
   echo "[fps_pairs $(date +%T)] ${kind}_$k" | tee -a "$OUT/pairs.log"
+  # Measure normal play: desync verification is a test feature, off outside testing.
+  export NOITA_ONLINE_VERIFY=0
   if [[ "$kind" == mp && "$VARY" == 1 ]]; then
     NOITA_ONLINE_LADDER="nudge$((400 + 50 * (k - 1)))" "$ROOT/harness/e2e.sh" "${args[@]}" >/dev/null 2>&1
   else

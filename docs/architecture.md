@@ -116,9 +116,11 @@ sequenceDiagram
   on its socket (at most 1 ms, for timers), so a datagram is relayed as soon as it arrives.
 * Input delay: start value from the lobby round trips, then kept at the network's need at
   the session's frame rate (`delay.rs`, see above).
-* Verification: per checkpoint frame, every chunk loaded on ≥ 2 clients and every tracked
-  entity position (players, enemies) is compared exactly; results go to `hashes.jsonl`
-  and `summary.json`.
+* Verification (testing only): clients started with `NOITA_ONLINE_VERIFY=1` (the test
+  harness sets it; normal play doesn't, it costs ~1.5 % frame rate) send state reports.
+  Per checkpoint frame, every chunk loaded on ≥ 2 clients and every tracked entity
+  position (players, enemies) is compared exactly; results go to `hashes.jsonl` and
+  `summary.json`. A mismatch is only logged (`events.log`); nothing is resynchronised.
 * Metrics: per-client bandwidth (1 s windows), process CPU time, client frame-time
   reports.
 

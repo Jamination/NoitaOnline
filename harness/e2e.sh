@@ -64,6 +64,9 @@ else
   export NOITA_ONLINE_EXIT=1
 fi
 export NOITA_ONLINE_OUT="$OUT"
+# Desync verification (state reports compared by the server) is a test feature, off in
+# normal play; on by default here, NOITA_ONLINE_VERIFY=0 turns it off (FPS measurements).
+export NOITA_ONLINE_VERIFY="${NOITA_ONLINE_VERIFY:-1}"
 # Same frame cap (vsync stand-in) for baseline and multiplayer runs; 0 = uncapped.
 [[ "${FPS_CAP:-60}" != 0 ]] && export NOITA_ONLINE_FPS_CAP="${FPS_CAP:-60}"
 [[ -n "$SEED" ]] && export NOITA_ONLINE_SOLO_SEED="$SEED"

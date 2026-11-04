@@ -408,12 +408,13 @@ function OnWorldPostUpdate()
         end
       end
     end
-    -- State reports: entity digest + tracked positions every 60 frames; chunk hashes either
-    -- staggered (each loaded chunk hashed once per 60 frames, a few per frame: no frame-time
-    -- spike) or, in "full" mode, every loaded chunk at once on the 60-frame checkpoint.
+    -- State reports (desync verification, testing only: cfg.verify or dense diagnostics):
+    -- entity digest + tracked positions every 60 frames; chunk hashes either staggered (each
+    -- loaded chunk hashed once per 60 frames, a few per frame: no frame-time spike) or, in
+    -- "full" mode, every loaded chunk at once on the 60-frame checkpoint.
     local dense = cfg.dense_from and f >= cfg.dense_from and f <= cfg.dense_to
     local checkpoint = f % 60 == 0
-    if ready and not LADDER.noreport and (checkpoint or dense or not cfg.full_hash) then
+    if ready and (cfg.verify or dense) and not LADDER.noreport and (checkpoint or dense or not cfg.full_hash) then
       local h, positions = 0, {}
       if checkpoint or dense then h, positions = State.collect(Players.proxy, dense) end
       local period = (cfg.full_hash or dense) and 0 or 60

@@ -8,7 +8,8 @@ and every pixel of the falling-sand world) because every client runs the *same*
 simulation: the mod turns Noita into a **deterministic lockstep** game. Only player inputs
 travel over the network; each client applies all players' inputs for frame *f* before
 simulating frame *f*, and in-memory engine patches make Noita's simulation
-bit-reproducible. Clients continuously report world hashes, which the server cross-checks.
+bit-reproducible. In tests, clients report world hashes, which the server cross-checks
+(`NOITA_ONLINE_VERIFY=1`, set by the test harness; off in normal play).
 
 ```mermaid
 flowchart LR
