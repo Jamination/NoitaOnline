@@ -91,7 +91,13 @@ A single MP run against a single solo run is not a usable comparison:
 `harness/fps_pairs.sh` therefore runs MP and solo one at a time on the same pinned core,
 alternating which goes first (MP solo, solo MP, ...), and `evaluate.py` compares the
 median average FPS and the median 1 % low of each side over all runs (frames 600 on).
-Use at least 3 pairs; more pairs narrow the solo median.
+A session replays one trajectory per seed, and which one depends on details such as the
+session's start hour (weather); a single trajectory can be several percent heavier or
+lighter than the solo median. So that both sides sample the scenario alike, MP run k
+gets one extra frame of "Right" for the bot at frame 400 + 50·(k−1) (`nudge<N>` below),
+a distinct deterministic trajectory per run, as solo runs diverge on their own around
+frame 750. `--same-trajectory` replays one trajectory (for A/B tests of a change).
+Use at least 4 pairs per seed and several seeds; more pairs narrow both medians.
 
 ### Profiling
 
