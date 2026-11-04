@@ -16,7 +16,8 @@ pub const CH_UNRELIABLE: u8 = 1;
 
 /// Bumped whenever the message format or lockstep rules change; server and clients must match.
 /// 5: every input carries its client's render camera (the client's input trailer).
-pub const GAME_PROTOCOL_VERSION: u32 = 5;
+/// 6: `Perf` carries the client's measured round trip (the adaptive input delay's network bound).
+pub const GAME_PROTOCOL_VERSION: u32 = 6;
 
 /// Budget for one unreliable lockstep datagram's payload (fits rudp's unreliable limit).
 pub const STREAM_BUDGET: usize = 1100;
@@ -61,8 +62,9 @@ pub enum ClientMsg {
     /// Periodic client-side performance report. `wait_us`: time blocked waiting for ticks;
     /// `stalls`: frames whose tick had not arrived when the game needed it (waits over 1 ms);
     /// `margin_min_us`: over the other frames, the shortest time between a tick's arrival
-    /// and the game needing it (`u32::MAX`: no such frame).
-    Perf { frames: u32, avg_frame_us: u32, p99_frame_us: u32, max_frame_us: u32, wait_us: u32, stalls: u32, margin_min_us: u32 },
+    /// and the game needing it (`u32::MAX`: no such frame); `rtt_us`: the client's latest
+    /// `Ping` round trip (0: none yet).
+    Perf { frames: u32, avg_frame_us: u32, p99_frame_us: u32, max_frame_us: u32, wait_us: u32, stalls: u32, margin_min_us: u32, rtt_us: u32 },
     /// Free-form log line forwarded to the server log.
     Log { text: String },
     Ping { t: u64 },
@@ -118,7 +120,7 @@ impl ClientMsg {
                     w.varint(p.id as u64).u8(p.kind).u32(p.x_bits).u32(p.y_bits);
                 }
             }
-            ClientMsg::Perf { frames, avg_frame_us, p99_frame_us, max_frame_us, wait_us, stalls, margin_min_us } => {
+            ClientMsg::Perf { frames, avg_frame_us, p99_frame_us, max_frame_us, wait_us, stalls, margin_min_us, rtt_us } => {
                 w.u8(4)
                     .varint(*frames as u64)
                     .varint(*avg_frame_us as u64)
@@ -126,7 +128,8 @@ impl ClientMsg {
                     .varint(*max_frame_us as u64)
                     .varint(*wait_us as u64)
                     .varint(*stalls as u64)
-                    .varint(*margin_min_us as u64);
+                    .varint(*margin_min_us as u64)
+                    .varint(*rtt_us as u64);
             }
             ClientMsg::Log { text } => {
                 w.u8(5).str(text);
@@ -196,6 +199,7 @@ impl ClientMsg {
                 wait_us: r.varint()? as u32,
                 stalls: r.varint()? as u32,
                 margin_min_us: r.varint()? as u32,
+                rtt_us: r.varint()? as u32,
             },
             5 => ClientMsg::Log { text: r.str()?.to_owned() },
             6 => ClientMsg::Ping { t: r.u64()? },
@@ -390,7 +394,16 @@ mod tests {
                 positions: vec![EntityPos { id: 7, kind: 1, x_bits: 1.5f32.to_bits(), y_bits: 0 }],
             },
             ClientMsg::StateHash { frame: 61, entities: None, chunks: vec![], positions: vec![] },
-            ClientMsg::Perf { frames: 60, avg_frame_us: 16666, p99_frame_us: 20000, max_frame_us: 30000, wait_us: 5, stalls: 2, margin_min_us: u32::MAX },
+            ClientMsg::Perf {
+                frames: 60,
+                avg_frame_us: 16666,
+                p99_frame_us: 20000,
+                max_frame_us: 30000,
+                wait_us: 5,
+                stalls: 2,
+                margin_min_us: u32::MAX,
+                rtt_us: 210_000,
+            },
             ClientMsg::Log { text: "hi".into() },
             ClientMsg::Ping { t: 5 },
         ];

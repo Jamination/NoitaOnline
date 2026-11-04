@@ -490,6 +490,7 @@ pub extern "C" fn no_frame_mark() -> u32 {
                             wait_us: w.wait_us,
                             stalls: w.stalls,
                             margin_min_us: w.margin_min_us,
+                            rtt_us: rt.shared.rtt_us.load(std::sync::atomic::Ordering::Relaxed).min(u32::MAX as u64) as u32,
                         },
                     );
                 }

@@ -301,7 +301,7 @@ fn run(args: Args) -> std::io::Result<()> {
                                 }
                             }
                         }
-                        ClientMsg::Perf { frames, avg_frame_us, p99_frame_us, max_frame_us, wait_us, stalls, margin_min_us } => {
+                        ClientMsg::Perf { frames, avg_frame_us, p99_frame_us, max_frame_us, wait_us, stalls, margin_min_us, rtt_us } => {
                             let a = perf.entry(id).or_default();
                             a.reports += 1;
                             a.frames += frames as u64;
@@ -311,13 +311,15 @@ fn run(args: Args) -> std::io::Result<()> {
                             if let Some(f) = &mut logs.perf {
                                 let _ = writeln!(
                                     f,
-                                    "{{\"t\":{:.3},\"player\":{id},\"frames\":{frames},\"avg_frame_us\":{avg_frame_us},\"p99_frame_us\":{p99_frame_us},\"max_frame_us\":{max_frame_us},\"wait_us\":{wait_us},\"stalls\":{stalls},\"margin_min_us\":{}}}",
+                                    "{{\"t\":{:.3},\"player\":{id},\"frames\":{frames},\"avg_frame_us\":{avg_frame_us},\"p99_frame_us\":{p99_frame_us},\"max_frame_us\":{max_frame_us},\"wait_us\":{wait_us},\"stalls\":{stalls},\"margin_min_us\":{},\"rtt_us\":{rtt_us}}}",
                                     elapsed_secs(),
                                     if margin_min_us == u32::MAX { -1 } else { margin_min_us as i64 }
                                 );
                             }
                             if let Phase::Running { relay, delay, .. } = &mut phase {
-                                let w = delay::Window { stalls, margin_min_us };
+                                let (packets_sent, packets_acked) =
+                                    server.connection(client).map_or((0, 0), |c| (c.stats.packets_sent, c.stats.packets_acked));
+                                let w = delay::Window { frames, avg_frame_us, wait_us, stalls, rtt_us, packets_sent, packets_acked };
                                 if let Some((d, why)) = delay.report(id, w, relay.active()) {
                                     let _ = server.broadcast(CH_RELIABLE, &ServerMsg::InputDelay { delay: d }.encode());
                                     server.flush();
@@ -386,7 +388,7 @@ fn run(args: Args) -> std::io::Result<()> {
                     ));
                     phase = Phase::Running {
                         relay: lockstep::Relay::new(ready, input_delay as u32),
-                        delay: delay::Controller::new(input_delay, args.input_delay.is_none()),
+                        delay: delay::Controller::new(input_delay, args.input_delay.is_none(), max_rtt),
                         started: Instant::now(),
                         session_id,
                         seed,

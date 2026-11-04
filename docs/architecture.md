@@ -31,16 +31,24 @@ sequenceDiagram
 * **Input delay** `D` frames hides the input's trip client → server → clients: the input a
   client captures while simulating frame *f* is simulated by every client in frame *f + D*.
   The server starts the session with the fewest frames that cover the slowest link's lobby
-  round trip plus 2 ms (1 frame on a LAN, `--input-delay auto`) and then adapts it: the
-  clients report, per ~60 frames, how many frames waited for their tick and how early the
-  other ticks arrived. When even the client that waited least (the slowest client, which
-  the others wait for in any case) waited for 3+ ticks, `D` grows by one frame; after 10
-  report rounds (doubled after every growth, up to 160) in which its ticks all arrived over
-  a frame + 2 ms early, `D` shrinks by one, never below 1. The server announces the new
-  value (`InputDelay`); a client switching to a longer delay sends its current input for
-  one more frame (held buttons only), one switching to a shorter delay merges two frames'
-  inputs into one (buttons pressed in either, both frames' wheel steps and inventory edits).
-  Switches cannot desync: every client simulates the ticks the server relays.
+  round trip plus 2 ms at 60 fps (1 frame on a LAN, `--input-delay auto`) and then adapts
+  it to what the network needs at the session's actual frame rate. The clients report, per
+  ~60 frames, their frame time, how long and on how many frames they waited for their tick,
+  and their latest ping round trip. The network bound is the worst client round trip
+  (smallest of its last 3 reports) + 25 % + 2 ms, in frames of the session's pace (the
+  slowest client's frame time without tick waits), plus one frame when the server sees ≥ 1 %
+  of its packets to a client go unacknowledged over the last 8 rounds (a lost datagram costs
+  one frame interval, see below). When even the client that waited least waited for 3+
+  ticks and `D` is below the bound, `D` grows by one frame. At or above the bound the inputs
+  arrive in time, so waits are frame pacing (in lockstep a client waits whenever another
+  runs a frame behind, whatever `D`; 4 clients on one machine stall on ~15 % of frames at
+  `D` = 1, 2, 3 and 4 alike) and do not raise it. After 3 consecutive rounds above the
+  bound, `D` shrinks by one, never below 1; each change is followed by 2 ignored rounds. The
+  server announces the new value (`InputDelay`); a client switching to a longer delay sends
+  its current input for one more frame (held buttons only), one switching to a shorter
+  delay merges two frames' inputs into one (buttons pressed in either, both frames' wheel
+  steps and inventory edits). Switches cannot desync: every client simulates the ticks the
+  server relays.
 * **Redundant streams**: each client datagram repeats all inputs the server has not
   acknowledged; each server datagram repeats all ticks the client has not acknowledged. A
   lost datagram costs one frame interval, not a resend round trip, and there is no
@@ -106,8 +114,8 @@ sequenceDiagram
 * Lockstep relay: per frame, one tick containing every active player's input, emitted in
   order once complete; departed players are dropped from subsequent ticks. The server waits
   on its socket (at most 1 ms, for timers), so a datagram is relayed as soon as it arrives.
-* Input delay: start value from the lobby round trips, then adapted to the clients' tick
-  reports (`delay.rs`, see above).
+* Input delay: start value from the lobby round trips, then kept at the network's need at
+  the session's frame rate (`delay.rs`, see above).
 * Verification: per checkpoint frame, every chunk loaded on ≥ 2 clients and every tracked
   entity position (players, enemies) is compared exactly; results go to `hashes.jsonl`
   and `summary.json`.
