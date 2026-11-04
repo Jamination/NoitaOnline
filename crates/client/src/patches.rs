@@ -1548,8 +1548,9 @@ pub unsafe fn stream_views() {
     }
 }
 
-/// Eviction schedule: (next frame, current interval in frames); see [`evict_chunks`].
-static EVICT: std::sync::Mutex<(u32, f64)> = std::sync::Mutex::new((0, 0.0));
+/// Eviction schedule: (next frame, current interval in frames, whether a chunk was evicted
+/// yet); see [`evict_chunks`].
+static EVICT: std::sync::Mutex<(u32, f64, bool)> = std::sync::Mutex::new((0, 0.0, false));
 
 /// Deterministic stand-in for the engine's chunk eviction (`FUN_00743990`, which sessions
 /// switch off with STREAMING_ENABLED=0 because it runs on wall-clock time around the local
@@ -1561,10 +1562,22 @@ static EVICT: std::sync::Mutex<(u32, f64)> = std::sync::Mutex::new((0, 0.0));
 /// loaded and returns to the setting once at most the target are. Here every player keeps
 /// the target: each loaded chunk belongs to the player whose focus centre (`foci`, focus
 /// rects in slot order) is nearest (lowest slot on ties), and a player with more than the
-/// target loses its farthest; the schedule counts frames (seconds × 60). A chunk overlapping
-/// a focus rect (around the player, larger than its camera load rect) stays: vanilla's
+/// target loses its farthest; the schedule counts frames (seconds × 60, the next check one
+/// interval after the last, with the interval as this check left it). A chunk overlapping a
+/// focus rect (around the player, larger than its camera load rect) stays: vanilla's
 /// farthest-first choice never reaches the screen either. With one player this is vanilla's
-/// rule with the player as the camera. Returns how many chunks were unloaded.
+/// rule with the player as the camera. Loaded chunks are found inside the ChunkMap's bounding
+/// box (+0x10, chunks, inclusive), as vanilla scans them.
+///
+/// Until the first eviction the check runs every frame. Vanilla's clock is wall time: its
+/// first check is on the first world frame, and world creation plus the spawn (two frames of
+/// ~0.3 s generating the spawn's chunks) take about a second, so the next one comes 1–4
+/// frames after the spawn's camera loads, before most of the enemies those chunks spawn over
+/// the following ~40 frames are placed: the look-ahead chunk it unloads (e.g. (2,1)) keeps
+/// the ones spawned into it after the unload for the whole run. Counting 60 frames from the
+/// first window instead unloaded that chunk ~50 frames later with its enemies in it (the
+/// unload freezes and kills them, `FUN_00a5af60`): a 1-player bot session had 10–25 fewer
+/// enemies than vanilla on every seed. Returns how many chunks were unloaded.
 ///
 /// # Safety
 /// Game thread, inside the simulation window, world initialised.
@@ -1589,14 +1602,13 @@ pub unsafe fn evict_chunks(foci: &[[i32; 4]], frame: u32) -> u32 {
     if frame < schedule.0 {
         return 0;
     }
-    schedule.0 = frame + schedule.1.round().max(1.0) as u32;
     // Focus centres in chunks, as vanilla's camera centre (`>> 9`).
     let centres: Vec<(i32, i32)> = foci.iter().map(|r| ((r[0] + r[2]).div_euclid(2) >> 9, (r[1] + r[3]).div_euclid(2) >> 9)).collect();
     // Loaded chunks in row order (y, then x, ascending): (cx, cy, table index, owner, d²).
     let mut chunks: Vec<(i32, i32, u32, usize, i64)> = Vec::new();
-    for idx in 0..512 * 512u32 {
+    let mut visit = |idx: u32| {
         if *table.add(idx as usize) == 0 {
-            continue;
+            return;
         }
         let (cx, cy) = ((idx % 512) as i32 - 256, (idx / 512) as i32 - 256);
         let mut owner = (0, i64::MAX);
@@ -1607,16 +1619,33 @@ pub unsafe fn evict_chunks(foci: &[[i32; 4]], frame: u32) -> u32 {
             }
         }
         chunks.push((cx, cy, idx, owner.0, owner.1));
+    };
+    let [x0, y0, x1, y1] = *((chunk_map + 0x10) as *const [i32; 4]);
+    if x0 <= x1 && y0 <= y1 && (x1 as i64 - x0 as i64) < 512 && (y1 as i64 - y0 as i64) < 512 {
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                visit((((y + 256) & 511) * 512 + ((x + 256) & 511)) as u32);
+            }
+        }
+    } else {
+        for idx in 0..512 * 512u32 {
+            visit(idx);
+        }
     }
     chunks.sort_by_key(|c| (c.1, c.0));
     let most = (0..foci.len()).map(|p| chunks.iter().filter(|c| c.3 == p).count()).max().unwrap_or(0);
     if most <= target {
         schedule.1 = base;
+        if schedule.2 {
+            schedule.0 = frame + schedule.1.round().max(1.0) as u32;
+        }
         return 0;
     }
     if most >= 2 * target {
         schedule.1 *= 0.5;
     }
+    schedule.0 = frame + schedule.1.round().max(1.0) as u32;
+    schedule.2 = true;
     drop(schedule);
     // Chunks on the keep-alive list (entries not yet expired).
     let mut kept: Vec<(i32, i32)> = Vec::new();
